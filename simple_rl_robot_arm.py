@@ -321,8 +321,6 @@ class DiTAgent:
             num_layers=3,
             num_heads=4,
             use_vision=use_vision,
-            diffusion_steps=self.num_diffusion_steps,
-            horizon=1,  # Single-step for now
         ).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
 
