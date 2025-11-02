@@ -69,7 +69,7 @@ class RecurrentKDA(nn.Module):
         k = self.Wk(x_norm).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
         v = self.Wv(x_norm).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
         g = torch.sigmoid(self.Wg(x_norm)).view(B, T, self.num_heads, self.d_k).transpose(1, 2)  # Diag(alpha)
-        beta = torch.sigmoid(self.Wbeta(x_norm))[:, None, :, None, None]  # [B,1,H,1,1]
+        beta_all = torch.sigmoid(self.Wbeta(x_norm))  # [B, T, num_heads]
 
         new_states = []
         outputs = []
@@ -79,8 +79,10 @@ class RecurrentKDA(nn.Module):
             k_t = k[:, :, t]
             v_t = v[:, :, t]
             alpha_t = g[:, :, t]
-            S_t = state + beta * torch.einsum('b h d, b h e -> b h d e', k_t, v_t)  # Simplified update
-            S_t = (torch.eye(self.d_k, device=x.device)[None, None] - beta * torch.einsum('b h d, b h e -> b h d e', k_t, k_t)) @ (alpha_t.unsqueeze(-1) * S_t)
+            beta_t = beta_all[:, t, :].unsqueeze(-1).unsqueeze(-1)  # [B, H, 1, 1]
+
+            S_t = state + beta_t * torch.einsum('b h d, b h e -> b h d e', k_t, v_t)  # Simplified update
+            S_t = (torch.eye(self.d_k, device=x.device)[None, None] - beta_t * torch.einsum('b h d, b h e -> b h d e', k_t, k_t)) @ (alpha_t.unsqueeze(-1) * S_t)
             o_t = torch.einsum('b h d, b h d e -> b h e', q_t, S_t)
             outputs.append(o_t)
             new_states.append(S_t)
@@ -560,9 +562,12 @@ print(f"Model will be saved to: {MODEL_PATH}")
 
 try:
     for episode in range(agent.episode_count, agent.episode_count + num_episodes):
-        # Reset arm to random initial position
-        initial_pos = np.random.uniform(-1.0, 1.0, 7)
+        # Reset arm to safe initial position (smaller range to avoid physics issues)
+        initial_pos = np.random.uniform(-0.5, 0.5, 7)
         robot.set_joint_positions(np.concatenate([initial_pos, [0.04, 0.04]]))
+
+        # Step world to apply joint positions
+        my_world.step(render=False)
 
         # Reset ball to random position using RigidPrim
         target_position = np.array([
@@ -575,10 +580,23 @@ try:
         episode_reward = 0
         ball_grasped = False
 
+        # Step simulation once to initialize camera
+        my_world.step(render=True)
+
         for step in range(max_steps_per_episode):
             # Capture camera image
             wrist_camera.get_current_frame()
-            rgb_image = wrist_camera.get_rgba()[:, :, :3]  # Get RGB only (84x84x3)
+            rgba_data = wrist_camera.get_rgba()
+
+            # Check if data is valid
+            if rgba_data is None or rgba_data.size == 0:
+                # Use dummy image if camera not ready
+                rgb_image = np.zeros((84, 84, 3), dtype=np.uint8)
+            else:
+                # Reshape from flat array to image if needed
+                if len(rgba_data.shape) == 1:
+                    rgba_data = rgba_data.reshape(84, 84, 4)
+                rgb_image = rgba_data[:, :, :3].astype(np.uint8)  # Get RGB only (84x84x3)
 
             # Get robot state
             joint_positions = robot.get_joint_positions()[0]
