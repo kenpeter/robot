@@ -386,7 +386,7 @@ robot = Articulation(prim_paths_expr="/World/Franka", name="franka_arm")
 # Get end-effector link for position tracking
 end_effector = RigidPrim("/World/Franka/panda_hand", name="end_effector")
 
-# Add target sphere
+# Add target sphere (ball to pick up)
 from pxr import UsdGeom, Gf, UsdLux
 
 stage = my_world.stage
@@ -396,22 +396,29 @@ sphere.GetRadiusAttr().Set(0.05)
 sphere_translate = sphere.AddTranslateOp()
 sphere_translate.Set(Gf.Vec3d(0.3, 0.3, 0.5))
 
+# Add goal location marker (green box)
+goal_path = "/World/Goal"
+goal_cube = UsdGeom.Cube.Define(stage, goal_path)
+goal_cube.GetSizeAttr().Set(0.15)
+goal_translate = goal_cube.AddTranslateOp()
+goal_translate.Set(Gf.Vec3d(-0.3, 0.3, 0.3))  # Goal position
+
 # Initialize world
 my_world.reset()
 
 # RL Training parameters
 MODEL_PATH = "rl_robot_arm_model.pth"
-state_dim = 10  # 9 joint positions (7 arm + 2 gripper) + 1 distance to target
+state_dim = 16  # 9 joints + 3 ee_pos + 3 ball_pos + 1 ball_grasped
 agent = DiTAgent(
-    state_dim=state_dim, action_dim=7
-)  # First 7 joints (excluding grippers)
+    state_dim=state_dim, action_dim=8
+)  # 7 arm joints + 1 gripper
 
 # Try to load existing model
 agent.load_model(MODEL_PATH)
 
-num_episodes = 20000
+num_episodes = 1000
 max_steps_per_episode = 500
-target_position = np.array([0.3, 0.3, 0.5])
+goal_position = np.array([-0.3, 0.3, 0.3])  # Fixed goal location
 save_interval = 10  # Save model every 10 episodes
 
 print("Starting RL Training...")
@@ -441,6 +448,7 @@ try:
         )
 
         episode_reward = 0
+        ball_grasped = False
 
         for step in range(max_steps_per_episode):
             # Get end effector position
@@ -449,37 +457,80 @@ try:
             ]  # Get first element (single robot)
             ee_position, _ = end_effector.get_world_poses()
 
-            # Calculate state (distance to target)
-            distance = np.linalg.norm(ee_position - target_position)
-            state = np.concatenate([joint_positions, [distance]])
+            # Calculate distances
+            ball_distance = np.linalg.norm(ee_position - target_position)
+            goal_distance = np.linalg.norm(target_position - goal_position)
 
-            # Get action from agent
+            # Gripper width (gripper fingers are joints 7 and 8)
+            gripper_width = joint_positions[7] + joint_positions[8]
+
+            # Check if ball is grasped (close to ee AND gripper closed)
+            if ball_distance < 0.08 and gripper_width < 0.02:
+                ball_grasped = True
+
+            # Build state: joints + ee_pos + ball_pos + ball_grasped
+            state = np.concatenate([
+                joint_positions,                    # 9
+                ee_position,                        # 3
+                target_position,                    # 3
+                [float(ball_grasped)]              # 1
+            ])  # Total: 16
+
+            # Get action from agent (7 arm joints + 1 gripper)
             action = agent.get_action(state)
 
-            # Apply action (update first 7 joints)
+            # Apply action: first 7 = arm joints, last 1 = gripper
             new_positions = joint_positions.copy()
-            new_positions[:7] += action
+            new_positions[:7] += action[:7] * 0.1  # Scale down arm actions
             new_positions[:7] = np.clip(new_positions[:7], -2.5, 2.5)
-            robot.set_joint_positions([new_positions])  # Wrap in list for batch format
+
+            # Gripper control: positive = close, negative = open
+            gripper_action = np.clip(action[7], -1.0, 1.0)
+            new_positions[7:9] = np.clip(new_positions[7:9] + gripper_action * 0.01, 0.0, 0.04)
+
+            robot.set_joint_positions([new_positions])
 
             # Step simulation
             my_world.step(render=True)
 
-            # Calculate reward
+            # Multi-stage reward function
             new_ee_position, _ = end_effector.get_world_poses()
-            new_distance = np.linalg.norm(new_ee_position - target_position)
-            reward = -new_distance
+            new_ball_distance = np.linalg.norm(new_ee_position - target_position)
+            new_goal_distance = np.linalg.norm(target_position - goal_position)
 
-            # Bonus for reaching target
-            if new_distance < 0.1:
-                reward += 10.0
-                print(f"Episode {episode}: Target reached at step {step}!")
-                break
+            reward = 0
+
+            # Stage 1: Reach the ball
+            reward -= new_ball_distance * 2.0
+
+            # Stage 2: Grasp the ball
+            if new_ball_distance < 0.08 and gripper_width < 0.02:
+                reward += 5.0  # Grasping bonus
+                ball_grasped = True
+
+                # Stage 3: Move ball to goal
+                reward -= new_goal_distance * 3.0
+
+                # Stage 4: Success - ball at goal
+                if new_goal_distance < 0.15:
+                    reward += 20.0
+                    print(f"Episode {episode}: Ball delivered to goal at step {step}!")
+                    break
+            else:
+                ball_grasped = False
 
             # Update agent
-            next_state = np.concatenate(
-                [robot.get_joint_positions()[0], [new_distance]]
-            )
+            new_joint_positions = robot.get_joint_positions()[0]
+            new_gripper_width = new_joint_positions[7] + new_joint_positions[8]
+            new_ball_grasped = new_ball_distance < 0.08 and new_gripper_width < 0.02
+
+            next_state = np.concatenate([
+                new_joint_positions,              # 9
+                new_ee_position,                  # 3
+                target_position,                  # 3
+                [float(new_ball_grasped)]        # 1
+            ])  # Total: 16
+
             agent.update(state, action, reward, next_state)
 
             episode_reward += reward
