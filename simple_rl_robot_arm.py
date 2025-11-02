@@ -410,6 +410,10 @@ class DiTAgent:
 
     def update(self, state, action, reward, next_state, image=None):
         """Store experience and train the diffusion model"""
+        # Only store experiences with valid vision data
+        if self.use_vision and (image is None or image.size == 0 or np.all(image == 0)):
+            return  # Skip invalid vision experiences
+
         # Add to buffer
         self.buffer.append((state, action, reward, next_state, image))
         if len(self.buffer) > self.buffer_size:
@@ -437,11 +441,11 @@ class DiTAgent:
         # Process images if using vision
         images_tensor = None
         if self.use_vision:
-            images = [img for s, a, r, ns, img in batch if img is not None]
-            if images:
-                images_tensor = (
-                    torch.FloatTensor(np.stack(images)).to(self.device) / 255.0
-                )
+            images = [img for s, a, r, ns, img in batch]
+            # All images should be valid now due to filtering in update()
+            images_tensor = (
+                torch.FloatTensor(np.stack(images)).to(self.device) / 255.0
+            )
 
         # Diffusion training
         self.model.train()
@@ -721,22 +725,27 @@ try:
 
             reward = 0
 
-            # Stage 1: Reach the ball
-            reward -= new_ball_distance * 2.0
+            # Stage 1: Reach the ball (reward for getting closer)
+            distance_improvement = ball_distance - new_ball_distance
+            reward += distance_improvement * 2.0  # Normalized: ~-0.1 to +0.1 per step
+
+            # Small time penalty to encourage efficiency
+            reward -= 0.001
 
             # Stage 2: Grasp the ball
             new_joint_positions = robot.get_joint_positions()[0]
             new_gripper_width = new_joint_positions[7] + new_joint_positions[8]
             if new_ball_distance < 0.08 and new_gripper_width < 0.02:
-                reward += 5.0  # Grasping bonus
+                reward += 10.0  # BIG grasping bonus (normalized)
                 ball_grasped = True
 
-                # Stage 3: Move ball to goal
-                reward -= new_goal_distance * 3.0
+                # Stage 3: Move ball to goal (reward for getting closer to goal)
+                goal_improvement = goal_distance - new_goal_distance
+                reward += goal_improvement * 5.0  # Progress reward
 
                 # Stage 4: Success - ball at goal
                 if new_goal_distance < 0.15:
-                    reward += 20.0
+                    reward += 50.0  # HUGE success bonus (normalized)
                     print(f"Episode {episode}: Ball delivered to goal at step {step}!")
                     break
             else:
