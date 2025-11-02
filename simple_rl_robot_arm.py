@@ -34,6 +34,7 @@ from isaacsim.storage.native import get_assets_root_path
 # Import Flash Attention 4
 try:
     from flash_attention_4_wrapper import flash_attention_4
+
     USE_FA4 = True
     print("Flash Attention 4 loaded successfully")
 except Exception as e:
@@ -41,9 +42,11 @@ except Exception as e:
     flash_attention_4 = None
     print(f"Flash Attention 4 not available ({e}), using standard attention")
 
+
 # Diffusion Transformer for continuous action generation
 class DiTBlock(nn.Module):
     """Transformer block with adaptive layer norm and Flash Attention for diffusion timestep conditioning"""
+
     def __init__(self, hidden_dim, num_heads=4):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -62,12 +65,11 @@ class DiTBlock(nn.Module):
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
-            nn.Linear(hidden_dim * 4, hidden_dim)
+            nn.Linear(hidden_dim * 4, hidden_dim),
         )
         # Adaptive modulation parameters
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 6 * hidden_dim)
+            nn.SiLU(), nn.Linear(hidden_dim, 6 * hidden_dim)
         )
 
     def forward(self, x, c):
@@ -77,8 +79,9 @@ class DiTBlock(nn.Module):
         """
         batch_size, seq_len, _ = x.shape
 
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
+        )
 
         # Self-attention with adaptive modulation using Flash Attention 4
         x_norm = self.norm1(x)
@@ -94,16 +97,17 @@ class DiTBlock(nn.Module):
         if USE_FA4 and torch.cuda.is_available() and flash_attention_4 is not None:
             # Flash Attention 4 with async pipeline and optimized softmax
             attn_out = flash_attention_4(q, k, v)
-            attn_out = attn_out.transpose(1, 2).reshape(batch_size, seq_len, self.hidden_dim)
+            attn_out = attn_out.transpose(1, 2).reshape(
+                batch_size, seq_len, self.hidden_dim
+            )
         else:
             # Fallback: PyTorch's scaled_dot_product_attention (uses FA2/FA3)
             attn_out = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=0.0,
-                is_causal=False
+                q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False
             )
-            attn_out = attn_out.transpose(1, 2).reshape(batch_size, seq_len, self.hidden_dim)
+            attn_out = attn_out.transpose(1, 2).reshape(
+                batch_size, seq_len, self.hidden_dim
+            )
 
         attn_out = self.proj(attn_out)
 
@@ -116,39 +120,40 @@ class DiTBlock(nn.Module):
 
         return x
 
+
 class DiffusionTransformer(nn.Module):
     """Diffusion Transformer for action generation"""
-    def __init__(self, state_dim, action_dim, hidden_dim=128, num_layers=4, num_heads=4):
+
+    def __init__(
+        self, state_dim, action_dim, hidden_dim=128, num_layers=4, num_heads=4
+    ):
         super().__init__()
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
 
         # Timestep embedding (for diffusion process)
         self.time_embed = nn.Sequential(
-            nn.Linear(1, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)
         )
 
         # State encoder
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(hidden_dim, hidden_dim),
         )
 
         # Noisy action encoder
         self.action_encoder = nn.Linear(action_dim, hidden_dim)
 
         # Transformer blocks
-        self.blocks = nn.ModuleList([
-            DiTBlock(hidden_dim, num_heads) for _ in range(num_layers)
-        ])
+        self.blocks = nn.ModuleList(
+            [DiTBlock(hidden_dim, num_heads) for _ in range(num_layers)]
+        )
 
         # Output head to predict noise
         self.final_layer = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, action_dim)
+            nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, action_dim)
         )
 
     def forward(self, noisy_action, state, timestep):
@@ -161,7 +166,7 @@ class DiffusionTransformer(nn.Module):
         """
         # Encode inputs
         t_emb = self.time_embed(timestep)  # [batch, hidden_dim]
-        s_emb = self.state_encoder(state)   # [batch, hidden_dim]
+        s_emb = self.state_encoder(state)  # [batch, hidden_dim]
         a_emb = self.action_encoder(noisy_action)  # [batch, hidden_dim]
 
         # Conditioning: combine timestep and state
@@ -180,9 +185,16 @@ class DiffusionTransformer(nn.Module):
 
         return noise_pred
 
+
 class DiTAgent:
     """RL Agent using Diffusion Transformer for action generation"""
-    def __init__(self, state_dim, action_dim, device='cuda' if torch.cuda.is_available() else 'cpu'):
+
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+    ):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.device = device
@@ -193,7 +205,9 @@ class DiTAgent:
         self.beta_end = 0.02
 
         # Create diffusion schedule
-        self.betas = torch.linspace(self.beta_start, self.beta_end, self.num_diffusion_steps).to(device)
+        self.betas = torch.linspace(
+            self.beta_start, self.beta_end, self.num_diffusion_steps
+        ).to(device)
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
 
@@ -222,7 +236,9 @@ class DiTAgent:
 
             # Reverse diffusion process
             for t in reversed(range(self.num_diffusion_steps)):
-                timestep = torch.FloatTensor([[t / self.num_diffusion_steps]]).to(self.device)
+                timestep = torch.FloatTensor([[t / self.num_diffusion_steps]]).to(
+                    self.device
+                )
 
                 # Predict noise
                 predicted_noise = self.model(action, state_tensor, timestep)
@@ -235,13 +251,17 @@ class DiTAgent:
                 if t > 0:
                     noise = torch.randn_like(action)
                     alpha_cumprod_prev = self.alphas_cumprod[t - 1]
-                    sigma = torch.sqrt(beta * (1 - alpha_cumprod_prev) / (1 - alpha_cumprod))
+                    sigma = torch.sqrt(
+                        beta * (1 - alpha_cumprod_prev) / (1 - alpha_cumprod)
+                    )
                 else:
                     noise = 0
                     sigma = 0
 
                 # Update action
-                action = (action - beta / torch.sqrt(1 - alpha_cumprod) * predicted_noise) / torch.sqrt(alpha)
+                action = (
+                    action - beta / torch.sqrt(1 - alpha_cumprod) * predicted_noise
+                ) / torch.sqrt(alpha)
                 action = action + sigma * noise
 
             # Add exploration noise during training
@@ -275,12 +295,17 @@ class DiTAgent:
         self.model.train()
 
         # Sample random timestep
-        t = torch.randint(0, self.num_diffusion_steps, (self.batch_size,)).to(self.device)
+        t = torch.randint(0, self.num_diffusion_steps, (self.batch_size,)).to(
+            self.device
+        )
 
         # Add noise to actions
         noise = torch.randn_like(actions)
         alpha_cumprod_t = self.alphas_cumprod[t].view(-1, 1)
-        noisy_actions = torch.sqrt(alpha_cumprod_t) * actions + torch.sqrt(1 - alpha_cumprod_t) * noise
+        noisy_actions = (
+            torch.sqrt(alpha_cumprod_t) * actions
+            + torch.sqrt(1 - alpha_cumprod_t) * noise
+        )
 
         # Predict noise
         timesteps = (t.float() / self.num_diffusion_steps).view(-1, 1)
@@ -305,12 +330,12 @@ class DiTAgent:
     def save_model(self, filepath):
         """Save agent state to file"""
         model_data = {
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'episode_count': self.episode_count,
-            'total_reward_history': self.total_reward_history,
-            'buffer': self.buffer[-1000:],  # Save last 1000 experiences
-            'noise_scale': self.noise_scale
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "episode_count": self.episode_count,
+            "total_reward_history": self.total_reward_history,
+            "buffer": self.buffer[-1000:],  # Save last 1000 experiences
+            "noise_scale": self.noise_scale,
         }
         torch.save(model_data, filepath)
         print(f"Model saved to {filepath}")
@@ -321,16 +346,18 @@ class DiTAgent:
             print(f"Model file {filepath} not found. Starting fresh.")
             return False
 
-        model_data = torch.load(filepath, map_location=self.device)
-        self.model.load_state_dict(model_data['model_state_dict'])
-        self.optimizer.load_state_dict(model_data['optimizer_state_dict'])
-        self.episode_count = model_data['episode_count']
-        self.total_reward_history = model_data['total_reward_history']
-        self.buffer = model_data.get('buffer', [])
-        self.noise_scale = model_data.get('noise_scale', 0.3)
+        model_data = torch.load(filepath, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(model_data["model_state_dict"])
+        self.optimizer.load_state_dict(model_data["optimizer_state_dict"])
+        self.episode_count = model_data["episode_count"]
+        self.total_reward_history = model_data["total_reward_history"]
+        self.buffer = model_data.get("buffer", [])
+        self.noise_scale = model_data.get("noise_scale", 0.3)
 
         print(f"Model loaded from {filepath}")
-        print(f"Resuming from episode {self.episode_count}, buffer size: {len(self.buffer)}")
+        print(
+            f"Resuming from episode {self.episode_count}, buffer size: {len(self.buffer)}"
+        )
         return True
 
 
@@ -375,13 +402,15 @@ my_world.reset()
 # RL Training parameters
 MODEL_PATH = "rl_robot_arm_model.pth"
 state_dim = 10  # 9 joint positions (7 arm + 2 gripper) + 1 distance to target
-agent = DiTAgent(state_dim=state_dim, action_dim=7)  # First 7 joints (excluding grippers)
+agent = DiTAgent(
+    state_dim=state_dim, action_dim=7
+)  # First 7 joints (excluding grippers)
 
 # Try to load existing model
 agent.load_model(MODEL_PATH)
 
-num_episodes = 100
-max_steps_per_episode = 200
+num_episodes = 20000
+max_steps_per_episode = 500
 target_position = np.array([0.3, 0.3, 0.5])
 save_interval = 10  # Save model every 10 episodes
 
@@ -396,20 +425,28 @@ try:
         robot.set_joint_positions(np.concatenate([initial_pos, [0.04, 0.04]]))
 
         # Reset target to random position
-        target_position = np.array([
-            np.random.uniform(0.2, 0.5),
-            np.random.uniform(-0.3, 0.3),
-            np.random.uniform(0.3, 0.7)
-        ])
-        sphere_translate.Set(Gf.Vec3d(float(target_position[0]),
-                                       float(target_position[1]),
-                                       float(target_position[2])))
+        target_position = np.array(
+            [
+                np.random.uniform(0.2, 0.5),
+                np.random.uniform(-0.3, 0.3),
+                np.random.uniform(0.3, 0.7),
+            ]
+        )
+        sphere_translate.Set(
+            Gf.Vec3d(
+                float(target_position[0]),
+                float(target_position[1]),
+                float(target_position[2]),
+            )
+        )
 
         episode_reward = 0
 
         for step in range(max_steps_per_episode):
             # Get end effector position
-            joint_positions = robot.get_joint_positions()[0]  # Get first element (single robot)
+            joint_positions = robot.get_joint_positions()[
+                0
+            ]  # Get first element (single robot)
             ee_position, _ = end_effector.get_world_poses()
 
             # Calculate state (distance to target)
@@ -440,7 +477,9 @@ try:
                 break
 
             # Update agent
-            next_state = np.concatenate([robot.get_joint_positions()[0], [new_distance]])
+            next_state = np.concatenate(
+                [robot.get_joint_positions()[0], [new_distance]]
+            )
             agent.update(state, action, reward, next_state)
 
             episode_reward += reward
@@ -451,8 +490,14 @@ try:
 
         # Print progress
         if episode % 10 == 0:
-            avg_reward = np.mean(agent.total_reward_history[-10:]) if len(agent.total_reward_history) >= 10 else np.mean(agent.total_reward_history)
-            print(f"Episode {episode}/{agent.episode_count + num_episodes - 1}, Reward: {episode_reward:.2f}, Avg(10): {avg_reward:.2f}, Noise: {agent.noise_scale:.3f}")
+            avg_reward = (
+                np.mean(agent.total_reward_history[-10:])
+                if len(agent.total_reward_history) >= 10
+                else np.mean(agent.total_reward_history)
+            )
+            print(
+                f"Episode {episode}/{agent.episode_count + num_episodes - 1}, Reward: {episode_reward:.2f}, Avg(10): {avg_reward:.2f}, Noise: {agent.noise_scale:.3f}"
+            )
 
         # Save model periodically
         if (episode + 1) % save_interval == 0:
@@ -466,6 +511,7 @@ except KeyboardInterrupt:
 except Exception as e:
     print(f"Error during training: {e}")
     import traceback
+
     traceback.print_exc()
     agent.save_model(MODEL_PATH)
     print("Model saved after error")
