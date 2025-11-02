@@ -570,7 +570,7 @@ try:
             np.random.uniform(-0.3, 0.3),
             np.random.uniform(0.3, 0.7),
         ], dtype=np.float32).flatten()  # Ensure 1D
-        ball.set_world_pose(position=target_position)
+        ball.set_world_poses(positions=np.array([target_position]))
 
         episode_reward = 0
         ball_grasped = False
