@@ -38,6 +38,7 @@ print("Using Kimi Linear Attention (RecurrentKDA) for efficient transformers")
 # Kimi Linear Attention (RecurrentKDA)
 class RecurrentKDA(nn.Module):
     """Simplified recurrent KDA (Eq. 1) for causal self-attention with O(n) complexity."""
+
     def __init__(self, d_model: int, num_heads: int = 4):
         super().__init__()
         self.d_model = d_model
@@ -46,7 +47,9 @@ class RecurrentKDA(nn.Module):
         self.Wq = nn.Linear(d_model, d_model, bias=False)
         self.Wk = nn.Linear(d_model, d_model, bias=False)
         self.Wv = nn.Linear(d_model, d_model, bias=False)
-        self.Wg = nn.Linear(d_model, d_model, bias=False)  # For alpha (sigmoid -> [0,1])
+        self.Wg = nn.Linear(
+            d_model, d_model, bias=False
+        )  # For alpha (sigmoid -> [0,1])
         self.Wbeta = nn.Linear(d_model, num_heads, bias=False)  # Per-head beta
         self.Wo = nn.Linear(d_model, d_model, bias=False)
         self.norm = nn.LayerNorm(d_model)
@@ -60,7 +63,11 @@ class RecurrentKDA(nn.Module):
         q = self.Wq(x_norm).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
         k = self.Wk(x_norm).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
         v = self.Wv(x_norm).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
-        g = torch.sigmoid(self.Wg(x_norm)).view(B, T, self.num_heads, self.d_k).transpose(1, 2)  # Diag(alpha)
+        g = (
+            torch.sigmoid(self.Wg(x_norm))
+            .view(B, T, self.num_heads, self.d_k)
+            .transpose(1, 2)
+        )  # Diag(alpha)
         beta_all = torch.sigmoid(self.Wbeta(x_norm))  # [B, T, num_heads]
 
         new_states = []
@@ -73,14 +80,21 @@ class RecurrentKDA(nn.Module):
             alpha_t = g[:, :, t]
             beta_t = beta_all[:, t, :].unsqueeze(-1).unsqueeze(-1)  # [B, H, 1, 1]
 
-            S_t = state + beta_t * torch.einsum('b h d, b h e -> b h d e', k_t, v_t)  # Simplified update
-            S_t = (torch.eye(self.d_k, device=x.device)[None, None] - beta_t * torch.einsum('b h d, b h e -> b h d e', k_t, k_t)) @ (alpha_t.unsqueeze(-1) * S_t)
-            o_t = torch.einsum('b h d, b h d e -> b h e', q_t, S_t)
+            S_t = state + beta_t * torch.einsum(
+                "b h d, b h e -> b h d e", k_t, v_t
+            )  # Simplified update
+            S_t = (
+                torch.eye(self.d_k, device=x.device)[None, None]
+                - beta_t * torch.einsum("b h d, b h e -> b h d e", k_t, k_t)
+            ) @ (alpha_t.unsqueeze(-1) * S_t)
+            o_t = torch.einsum("b h d, b h d e -> b h e", q_t, S_t)
             outputs.append(o_t)
             new_states.append(S_t)
             state = S_t  # Update for next
 
-        o = torch.stack(outputs, dim=2).transpose(1, 2).contiguous().view(B, T, D)  # [B,T,D]
+        o = (
+            torch.stack(outputs, dim=2).transpose(1, 2).contiguous().view(B, T, D)
+        )  # [B,T,D]
         o = self.Wo(o)
         final_state = new_states[-1]  # Last state for next sequence
         return x + o, final_state  # Residual
@@ -115,14 +129,16 @@ class DiTBlock(nn.Module):
         c: conditioning (timestep + state) [batch, hidden_dim]
         kimi_state: recurrent state for Kimi attention
         """
-        scale_msa, gate_msa, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(c).chunk(4, dim=-1)
+        scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(
+            4, dim=-1
         )
 
         # Kimi Linear Attention with adaptive modulation
         x_scaled = x * (1 + scale_msa.unsqueeze(1))
         attn_out, new_kimi_state = self.kimi_attn(x_scaled, kimi_state)
-        x = x + gate_msa.unsqueeze(1) * (attn_out - x_scaled)  # Residual already in kimi_attn
+        x = x + gate_msa.unsqueeze(1) * (
+            attn_out - x_scaled
+        )  # Residual already in kimi_attn
 
         # MLP with adaptive modulation
         x_norm = self.norm2(x)
@@ -134,6 +150,7 @@ class DiTBlock(nn.Module):
 
 class SimpleCNN(nn.Module):
     """Simple CNN for visual feature extraction"""
+
     def __init__(self, output_dim=128, img_size=84):
         super().__init__()
         self.img_size = img_size
@@ -144,17 +161,14 @@ class SimpleCNN(nn.Module):
             nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
             nn.BatchNorm2d(32),
-
             # 42x42x32 -> 21x21x64
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
             nn.BatchNorm2d(64),
-
             # 21x21x64 -> 10x10x128
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
             nn.BatchNorm2d(128),
-
             # 10x10x128 -> 5x5x128
             nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
@@ -169,9 +183,7 @@ class SimpleCNN(nn.Module):
 
         # FC layers
         self.fc = nn.Sequential(
-            nn.Linear(self.flatten_size, 256),
-            nn.ReLU(),
-            nn.Linear(256, output_dim)
+            nn.Linear(self.flatten_size, 256), nn.ReLU(), nn.Linear(256, output_dim)
         )
 
     def forward(self, x):
@@ -190,7 +202,13 @@ class DiffusionTransformer(nn.Module):
     """Diffusion Transformer for action generation with vision"""
 
     def __init__(
-        self, state_dim, action_dim, hidden_dim=128, num_layers=4, num_heads=4, use_vision=True
+        self,
+        state_dim,
+        action_dim,
+        hidden_dim=128,
+        num_layers=4,
+        num_heads=4,
+        use_vision=True,
     ):
         super().__init__()
         self.action_dim = action_dim
@@ -284,7 +302,10 @@ class DiTAgent:
 
         # Create diffusion schedule with careful numerical stability
         self.betas = torch.linspace(
-            self.beta_start, self.beta_end, self.num_diffusion_steps, dtype=torch.float32
+            self.beta_start,
+            self.beta_end,
+            self.num_diffusion_steps,
+            dtype=torch.float32,
         ).to(device)
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
@@ -294,7 +315,12 @@ class DiTAgent:
 
         # Initialize DiT model with vision
         self.model = DiffusionTransformer(
-            state_dim, action_dim, hidden_dim=128, num_layers=3, num_heads=4, use_vision=use_vision
+            state_dim,
+            action_dim,
+            hidden_dim=128,
+            num_layers=3,
+            num_heads=4,
+            use_vision=use_vision,
         ).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
 
@@ -326,17 +352,26 @@ class DiTAgent:
                 if np.any(np.isnan(image)):
                     print(f"WARNING: NaN detected in image")
                     image = np.nan_to_num(image, 0.0)
-                image_tensor = torch.FloatTensor(image).unsqueeze(0).to(self.device) / 255.0
+                image_tensor = (
+                    torch.FloatTensor(image).unsqueeze(0).to(self.device) / 255.0
+                )
 
             # Start from random noise
-            action = torch.randn(1, self.action_dim, dtype=torch.float32).to(self.device) * 0.5
+            action = (
+                torch.randn(1, self.action_dim, dtype=torch.float32).to(self.device)
+                * 0.5
+            )
 
             # Reverse diffusion process (DDPM sampling)
             for t in reversed(range(self.num_diffusion_steps)):
-                timestep = torch.FloatTensor([[t / self.num_diffusion_steps]]).to(self.device)
+                timestep = torch.FloatTensor([[t / self.num_diffusion_steps]]).to(
+                    self.device
+                )
 
                 # Predict noise
-                predicted_noise = self.model(action, state_tensor, timestep, image_tensor)
+                predicted_noise = self.model(
+                    action, state_tensor, timestep, image_tensor
+                )
 
                 # Check for NaN in predicted noise
                 if torch.isnan(predicted_noise).any():
@@ -389,29 +424,42 @@ class DiTAgent:
         batch = [self.buffer[i] for i in indices]
 
         # Convert to tensors
-        states = torch.FloatTensor(np.array([s for s, a, r, ns, img in batch])).to(self.device)
-        actions = torch.FloatTensor(np.array([a for s, a, r, ns, img in batch])).to(self.device)
-        rewards = torch.FloatTensor(np.array([r for s, a, r, ns, img in batch])).to(self.device)
+        states = torch.FloatTensor(np.array([s for s, a, r, ns, img in batch])).to(
+            self.device
+        )
+        actions = torch.FloatTensor(np.array([a for s, a, r, ns, img in batch])).to(
+            self.device
+        )
+        rewards = torch.FloatTensor(np.array([r for s, a, r, ns, img in batch])).to(
+            self.device
+        )
 
         # Process images if using vision
         images_tensor = None
         if self.use_vision:
             images = [img for s, a, r, ns, img in batch if img is not None]
             if images:
-                images_tensor = torch.FloatTensor(np.stack(images)).to(self.device) / 255.0
+                images_tensor = (
+                    torch.FloatTensor(np.stack(images)).to(self.device) / 255.0
+                )
 
         # Diffusion training
         self.model.train()
 
         # Sample random timesteps
-        t = torch.randint(0, self.num_diffusion_steps, (self.batch_size,), dtype=torch.long).to(self.device)
+        t = torch.randint(
+            0, self.num_diffusion_steps, (self.batch_size,), dtype=torch.long
+        ).to(self.device)
 
         # Add noise to actions (forward diffusion process)
         noise = torch.randn_like(actions)
         alpha_cumprod_t = self.alphas_cumprod[t].view(-1, 1)
 
         # x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * noise
-        noisy_actions = torch.sqrt(alpha_cumprod_t + 1e-8) * actions + torch.sqrt(1.0 - alpha_cumprod_t + 1e-8) * noise
+        noisy_actions = (
+            torch.sqrt(alpha_cumprod_t + 1e-8) * actions
+            + torch.sqrt(1.0 - alpha_cumprod_t + 1e-8) * noise
+        )
 
         # Predict noise
         timesteps = (t.float() / self.num_diffusion_steps).view(-1, 1)
@@ -422,7 +470,7 @@ class DiTAgent:
 
         # Add reward weighting (prioritize good experiences)
         reward_weights = torch.sigmoid(rewards / 10.0)
-        weighted_loss = (loss * reward_weights.mean())
+        weighted_loss = loss * reward_weights.mean()
 
         # Optimize with gradient clipping
         self.optimizer.zero_grad()
@@ -502,7 +550,7 @@ wrist_camera = Camera(
     prim_path=camera_prim_path,
     resolution=(84, 84),  # Small resolution for faster processing
     position=np.array([0.05, 0.0, 0.05]),  # Offset from end-effector
-    orientation=np.array([0.7071, 0, 0.7071, 0])  # Point forward
+    orientation=np.array([0.7071, 0, 0.7071, 0]),  # Point forward
 )
 wrist_camera.initialize()
 
@@ -531,7 +579,9 @@ goal_path = "/World/Goal"
 goal_cube = UsdGeom.Cube.Define(stage, goal_path)
 goal_cube.GetSizeAttr().Set(0.15)
 goal_translate = goal_cube.AddTranslateOp()
-goal_translate.Set(Gf.Vec3d(-0.3, 0.3, 0.075))  # Goal position on floor (half cube size)
+goal_translate.Set(
+    Gf.Vec3d(-0.3, 0.3, 0.075)
+)  # Goal position on floor (half cube size)
 
 # Initialize world
 my_world.reset()
@@ -552,7 +602,7 @@ agent = DiTAgent(
 agent.load_model(MODEL_PATH)
 
 num_episodes = 1000
-max_steps_per_episode = 3000  # Increased to 3000 steps per episode
+max_steps_per_episode = 3000  # Balanced: enough time but fast iteration
 goal_position = np.array([-0.3, 0.3, 0.05])  # Goal location on floor
 save_interval = 10  # Save model every 10 episodes
 
@@ -573,11 +623,14 @@ try:
             my_world.step(render=False)
 
         # Reset ball to random position on floor using RigidPrim
-        target_position = np.array([
-            np.random.uniform(0.2, 0.6),   # x: in front of robot
-            np.random.uniform(-0.3, 0.3),  # y: left/right
-            0.05,                          # z: on floor (ball radius)
-        ], dtype=np.float32).flatten()  # Ensure 1D
+        target_position = np.array(
+            [
+                np.random.uniform(0.2, 0.6),  # x: in front of robot
+                np.random.uniform(-0.3, 0.3),  # y: left/right
+                0.05,  # z: on floor (ball radius)
+            ],
+            dtype=np.float32,
+        ).flatten()  # Ensure 1D
         ball.set_world_poses(positions=np.array([target_position]))
 
         episode_reward = 0
@@ -599,7 +652,9 @@ try:
                 # Reshape from flat array to image if needed
                 if len(rgba_data.shape) == 1:
                     rgba_data = rgba_data.reshape(84, 84, 4)
-                rgb_image = rgba_data[:, :, :3].astype(np.uint8)  # Get RGB only (84x84x3)
+                rgb_image = rgba_data[:, :, :3].astype(
+                    np.uint8
+                )  # Get RGB only (84x84x3)
 
             # Get robot state
             joint_positions = robot.get_joint_positions()[0]
@@ -620,28 +675,35 @@ try:
                 ball_grasped = True
 
             # Build state: joints + ball_grasped (NO ball position!)
-            state = np.concatenate([
-                joint_positions,                    # 9
-                [float(ball_grasped)]              # 1
-            ])  # Total: 10
+            state = np.concatenate(
+                [joint_positions, [float(ball_grasped)]]  # 9  # 1
+            )  # Total: 10
 
             # Get action from agent WITH VISION
             action = agent.get_action(state, image=rgb_image)
 
             # Debug: Print action every 50 steps
             if step % 50 == 0:
-                print(f"Step {step}: Action range [{action.min():.3f}, {action.max():.3f}], Mean: {action.mean():.3f}")
+                print(
+                    f"Step {step}: Action range [{action.min():.3f}, {action.max():.3f}], Mean: {action.mean():.3f}"
+                )
                 print(f"  Ball distance: {ball_distance:.3f}, EE pos: {ee_position}")
 
             # Apply action: first 7 = arm joints, last 1 = gripper
             # Use larger action scaling for faster learning
             new_positions = joint_positions.copy()
-            new_positions[:7] += action[:7] * 0.1  # Increased from 0.05 for faster movement
-            new_positions[:7] = np.clip(new_positions[:7], -2.8, 2.8)  # Franka joint limits
+            new_positions[:7] += (
+                action[:7] * 0.1
+            )  # Increased from 0.05 for faster movement
+            new_positions[:7] = np.clip(
+                new_positions[:7], -2.8, 2.8
+            )  # Franka joint limits
 
             # Gripper control: positive = close, negative = open
             gripper_action = np.clip(action[7], -1.0, 1.0)
-            new_positions[7:9] = np.clip(new_positions[7:9] + gripper_action * 0.005, 0.0, 0.04)  # Slower gripper
+            new_positions[7:9] = np.clip(
+                new_positions[7:9] + gripper_action * 0.005, 0.0, 0.04
+            )  # Slower gripper
 
             # Apply the positions (position control mode)
             robot.set_joint_positions(new_positions)
@@ -682,10 +744,9 @@ try:
 
             # Update agent (state WITHOUT ball position, using vision!)
             new_ball_grasped = new_ball_distance < 0.08 and new_gripper_width < 0.02
-            next_state = np.concatenate([
-                new_joint_positions,              # 9
-                [float(new_ball_grasped)]        # 1
-            ])  # Total: 10
+            next_state = np.concatenate(
+                [new_joint_positions, [float(new_ball_grasped)]]  # 9  # 1
+            )  # Total: 10
 
             agent.update(state, action, reward, next_state, image=rgb_image)
 
