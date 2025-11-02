@@ -295,8 +295,8 @@ class DiTAgent:
         self.use_vision = use_vision
         self.device = device
 
-        # Diffusion hyperparameters (simplified for stability)
-        self.num_diffusion_steps = 5  # Reduced from 10 for faster inference
+        # Diffusion hyperparameters (using KDA wrapper settings)
+        self.num_diffusion_steps = 10  # Increased for better quality with KDA
         self.beta_start = 0.0001
         self.beta_end = 0.02
 
@@ -313,14 +313,16 @@ class DiTAgent:
         # Clamp to avoid numerical issues
         self.alphas_cumprod = torch.clamp(self.alphas_cumprod, min=1e-8, max=1.0)
 
-        # Initialize DiT model with vision
+        # Initialize KDA DiffusionTransformer with vision
         self.model = DiffusionTransformer(
-            state_dim,
-            action_dim,
+            state_dim=state_dim,
+            action_dim=action_dim,
             hidden_dim=128,
             num_layers=3,
             num_heads=4,
             use_vision=use_vision,
+            diffusion_steps=self.num_diffusion_steps,
+            horizon=1,  # Single-step for now
         ).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
 
@@ -576,8 +578,8 @@ create_prim(camera_prim_path, "Camera")
 wrist_camera = Camera(
     prim_path=camera_prim_path,
     resolution=(84, 84),  # Small resolution for faster processing
-    position=np.array([0.05, 0.0, 0.05]),  # Offset from end-effector
-    orientation=np.array([0.7071, 0, 0.7071, 0]),  # Point forward
+    position=np.array([0.08, 0.0, 0.02]),  # Further forward, slightly down
+    orientation=np.array([0.9239, 0, 0.3827, 0]),  # Point forward and slightly down (45deg tilt)
 )
 wrist_camera.initialize()
 
@@ -663,6 +665,7 @@ try:
 
         episode_reward = 0
         ball_grasped = False
+        last_ball_visible = False  # Track previous visibility for smoothing
 
         for step in range(max_steps_per_episode):
             # Step simulation FIRST to update physics
@@ -714,22 +717,36 @@ try:
             ball_visible = False
             ball_pixel_count = 0
             if rgb_image is not None and rgb_image.size > 0 and not np.all(rgb_image == 0):
-                # Ball is black/dark sphere - detect dark pixels (low RGB values)
-                # Dark: R < 50, G < 50, B < 50
-                dark_mask = (rgb_image[:, :, 0] < 50) & (rgb_image[:, :, 1] < 50) & (rgb_image[:, :, 2] < 50)
+                # Ball is black sphere - detect very dark pixels (near-black)
+                # Use stricter threshold to avoid ground/shadows
+                dark_mask = (rgb_image[:, :, 0] < 30) & (rgb_image[:, :, 1] < 30) & (rgb_image[:, :, 2] < 30)
                 ball_pixel_count = np.sum(dark_mask)
-                ball_visible = ball_pixel_count > 20  # At least 20 dark pixels to confirm ball
+
+                # Ball should be reasonable size (50-2000 pixels for 84x84 image)
+                # Too few = noise, too many = seeing ground
+                ball_visible = (ball_pixel_count > 50) and (ball_pixel_count < 2000)
+
+                # Temporal smoothing: If ball was visible last frame and close in distance, keep visible
+                if not ball_visible and last_ball_visible and ball_distance < 0.3:
+                    ball_visible = True  # Assume still visible (avoid flicker)
 
                 # Save one debug image (first valid frame)
                 if not vision_debug_saved and ball_pixel_count > 0:
                     try:
                         import cv2
+                        debug_img = rgb_image.copy()
+                        # Draw mask overlay
+                        debug_img[dark_mask] = [0, 255, 0]  # Highlight detected pixels in green
                         cv2.imwrite("debug_camera_view.png", cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
-                        print(f"\n=== VISION DEBUG: Saved camera image to debug_camera_view.png ===")
-                        print(f"    Dark pixels detected: {ball_pixel_count}, Ball visible: {ball_visible}")
+                        cv2.imwrite("debug_camera_mask.png", cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR))
+                        print(f"\n=== VISION DEBUG: Saved debug images ===")
+                        print(f"    Dark pixels: {ball_pixel_count}, Ball visible: {ball_visible}")
                         vision_debug_saved = True
                     except:
                         pass  # OpenCV not available, skip image save
+
+            # Update last visibility for next frame
+            last_ball_visible = ball_visible
 
             # Debug: Print action and vision info every 50 steps
             if step % 50 == 0:
@@ -770,27 +787,28 @@ try:
 
             # Penalty for end-effector going below ground (normalized)
             if new_ee_position[2] < 0.05:
-                reward -= 5.0  # Large penalty for hard collision (normalized)
+                reward -= 2.0  # Reduced penalty
 
             # Graduated penalty for getting too close to ground (safety margin)
             elif new_ee_position[2] < 0.1:
-                reward -= (0.1 - new_ee_position[2]) * 10.0  # Max penalty: -0.5
+                reward -= (0.1 - new_ee_position[2]) * 5.0  # Reduced: Max penalty -0.25
 
             # Vision reward: Small bonus for seeing the ball (not the main objective)
             if ball_visible:
                 # Small reward for keeping ball in view (helps with exploration)
-                vision_reward = min(ball_pixel_count / 500.0, 0.2)  # Max +0.2 reward (small!)
+                vision_reward = min(ball_pixel_count / 500.0, 0.3)  # Slightly increased
                 reward += vision_reward
-            else:
-                # Very small penalty for not seeing ball
-                reward -= 0.1
+            # No penalty for not seeing - too harsh
 
             # Stage 1: Reach the ball (reward for getting closer)
             distance_improvement = ball_distance - new_ball_distance
-            reward += distance_improvement * 2.0  # Normalized: ~-0.1 to +0.1 per step
+            reward += distance_improvement * 5.0  # Increased! Make progress more rewarding
 
-            # Small time penalty to encourage efficiency
-            reward -= 0.001
+            # Small positive reward for being close to ball
+            if new_ball_distance < 0.2:
+                reward += 0.5  # Bonus for proximity
+
+            # No time penalty - let agent take time to learn
 
             # Stage 2: Grasp the ball
             new_joint_positions = robot.get_joint_positions()[0]
