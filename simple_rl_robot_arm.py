@@ -332,7 +332,9 @@ class DiTAgent:
         # Training stats
         self.episode_count = 0
         self.total_reward_history = []
+        self.loss_history = []  # Track training loss
         self.noise_scale = 0.3  # Exploration noise
+        self.step_count = 0  # Total training steps
 
     def get_action(self, state, image=None, deterministic=False):
         """Generate action using reverse diffusion process"""
@@ -489,8 +491,15 @@ class DiTAgent:
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
+        # Track training metrics
+        self.loss_history.append(weighted_loss.item())
+        self.step_count += 1
+
         # Decay exploration noise
         self.noise_scale = max(0.05, self.noise_scale * 0.999)
+
+        # Return loss for logging
+        return weighted_loss.item()
 
     def save_model(self, filepath):
         """Save agent state to file"""
@@ -499,8 +508,10 @@ class DiTAgent:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "episode_count": self.episode_count,
             "total_reward_history": self.total_reward_history,
-            "buffer": self.buffer[-1000:],  # Save last 1000 experiences
+            "loss_history": self.loss_history[-1000:],  # Save last 1000 losses
+            "buffer": list(self.buffer)[-1000:],  # Convert deque to list, save last 1000
             "noise_scale": self.noise_scale,
+            "step_count": self.step_count,
         }
         torch.save(model_data, filepath)
         print(f"Model saved to {filepath}")
@@ -516,12 +527,17 @@ class DiTAgent:
         self.optimizer.load_state_dict(model_data["optimizer_state_dict"])
         self.episode_count = model_data["episode_count"]
         self.total_reward_history = model_data["total_reward_history"]
-        self.buffer = model_data.get("buffer", [])
+        self.loss_history = model_data.get("loss_history", [])
+        self.step_count = model_data.get("step_count", 0)
+
+        # Load buffer and convert back to deque
+        buffer_list = model_data.get("buffer", [])
+        self.buffer = deque(buffer_list, maxlen=self.buffer_size)
         self.noise_scale = model_data.get("noise_scale", 0.3)
 
         print(f"Model loaded from {filepath}")
         print(
-            f"Resuming from episode {self.episode_count}, buffer size: {len(self.buffer)}"
+            f"Resuming from episode {self.episode_count}, step {self.step_count}, buffer size: {len(self.buffer)}"
         )
         return True
 
@@ -729,14 +745,13 @@ try:
 
             reward = 0
 
-            # Penalty for end-effector going below ground (z < 0.05)
+            # Penalty for end-effector going below ground (normalized)
             if new_ee_position[2] < 0.05:
-                reward -= 10.0  # Large penalty for ground collision
+                reward -= 5.0  # Large penalty for hard collision (normalized)
 
-            # Penalty for any robot link going below ground
-            # Check if end-effector is too low (safety margin)
-            if new_ee_position[2] < 0.1:
-                reward -= (0.1 - new_ee_position[2]) * 20.0  # Graduated penalty
+            # Graduated penalty for getting too close to ground (safety margin)
+            elif new_ee_position[2] < 0.1:
+                reward -= (0.1 - new_ee_position[2]) * 10.0  # Max penalty: -0.5
 
             # Stage 1: Reach the ball (reward for getting closer)
             distance_improvement = ball_distance - new_ball_distance
@@ -770,7 +785,8 @@ try:
                 [new_joint_positions, [float(new_ball_grasped)]]  # 9  # 1
             )  # Total: 10
 
-            agent.update(state, action, reward, next_state, image=rgb_image)
+            # Update agent and track loss
+            loss = agent.update(state, action, reward, next_state, image=rgb_image)
 
             episode_reward += reward
 
@@ -778,16 +794,23 @@ try:
         agent.total_reward_history.append(episode_reward)
         agent.episode_count = episode + 1
 
-        # Print progress
-        if episode % 10 == 0:
-            avg_reward = (
-                np.mean(agent.total_reward_history[-10:])
-                if len(agent.total_reward_history) >= 10
-                else np.mean(agent.total_reward_history)
-            )
-            print(
-                f"Episode {episode}/{agent.episode_count + num_episodes - 1}, Reward: {episode_reward:.2f}, Avg(10): {avg_reward:.2f}, Noise: {agent.noise_scale:.3f}"
-            )
+        # Print progress with detailed metrics (every episode)
+        avg_reward = (
+            np.mean(agent.total_reward_history[-10:])
+            if len(agent.total_reward_history) >= 10
+            else np.mean(agent.total_reward_history)
+        )
+        avg_loss = (
+            np.mean(agent.loss_history[-100:])
+            if len(agent.loss_history) >= 100
+            else (np.mean(agent.loss_history) if agent.loss_history else 0.0)
+        )
+        print(
+            f"Ep {episode:4d} | "
+            f"R: {episode_reward:7.2f} | Avg: {avg_reward:7.2f} | "
+            f"Loss: {avg_loss:.4f} | Steps: {agent.step_count:6d} | "
+            f"Noise: {agent.noise_scale:.3f} | Buf: {len(agent.buffer):5d}"
+        )
 
         # Save model periodically
         if (episode + 1) % save_interval == 0:
