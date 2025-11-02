@@ -35,6 +35,95 @@ from isaacsim.storage.native import get_assets_root_path
 print("Using Kimi Linear Attention (RecurrentKDA) for efficient transformers")
 
 
+# ============================================================================
+# LLM Behavior Adjuster - Integrated
+# ============================================================================
+
+class SimpleLLMBehaviorAdjuster:
+    """
+    Simple rule-based behavior adjuster
+    Directly modifies rewards based on robot behavior patterns
+    """
+
+    def __init__(self):
+        self.episode_count = 0
+
+    def adjust_rewards(self, trajectories, episode_num):
+        """
+        Analyze trajectories and return reward adjustments
+        """
+        adjustments = []
+
+        for traj_idx, trajectory in enumerate(trajectories):
+            for step_idx, step in enumerate(trajectory):
+                distance = step['ball_distance']
+                ee_z = step['ee_pos'][2]
+                ball_z = step['ball_pos'][2]
+                grasped = step.get('ball_grasped', False)
+
+                # RULE 1: Reward getting close to ball
+                if distance < 0.15:
+                    bonus = 5.0 * (0.15 - distance)
+                    adjustments.append((traj_idx, step_idx, bonus))
+
+                # RULE 2: Penalize being far from ball
+                elif distance > 0.8:
+                    penalty = -2.0
+                    adjustments.append((traj_idx, step_idx, penalty))
+
+                # RULE 3: Penalize high end-effector when ball is on floor
+                if distance < 0.3 and ee_z > 0.3:
+                    penalty = -1.5
+                    adjustments.append((traj_idx, step_idx, penalty))
+
+                # RULE 4: Big reward for grasping
+                if grasped:
+                    bonus = 10.0
+                    adjustments.append((traj_idx, step_idx, bonus))
+
+                # RULE 5: Reward lowering end-effector when close to ball
+                if distance < 0.2 and ee_z < 0.15:
+                    bonus = 3.0
+                    adjustments.append((traj_idx, step_idx, bonus))
+
+        return {
+            'adjustments': adjustments,
+            'num_adjustments': len(adjustments),
+            'summary': f"Applied {len(adjustments)} reward adjustments"
+        }
+
+
+def apply_behavior_adjustments(trajectories, adjustments_dict):
+    """Apply reward adjustments to trajectories"""
+    adjusted_trajectories = []
+
+    for traj_idx, trajectory in enumerate(trajectories):
+        adjusted_traj = []
+
+        for step_idx, step in enumerate(trajectory):
+            adjusted_step = step.copy()
+
+            # Find adjustments for this step
+            relevant_adjustments = [
+                adj for traj_i, step_i, adj in adjustments_dict['adjustments']
+                if traj_i == traj_idx and step_i == step_idx
+            ]
+
+            # Apply adjustments
+            if relevant_adjustments:
+                total_adjustment = sum(relevant_adjustments)
+                adjusted_step['reward'] += total_adjustment
+                adjusted_step['adjusted'] = True
+                adjusted_step['original_reward'] = step['reward']
+
+            adjusted_traj.append(adjusted_step)
+
+        adjusted_trajectories.append(adjusted_traj)
+
+    return adjusted_trajectories
+
+
+# ============================================================================
 # Kimi Linear Attention (RecurrentKDA)
 class RecurrentKDA(nn.Module):
     """Simplified recurrent KDA (Eq. 1) for causal self-attention with O(n) complexity."""
@@ -601,14 +690,23 @@ agent = DiTAgent(
 # Try to load existing model
 agent.load_model(MODEL_PATH)
 
+# Initialize behavior adjuster
+behavior_adjuster = SimpleLLMBehaviorAdjuster()
+use_behavior_adjustment = True
+
 num_episodes = 1000
-max_steps_per_episode = 3000  # Balanced: enough time but fast iteration
+max_steps_per_episode = 1500  # Balanced: enough time but fast iteration
 goal_position = np.array([-0.3, 0.3, 0.05])  # Goal location on floor
 save_interval = 10  # Save model every 10 episodes
+adjustment_interval = 50  # Adjust behavior every 50 episodes
+
+# Trajectory storage
+trajectory_buffer = []
 
 print("Starting RL Training...")
 print(f"Episodes: {num_episodes}, Max steps per episode: {max_steps_per_episode}")
 print(f"Model will be saved to: {MODEL_PATH}")
+print(f"Behavior adjustment every {adjustment_interval} episodes")
 
 try:
     for episode in range(agent.episode_count, agent.episode_count + num_episodes):
@@ -635,6 +733,9 @@ try:
 
         episode_reward = 0
         ball_grasped = False
+
+        # Trajectory for behavior adjustment
+        episode_trajectory = []
 
         # Step simulation once to initialize camera
         my_world.step(render=True)
@@ -750,7 +851,24 @@ try:
 
             agent.update(state, action, reward, next_state, image=rgb_image)
 
+            # Store step data for behavior adjustment
+            episode_trajectory.append({
+                'state': state.copy(),
+                'action': action.copy(),
+                'reward': reward,
+                'next_state': next_state.copy(),
+                'image': rgb_image.copy() if rgb_image is not None else None,
+                'ball_distance': ball_distance,
+                'ee_pos': ee_position.copy(),
+                'ball_pos': ball_pos.copy(),
+                'ball_grasped': ball_grasped,
+                'step': step
+            })
+
             episode_reward += reward
+
+        # Store trajectory
+        trajectory_buffer.append(episode_trajectory)
 
         # Track statistics
         agent.total_reward_history.append(episode_reward)
@@ -766,6 +884,39 @@ try:
             print(
                 f"Episode {episode}/{agent.episode_count + num_episodes - 1}, Reward: {episode_reward:.2f}, Avg(10): {avg_reward:.2f}, Noise: {agent.noise_scale:.3f}"
             )
+
+        # Behavior Adjustment every N episodes
+        if use_behavior_adjustment and (episode + 1) % adjustment_interval == 0 and episode > 0:
+            print(f"\n🎯 Adjusting behavior based on last {adjustment_interval} episodes...")
+            try:
+                # Get recent trajectories
+                recent_trajectories = trajectory_buffer[-adjustment_interval:]
+
+                # Adjust rewards to shape behavior
+                adjustments = behavior_adjuster.adjust_rewards(recent_trajectories, episode)
+                adjusted_trajectories = apply_behavior_adjustments(recent_trajectories, adjustments)
+
+                print(f"✅ Applied {adjustments['num_adjustments']} reward adjustments")
+                print(f"   {adjustments['summary']}")
+
+                # Add adjusted experiences back to agent's buffer for re-training
+                experiences_added = 0
+                for traj in adjusted_trajectories:
+                    for step_data in traj:
+                        if step_data.get('adjusted', False):
+                            agent.buffer.append((
+                                step_data['state'],
+                                step_data['action'],
+                                step_data['reward'],  # Adjusted reward
+                                step_data['next_state'],
+                                step_data['image']
+                            ))
+                            experiences_added += 1
+
+                print(f"   Re-training on {experiences_added} adjusted experiences\n")
+
+            except Exception as e:
+                print(f"⚠️  Behavior adjustment failed: {e}\n")
 
         # Save model periodically
         if (episode + 1) % save_interval == 0:
