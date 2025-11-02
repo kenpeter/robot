@@ -632,6 +632,7 @@ num_episodes = 1000
 max_steps_per_episode = 3000  # Balanced: enough time but fast iteration
 goal_position = np.array([-0.3, 0.3, 0.05])  # Goal location on floor
 save_interval = 10  # Save model every 10 episodes
+vision_debug_saved = False  # Flag to save one camera image for debugging
 
 print("Starting RL Training...")
 print(f"Episodes: {num_episodes}, Max steps per episode: {max_steps_per_episode}")
@@ -709,12 +710,34 @@ try:
             # Get action from agent WITH VISION
             action = agent.get_action(state, image=rgb_image)
 
-            # Debug: Print action every 50 steps
+            # Vision debugging: Check if ball is visible in camera
+            ball_visible = False
+            ball_pixel_count = 0
+            if rgb_image is not None and rgb_image.size > 0 and not np.all(rgb_image == 0):
+                # Ball is black/dark sphere - detect dark pixels (low RGB values)
+                # Dark: R < 50, G < 50, B < 50
+                dark_mask = (rgb_image[:, :, 0] < 50) & (rgb_image[:, :, 1] < 50) & (rgb_image[:, :, 2] < 50)
+                ball_pixel_count = np.sum(dark_mask)
+                ball_visible = ball_pixel_count > 20  # At least 20 dark pixels to confirm ball
+
+                # Save one debug image (first valid frame)
+                if not vision_debug_saved and ball_pixel_count > 0:
+                    try:
+                        import cv2
+                        cv2.imwrite("debug_camera_view.png", cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
+                        print(f"\n=== VISION DEBUG: Saved camera image to debug_camera_view.png ===")
+                        print(f"    Dark pixels detected: {ball_pixel_count}, Ball visible: {ball_visible}")
+                        vision_debug_saved = True
+                    except:
+                        pass  # OpenCV not available, skip image save
+
+            # Debug: Print action and vision info every 50 steps
             if step % 50 == 0:
                 print(
                     f"Step {step}: Action range [{action.min():.3f}, {action.max():.3f}], Mean: {action.mean():.3f}"
                 )
-                print(f"  Ball distance: {ball_distance:.3f}, EE pos: {ee_position}")
+                print(f"  Ball dist: {ball_distance:.3f}, EE: {ee_position}")
+                print(f"  Vision: Dark pixels={ball_pixel_count}, Ball visible={ball_visible}")
 
             # Apply action: first 7 = arm joints, last 1 = gripper
             # Use larger action scaling for faster learning
@@ -752,6 +775,15 @@ try:
             # Graduated penalty for getting too close to ground (safety margin)
             elif new_ee_position[2] < 0.1:
                 reward -= (0.1 - new_ee_position[2]) * 10.0  # Max penalty: -0.5
+
+            # Vision reward: Encourage camera to see the ball
+            if ball_visible:
+                # Reward based on how many dark pixels (ball size in view)
+                vision_reward = min(ball_pixel_count / 100.0, 2.0)  # Max +2.0 reward
+                reward += vision_reward
+            else:
+                # Small penalty for not seeing ball (encourages looking for it)
+                reward -= 0.5
 
             # Stage 1: Reach the ball (reward for getting closer)
             distance_improvement = ball_distance - new_ball_distance
