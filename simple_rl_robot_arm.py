@@ -369,11 +369,11 @@ class DiTAgent:
                 ) / torch.sqrt(alpha)
                 action = action + sigma * noise
 
-            # Add exploration noise during training
+            # Add exploration noise during training (reduced)
             if not deterministic:
-                action = action + self.noise_scale * torch.randn_like(action)
+                action = action + self.noise_scale * 0.1 * torch.randn_like(action)
 
-            action = torch.clamp(action, -0.1, 0.1)  # Limit action magnitude
+            action = torch.clamp(action, -1.0, 1.0)  # Keep actions normalized
 
         return action.cpu().numpy()[0]
 
@@ -392,9 +392,10 @@ class DiTAgent:
         indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
         batch = [self.buffer[i] for i in indices]
 
-        states = torch.FloatTensor([s for s, a, r, ns, img in batch]).to(self.device)
-        actions = torch.FloatTensor([a for s, a, r, ns, img in batch]).to(self.device)
-        rewards = torch.FloatTensor([r for s, a, r, ns, img in batch]).to(self.device)
+        # Convert to numpy arrays first for better performance
+        states = torch.FloatTensor(np.array([s for s, a, r, ns, img in batch])).to(self.device)
+        actions = torch.FloatTensor(np.array([a for s, a, r, ns, img in batch])).to(self.device)
+        rewards = torch.FloatTensor(np.array([r for s, a, r, ns, img in batch])).to(self.device)
 
         # Process images if using vision
         images_tensor = None
@@ -626,13 +627,14 @@ try:
             action = agent.get_action(state, image=rgb_image)
 
             # Apply action: first 7 = arm joints, last 1 = gripper
+            # Use much smaller action scaling to prevent instability
             new_positions = joint_positions.copy()
-            new_positions[:7] += action[:7] * 0.1  # Scale down arm actions
-            new_positions[:7] = np.clip(new_positions[:7], -2.5, 2.5)
+            new_positions[:7] += action[:7] * 0.01  # Reduced from 0.1 to 0.01
+            new_positions[:7] = np.clip(new_positions[:7], -2.0, 2.0)  # Tighter limits
 
             # Gripper control: positive = close, negative = open
             gripper_action = np.clip(action[7], -1.0, 1.0)
-            new_positions[7:9] = np.clip(new_positions[7:9] + gripper_action * 0.01, 0.0, 0.04)
+            new_positions[7:9] = np.clip(new_positions[7:9] + gripper_action * 0.005, 0.0, 0.04)  # Slower gripper
 
             robot.set_joint_positions([new_positions])
 
