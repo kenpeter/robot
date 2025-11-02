@@ -776,14 +776,14 @@ try:
             elif new_ee_position[2] < 0.1:
                 reward -= (0.1 - new_ee_position[2]) * 10.0  # Max penalty: -0.5
 
-            # Vision reward: Encourage camera to see the ball
+            # Vision reward: Small bonus for seeing the ball (not the main objective)
             if ball_visible:
-                # Reward based on how many dark pixels (ball size in view)
-                vision_reward = min(ball_pixel_count / 100.0, 2.0)  # Max +2.0 reward
+                # Small reward for keeping ball in view (helps with exploration)
+                vision_reward = min(ball_pixel_count / 500.0, 0.2)  # Max +0.2 reward (small!)
                 reward += vision_reward
             else:
-                # Small penalty for not seeing ball (encourages looking for it)
-                reward -= 0.5
+                # Very small penalty for not seeing ball
+                reward -= 0.1
 
             # Stage 1: Reach the ball (reward for getting closer)
             distance_improvement = ball_distance - new_ball_distance
