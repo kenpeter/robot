@@ -602,7 +602,7 @@ agent = DiTAgent(
 agent.load_model(MODEL_PATH)
 
 num_episodes = 1000
-max_steps_per_episode = 3000  # Balanced: enough time but fast iteration
+max_steps_per_episode = 2000  # Balanced: enough time but fast iteration
 goal_position = np.array([-0.3, 0.3, 0.05])  # Goal location on floor
 save_interval = 10  # Save model every 10 episodes
 
