@@ -882,4 +882,12 @@ finally:
     print(f"Training complete! Total episodes: {agent.episode_count}")
     print(f"Final model saved to: {MODEL_PATH}")
     agent.save_model(MODEL_PATH)
+
+    # Explicit cleanup to avoid shutdown crash
+    try:
+        my_world.stop()
+        my_world.clear()
+    except:
+        pass
+
     simulation_app.close()
