@@ -25,6 +25,7 @@ import carb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from collections import deque
 from isaacsim.core.api import World
 from isaacsim.core.prims import Articulation, RigidPrim
 from isaacsim.core.utils.stage import add_reference_to_stage
@@ -136,9 +137,8 @@ class DiTBlock(nn.Module):
         # Kimi Linear Attention with adaptive modulation
         x_scaled = x * (1 + scale_msa.unsqueeze(1))
         attn_out, new_kimi_state = self.kimi_attn(x_scaled, kimi_state)
-        x = x + gate_msa.unsqueeze(1) * (
-            attn_out - x_scaled
-        )  # Residual already in kimi_attn
+        # attn_out already has residual from kimi_attn, just apply gate
+        x = attn_out * gate_msa.unsqueeze(1)
 
         # MLP with adaptive modulation
         x_norm = self.norm2(x)
@@ -155,24 +155,24 @@ class SimpleCNN(nn.Module):
         super().__init__()
         self.img_size = img_size
 
-        # Simple convolutional layers
+        # Simple convolutional layers (using GroupNorm instead of BatchNorm for stability)
         self.conv = nn.Sequential(
             # 84x84x3 -> 42x42x32
             nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.BatchNorm2d(32),
+            nn.GroupNorm(8, 32),  # 8 groups for 32 channels
             # 42x42x32 -> 21x21x64
             nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),  # 8 groups for 64 channels
             # 21x21x64 -> 10x10x128
             nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(16, 128),  # 16 groups for 128 channels
             # 10x10x128 -> 5x5x128
             nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
             nn.ReLU(),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(16, 128),  # 16 groups for 128 channels
         )
 
         # Adaptive pooling to ensure consistent output size
@@ -324,8 +324,8 @@ class DiTAgent:
         ).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
 
-        # Experience replay buffer
-        self.buffer = []
+        # Experience replay buffer (using deque for O(1) append/pop)
+        self.buffer = deque(maxlen=10000)
         self.buffer_size = 10000
         self.batch_size = 64
 
@@ -390,6 +390,9 @@ class DiTAgent:
                 # Update action
                 action = coef1 * (action - coef2 * predicted_noise)
 
+                # Clamp intermediate values to prevent explosion
+                action = torch.clamp(action, -10.0, 10.0)
+
                 # Add noise if not final step
                 if t > 0:
                     noise = torch.randn_like(action) * 0.1  # Reduced noise
@@ -414,17 +417,21 @@ class DiTAgent:
         if self.use_vision and (image is None or image.size == 0 or np.all(image == 0)):
             return  # Skip invalid vision experiences
 
-        # Add to buffer
+        # Add to buffer (deque auto-evicts oldest when full)
         self.buffer.append((state, action, reward, next_state, image))
-        if len(self.buffer) > self.buffer_size:
-            self.buffer.pop(0)
 
         # Train if enough samples
         if len(self.buffer) < self.batch_size:
             return
 
-        # Sample batch
-        indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
+        # Sample batch - only from valid vision experiences
+        if self.use_vision:
+            valid_indices = [i for i in range(len(self.buffer)) if self.buffer[i][4] is not None]
+            if len(valid_indices) < self.batch_size:
+                return  # Not enough valid samples
+            indices = np.random.choice(valid_indices, self.batch_size, replace=False)
+        else:
+            indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
         batch = [self.buffer[i] for i in indices]
 
         # Convert to tensors
@@ -469,12 +476,12 @@ class DiTAgent:
         timesteps = (t.float() / self.num_diffusion_steps).view(-1, 1)
         predicted_noise = self.model(noisy_actions, states, timesteps, images_tensor)
 
-        # Compute loss (MSE between predicted and actual noise)
-        loss = F.mse_loss(predicted_noise, noise)
+        # Compute per-sample loss (MSE between predicted and actual noise)
+        per_sample_loss = F.mse_loss(predicted_noise, noise, reduction='none').mean(dim=1)
 
         # Add reward weighting (prioritize good experiences)
         reward_weights = torch.sigmoid(rewards / 10.0)
-        weighted_loss = loss * reward_weights.mean()
+        weighted_loss = (per_sample_loss * reward_weights).mean()
 
         # Optimize with gradient clipping
         self.optimizer.zero_grad()
@@ -640,11 +647,11 @@ try:
         episode_reward = 0
         ball_grasped = False
 
-        # Step simulation once to initialize camera
-        my_world.step(render=True)
-
         for step in range(max_steps_per_episode):
-            # Capture camera image
+            # Step simulation FIRST to update physics
+            my_world.step(render=True)
+
+            # THEN capture camera image (synchronized with current state)
             wrist_camera.get_current_frame()
             rgba_data = wrist_camera.get_rgba()
 
@@ -660,7 +667,7 @@ try:
                     np.uint8
                 )  # Get RGB only (84x84x3)
 
-            # Get robot state
+            # Get robot state (after step, synchronized with image)
             joint_positions = robot.get_joint_positions()[0]
             ball_pos, _ = ball.get_world_poses()
             ball_pos = np.array(ball_pos, dtype=np.float32).flatten()
@@ -712,10 +719,7 @@ try:
             # Apply the positions (position control mode)
             robot.set_joint_positions(new_positions)
 
-            # Step simulation
-            my_world.step(render=True)
-
-            # Multi-stage reward function
+            # Multi-stage reward function (step happens at start of next loop)
             new_ball_pos, _ = ball.get_world_poses()
             new_ball_pos = np.array(new_ball_pos, dtype=np.float32).flatten()
             new_ee_position, _ = end_effector.get_world_poses()
@@ -724,6 +728,15 @@ try:
             new_goal_distance = np.linalg.norm(new_ball_pos - goal_position)
 
             reward = 0
+
+            # Penalty for end-effector going below ground (z < 0.05)
+            if new_ee_position[2] < 0.05:
+                reward -= 10.0  # Large penalty for ground collision
+
+            # Penalty for any robot link going below ground
+            # Check if end-effector is too low (safety margin)
+            if new_ee_position[2] < 0.1:
+                reward -= (0.1 - new_ee_position[2]) * 20.0  # Graduated penalty
 
             # Stage 1: Reach the ball (reward for getting closer)
             distance_improvement = ball_distance - new_ball_distance
