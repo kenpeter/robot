@@ -432,13 +432,11 @@ try:
         robot.set_joint_positions(np.concatenate([initial_pos, [0.04, 0.04]]))
 
         # Reset target to random position
-        target_position = np.array(
-            [
-                np.random.uniform(0.2, 0.5),
-                np.random.uniform(-0.3, 0.3),
-                np.random.uniform(0.3, 0.7),
-            ]
-        )
+        target_position = np.array([
+            np.random.uniform(0.2, 0.5),
+            np.random.uniform(-0.3, 0.3),
+            np.random.uniform(0.3, 0.7),
+        ], dtype=np.float32).flatten()  # Ensure 1D
         sphere_translate.Set(
             Gf.Vec3d(
                 float(target_position[0]),
@@ -456,6 +454,7 @@ try:
                 0
             ]  # Get first element (single robot)
             ee_position, _ = end_effector.get_world_poses()
+            ee_position = np.array(ee_position, dtype=np.float32).flatten()  # Ensure 1D
 
             # Calculate distances
             ball_distance = np.linalg.norm(ee_position - target_position)
@@ -495,6 +494,7 @@ try:
 
             # Multi-stage reward function
             new_ee_position, _ = end_effector.get_world_poses()
+            new_ee_position = np.array(new_ee_position, dtype=np.float32).flatten()  # Ensure 1D
             new_ball_distance = np.linalg.norm(new_ee_position - target_position)
             new_goal_distance = np.linalg.norm(target_position - goal_position)
 
