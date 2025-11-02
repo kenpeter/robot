@@ -43,23 +43,66 @@ except Exception as e:
     print(f"Flash Attention 4 not available ({e}), using standard attention")
 
 
+# Kimi Linear Attention (RecurrentKDA)
+class RecurrentKDA(nn.Module):
+    """Simplified recurrent KDA (Eq. 1) for causal self-attention with O(n) complexity."""
+    def __init__(self, d_model: int, num_heads: int = 4):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.Wq = nn.Linear(d_model, d_model, bias=False)
+        self.Wk = nn.Linear(d_model, d_model, bias=False)
+        self.Wv = nn.Linear(d_model, d_model, bias=False)
+        self.Wg = nn.Linear(d_model, d_model, bias=False)  # For alpha (sigmoid -> [0,1])
+        self.Wbeta = nn.Linear(d_model, num_heads, bias=False)  # Per-head beta
+        self.Wo = nn.Linear(d_model, d_model, bias=False)
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor, state: torch.Tensor = None):
+        B, T, D = x.shape
+        if state is None:
+            state = torch.zeros(B, self.num_heads, self.d_k, self.d_k, device=x.device)
+
+        x_norm = self.norm(x)
+        q = self.Wq(x_norm).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
+        k = self.Wk(x_norm).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
+        v = self.Wv(x_norm).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
+        g = torch.sigmoid(self.Wg(x_norm)).view(B, T, self.num_heads, self.d_k).transpose(1, 2)  # Diag(alpha)
+        beta = torch.sigmoid(self.Wbeta(x_norm))[:, None, :, None, None]  # [B,1,H,1,1]
+
+        new_states = []
+        outputs = []
+        for t in range(T):
+            # Recurrent step (causal: only up to t)
+            q_t = q[:, :, t]  # [B, H, d_k]
+            k_t = k[:, :, t]
+            v_t = v[:, :, t]
+            alpha_t = g[:, :, t]
+            S_t = state + beta * torch.einsum('b h d, b h e -> b h d e', k_t, v_t)  # Simplified update
+            S_t = (torch.eye(self.d_k, device=x.device)[None, None] - beta * torch.einsum('b h d, b h e -> b h d e', k_t, k_t)) @ (alpha_t.unsqueeze(-1) * S_t)
+            o_t = torch.einsum('b h d, b h d e -> b h e', q_t, S_t)
+            outputs.append(o_t)
+            new_states.append(S_t)
+            state = S_t  # Update for next
+
+        o = torch.stack(outputs, dim=2).transpose(1, 2).contiguous().view(B, T, D)  # [B,T,D]
+        o = self.Wo(o)
+        final_state = new_states[-1]  # Last state for next sequence
+        return x + o, final_state  # Residual
+
+
 # Diffusion Transformer for continuous action generation
 class DiTBlock(nn.Module):
-    """Transformer block with adaptive layer norm and Flash Attention for diffusion timestep conditioning"""
+    """Transformer block with adaptive layer norm and Kimi Linear Attention for diffusion timestep conditioning"""
 
     def __init__(self, hidden_dim, num_heads=4):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
-        self.head_dim = hidden_dim // num_heads
 
-        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
-
-        self.norm1 = nn.LayerNorm(hidden_dim)
-
-        # QKV projection for Flash Attention
-        self.qkv = nn.Linear(hidden_dim, 3 * hidden_dim)
-        self.proj = nn.Linear(hidden_dim, hidden_dim)
+        # Use Kimi Linear Attention instead of quadratic attention
+        self.kimi_attn = RecurrentKDA(hidden_dim, num_heads)
 
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.mlp = nn.Sequential(
@@ -69,74 +112,121 @@ class DiTBlock(nn.Module):
         )
         # Adaptive modulation parameters
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_dim, 6 * hidden_dim)
+            nn.SiLU(), nn.Linear(hidden_dim, 4 * hidden_dim)  # Reduced from 6 to 4
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, kimi_state=None):
         """
         x: input tokens [batch, seq_len, hidden_dim]
         c: conditioning (timestep + state) [batch, hidden_dim]
+        kimi_state: recurrent state for Kimi attention
         """
-        batch_size, seq_len, _ = x.shape
-
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(c).chunk(6, dim=-1)
+        scale_msa, gate_msa, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(4, dim=-1)
         )
 
-        # Self-attention with adaptive modulation using Flash Attention 4
-        x_norm = self.norm1(x)
-        x_norm = x_norm * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-
-        # QKV projection
-        qkv = self.qkv(x_norm)
-        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, batch, num_heads, seq_len, head_dim]
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        # Use Flash Attention 4 if available, otherwise fallback
-        if USE_FA4 and torch.cuda.is_available() and flash_attention_4 is not None:
-            # Flash Attention 4 with async pipeline and optimized softmax
-            attn_out = flash_attention_4(q, k, v)
-            attn_out = attn_out.transpose(1, 2).reshape(
-                batch_size, seq_len, self.hidden_dim
-            )
-        else:
-            # Fallback: PyTorch's scaled_dot_product_attention (uses FA2/FA3)
-            attn_out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False
-            )
-            attn_out = attn_out.transpose(1, 2).reshape(
-                batch_size, seq_len, self.hidden_dim
-            )
-
-        attn_out = self.proj(attn_out)
-
-        x = x + gate_msa.unsqueeze(1) * attn_out
+        # Kimi Linear Attention with adaptive modulation
+        x_scaled = x * (1 + scale_msa.unsqueeze(1))
+        attn_out, new_kimi_state = self.kimi_attn(x_scaled, kimi_state)
+        x = x + gate_msa.unsqueeze(1) * (attn_out - x_scaled)  # Residual already in kimi_attn
 
         # MLP with adaptive modulation
         x_norm = self.norm2(x)
-        x_norm = x_norm * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        x_norm = x_norm * (1 + scale_mlp.unsqueeze(1))
         x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm)
+
+        return x, new_kimi_state
+
+
+class VisionTransformer(nn.Module):
+    """Lightweight Vision Transformer (ViT) for RGB images"""
+    def __init__(self, output_dim=128, img_size=84, patch_size=14, num_heads=4, depth=2):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size) ** 2  # 6x6 = 36 patches
+        self.patch_dim = 3 * patch_size * patch_size  # 3 * 14 * 14 = 588
+
+        # Patch embedding
+        self.patch_embed = nn.Linear(self.patch_dim, output_dim)
+
+        # Positional embedding (learnable)
+        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches + 1, output_dim) * 0.02)
+
+        # CLS token
+        self.cls_token = nn.Parameter(torch.randn(1, 1, output_dim))
+
+        # Kimi Linear Attention layers instead of standard transformer
+        self.kimi_layers = nn.ModuleList([
+            RecurrentKDA(output_dim, num_heads) for _ in range(depth)
+        ])
+
+        # Output projection
+        self.head = nn.Sequential(
+            nn.LayerNorm(output_dim),
+            nn.Linear(output_dim, output_dim)
+        )
+
+    def patchify(self, x):
+        """Convert image to patches"""
+        # x: [B, C, H, W]
+        B, C, H, W = x.shape
+        x = x.reshape(B, C, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size)
+        x = x.permute(0, 2, 4, 1, 3, 5).contiguous()  # [B, H', W', C, patch_size, patch_size]
+        x = x.reshape(B, self.num_patches, self.patch_dim)  # [B, num_patches, patch_dim]
+        return x
+
+    def forward(self, x):
+        # x: [B, H, W, C] from Isaac Sim -> [B, C, H, W] for PyTorch
+        if len(x.shape) == 4 and x.shape[-1] == 3:
+            x = x.permute(0, 3, 1, 2)  # BHWC -> BCHW
+
+        B = x.shape[0]
+
+        # Patchify and embed
+        patches = self.patchify(x)  # [B, num_patches, patch_dim]
+        x = self.patch_embed(patches)  # [B, num_patches, output_dim]
+
+        # Add CLS token
+        cls_tokens = self.cls_token.expand(B, -1, -1)  # [B, 1, output_dim]
+        x = torch.cat([cls_tokens, x], dim=1)  # [B, num_patches+1, output_dim]
+
+        # Add positional embedding
+        x = x + self.pos_embed
+
+        # Kimi Linear Attention layers
+        kimi_state = None
+        for layer in self.kimi_layers:
+            x, kimi_state = layer(x, kimi_state)
+
+        # Use CLS token as output
+        x = x[:, 0]  # [B, output_dim]
+        x = self.head(x)
 
         return x
 
 
 class DiffusionTransformer(nn.Module):
-    """Diffusion Transformer for action generation"""
+    """Diffusion Transformer for action generation with vision"""
 
     def __init__(
-        self, state_dim, action_dim, hidden_dim=128, num_layers=4, num_heads=4
+        self, state_dim, action_dim, hidden_dim=128, num_layers=4, num_heads=4, use_vision=True
     ):
         super().__init__()
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
+        self.use_vision = use_vision
+
+        # Vision encoder (ViT)
+        if use_vision:
+            self.vision_encoder = VisionTransformer(output_dim=hidden_dim)
 
         # Timestep embedding (for diffusion process)
         self.time_embed = nn.Sequential(
             nn.Linear(1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)
         )
 
-        # State encoder
+        # State encoder (proprioception only, no ball position)
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.SiLU(),
@@ -156,11 +246,12 @@ class DiffusionTransformer(nn.Module):
             nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, action_dim)
         )
 
-    def forward(self, noisy_action, state, timestep):
+    def forward(self, noisy_action, state, timestep, image=None):
         """
         noisy_action: [batch, action_dim] - noisy action at timestep t
-        state: [batch, state_dim] - robot state
+        state: [batch, state_dim] - robot proprioceptive state
         timestep: [batch, 1] - diffusion timestep (0 to 1)
+        image: [batch, H, W, 3] - optional RGB image
 
         Returns: predicted noise [batch, action_dim]
         """
@@ -169,15 +260,20 @@ class DiffusionTransformer(nn.Module):
         s_emb = self.state_encoder(state)  # [batch, hidden_dim]
         a_emb = self.action_encoder(noisy_action)  # [batch, hidden_dim]
 
-        # Conditioning: combine timestep and state
+        # Conditioning: combine timestep, state, and vision
         c = t_emb + s_emb  # [batch, hidden_dim]
+
+        if self.use_vision and image is not None:
+            v_emb = self.vision_encoder(image)  # [batch, hidden_dim]
+            c = c + v_emb
 
         # Action as sequence (can be extended to multiple tokens)
         x = a_emb.unsqueeze(1)  # [batch, 1, hidden_dim]
 
-        # Apply transformer blocks
+        # Apply transformer blocks with Kimi linear attention
+        kimi_state = None
         for block in self.blocks:
-            x = block(x, c)
+            x, kimi_state = block(x, c, kimi_state)
 
         # Predict noise
         x = x.squeeze(1)  # [batch, hidden_dim]
@@ -193,10 +289,12 @@ class DiTAgent:
         self,
         state_dim,
         action_dim,
+        use_vision=True,
         device="cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.use_vision = use_vision
         self.device = device
 
         # Diffusion hyperparameters
@@ -211,8 +309,8 @@ class DiTAgent:
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
 
-        # Initialize DiT model
-        self.model = DiffusionTransformer(state_dim, action_dim).to(device)
+        # Initialize DiT model with vision
+        self.model = DiffusionTransformer(state_dim, action_dim, use_vision=use_vision).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
 
         # Experience replay buffer
@@ -225,11 +323,16 @@ class DiTAgent:
         self.total_reward_history = []
         self.noise_scale = 0.3  # Exploration noise
 
-    def get_action(self, state, deterministic=False):
+    def get_action(self, state, image=None, deterministic=False):
         """Generate action using reverse diffusion process"""
         self.model.eval()
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+
+            # Process image if provided
+            image_tensor = None
+            if image is not None and self.use_vision:
+                image_tensor = torch.FloatTensor(image).unsqueeze(0).to(self.device) / 255.0
 
             # Start from random noise
             action = torch.randn(1, self.action_dim).to(self.device)
@@ -241,7 +344,7 @@ class DiTAgent:
                 )
 
                 # Predict noise
-                predicted_noise = self.model(action, state_tensor, timestep)
+                predicted_noise = self.model(action, state_tensor, timestep, image_tensor)
 
                 # Denoise
                 alpha = self.alphas[t]
@@ -272,10 +375,10 @@ class DiTAgent:
 
         return action.cpu().numpy()[0]
 
-    def update(self, state, action, reward, next_state):
+    def update(self, state, action, reward, next_state, image=None):
         """Store experience and train the model"""
         # Add to buffer
-        self.buffer.append((state, action, reward, next_state))
+        self.buffer.append((state, action, reward, next_state, image))
         if len(self.buffer) > self.buffer_size:
             self.buffer.pop(0)
 
@@ -287,9 +390,16 @@ class DiTAgent:
         indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
         batch = [self.buffer[i] for i in indices]
 
-        states = torch.FloatTensor([s for s, a, r, ns in batch]).to(self.device)
-        actions = torch.FloatTensor([a for s, a, r, ns in batch]).to(self.device)
-        rewards = torch.FloatTensor([r for s, a, r, ns in batch]).to(self.device)
+        states = torch.FloatTensor([s for s, a, r, ns, img in batch]).to(self.device)
+        actions = torch.FloatTensor([a for s, a, r, ns, img in batch]).to(self.device)
+        rewards = torch.FloatTensor([r for s, a, r, ns, img in batch]).to(self.device)
+
+        # Process images if using vision
+        images_tensor = None
+        if self.use_vision:
+            images = [img for s, a, r, ns, img in batch if img is not None]
+            if images:
+                images_tensor = torch.FloatTensor(np.stack(images)).to(self.device) / 255.0
 
         # Diffusion training
         self.model.train()
@@ -309,7 +419,7 @@ class DiTAgent:
 
         # Predict noise
         timesteps = (t.float() / self.num_diffusion_steps).view(-1, 1)
-        predicted_noise = self.model(noisy_actions, states, timesteps)
+        predicted_noise = self.model(noisy_actions, states, timesteps, images_tensor)
 
         # Compute loss (MSE between predicted and actual noise)
         loss = F.mse_loss(predicted_noise, noise)
@@ -386,8 +496,22 @@ robot = Articulation(prim_paths_expr="/World/Franka", name="franka_arm")
 # Get end-effector link for position tracking
 end_effector = RigidPrim("/World/Franka/panda_hand", name="end_effector")
 
-# Add target sphere (ball to pick up)
-from pxr import UsdGeom, Gf, UsdLux
+# Add wrist camera for vision
+from isaacsim.core.utils.prims import create_prim
+from isaacsim.sensors.camera import Camera
+
+camera_prim_path = "/World/Franka/panda_hand/camera"
+create_prim(camera_prim_path, "Camera")
+wrist_camera = Camera(
+    prim_path=camera_prim_path,
+    resolution=(84, 84),  # Small resolution for faster processing
+    position=np.array([0.05, 0.0, 0.05]),  # Offset from end-effector
+    orientation=np.array([0.7071, 0, 0.7071, 0])  # Point forward
+)
+wrist_camera.initialize()
+
+# Add target sphere (ball to pick up) with physics
+from pxr import UsdGeom, Gf, UsdLux, UsdPhysics
 
 stage = my_world.stage
 sphere_path = "/World/Target"
@@ -395,6 +519,15 @@ sphere = UsdGeom.Sphere.Define(stage, sphere_path)
 sphere.GetRadiusAttr().Set(0.05)
 sphere_translate = sphere.AddTranslateOp()
 sphere_translate.Set(Gf.Vec3d(0.3, 0.3, 0.5))
+
+# Add physics to ball
+sphere_prim = stage.GetPrimAtPath(sphere_path)
+UsdPhysics.RigidBodyAPI.Apply(sphere_prim)
+UsdPhysics.CollisionAPI.Apply(sphere_prim)
+UsdPhysics.MassAPI.Apply(sphere_prim).CreateMassAttr(0.05)  # 50g ball
+
+# Create RigidPrim for tracking
+ball = RigidPrim(sphere_path, name="ball")
 
 # Add goal location marker (green box)
 goal_path = "/World/Goal"
@@ -408,9 +541,9 @@ my_world.reset()
 
 # RL Training parameters
 MODEL_PATH = "rl_robot_arm_model.pth"
-state_dim = 16  # 9 joints + 3 ee_pos + 3 ball_pos + 1 ball_grasped
+state_dim = 10  # 9 joints + 1 ball_grasped (NO ball position, using vision instead!)
 agent = DiTAgent(
-    state_dim=state_dim, action_dim=8
+    state_dim=state_dim, action_dim=8, use_vision=True
 )  # 7 arm joints + 1 gripper
 
 # Try to load existing model
@@ -431,52 +564,48 @@ try:
         initial_pos = np.random.uniform(-1.0, 1.0, 7)
         robot.set_joint_positions(np.concatenate([initial_pos, [0.04, 0.04]]))
 
-        # Reset target to random position
+        # Reset ball to random position using RigidPrim
         target_position = np.array([
             np.random.uniform(0.2, 0.5),
             np.random.uniform(-0.3, 0.3),
             np.random.uniform(0.3, 0.7),
         ], dtype=np.float32).flatten()  # Ensure 1D
-        sphere_translate.Set(
-            Gf.Vec3d(
-                float(target_position[0]),
-                float(target_position[1]),
-                float(target_position[2]),
-            )
-        )
+        ball.set_world_pose(position=target_position)
 
         episode_reward = 0
         ball_grasped = False
 
         for step in range(max_steps_per_episode):
-            # Get end effector position
-            joint_positions = robot.get_joint_positions()[
-                0
-            ]  # Get first element (single robot)
+            # Capture camera image
+            wrist_camera.get_current_frame()
+            rgb_image = wrist_camera.get_rgba()[:, :, :3]  # Get RGB only (84x84x3)
+
+            # Get robot state
+            joint_positions = robot.get_joint_positions()[0]
+            ball_pos, _ = ball.get_world_poses()
+            ball_pos = np.array(ball_pos, dtype=np.float32).flatten()
             ee_position, _ = end_effector.get_world_poses()
-            ee_position = np.array(ee_position, dtype=np.float32).flatten()  # Ensure 1D
+            ee_position = np.array(ee_position, dtype=np.float32).flatten()
 
-            # Calculate distances
-            ball_distance = np.linalg.norm(ee_position - target_position)
-            goal_distance = np.linalg.norm(target_position - goal_position)
+            # Calculate distances (for reward only, not in state!)
+            ball_distance = np.linalg.norm(ee_position - ball_pos)
+            goal_distance = np.linalg.norm(ball_pos - goal_position)
 
-            # Gripper width (gripper fingers are joints 7 and 8)
+            # Gripper width
             gripper_width = joint_positions[7] + joint_positions[8]
 
-            # Check if ball is grasped (close to ee AND gripper closed)
+            # Check if ball is grasped
             if ball_distance < 0.08 and gripper_width < 0.02:
                 ball_grasped = True
 
-            # Build state: joints + ee_pos + ball_pos + ball_grasped
+            # Build state: joints + ball_grasped (NO ball position!)
             state = np.concatenate([
                 joint_positions,                    # 9
-                ee_position,                        # 3
-                target_position,                    # 3
                 [float(ball_grasped)]              # 1
-            ])  # Total: 16
+            ])  # Total: 10
 
-            # Get action from agent (7 arm joints + 1 gripper)
-            action = agent.get_action(state)
+            # Get action from agent WITH VISION
+            action = agent.get_action(state, image=rgb_image)
 
             # Apply action: first 7 = arm joints, last 1 = gripper
             new_positions = joint_positions.copy()
@@ -493,10 +622,12 @@ try:
             my_world.step(render=True)
 
             # Multi-stage reward function
+            new_ball_pos, _ = ball.get_world_poses()
+            new_ball_pos = np.array(new_ball_pos, dtype=np.float32).flatten()
             new_ee_position, _ = end_effector.get_world_poses()
-            new_ee_position = np.array(new_ee_position, dtype=np.float32).flatten()  # Ensure 1D
-            new_ball_distance = np.linalg.norm(new_ee_position - target_position)
-            new_goal_distance = np.linalg.norm(target_position - goal_position)
+            new_ee_position = np.array(new_ee_position, dtype=np.float32).flatten()
+            new_ball_distance = np.linalg.norm(new_ee_position - new_ball_pos)
+            new_goal_distance = np.linalg.norm(new_ball_pos - goal_position)
 
             reward = 0
 
@@ -504,7 +635,9 @@ try:
             reward -= new_ball_distance * 2.0
 
             # Stage 2: Grasp the ball
-            if new_ball_distance < 0.08 and gripper_width < 0.02:
+            new_joint_positions = robot.get_joint_positions()[0]
+            new_gripper_width = new_joint_positions[7] + new_joint_positions[8]
+            if new_ball_distance < 0.08 and new_gripper_width < 0.02:
                 reward += 5.0  # Grasping bonus
                 ball_grasped = True
 
@@ -519,19 +652,14 @@ try:
             else:
                 ball_grasped = False
 
-            # Update agent
-            new_joint_positions = robot.get_joint_positions()[0]
-            new_gripper_width = new_joint_positions[7] + new_joint_positions[8]
+            # Update agent (state WITHOUT ball position, using vision!)
             new_ball_grasped = new_ball_distance < 0.08 and new_gripper_width < 0.02
-
             next_state = np.concatenate([
                 new_joint_positions,              # 9
-                new_ee_position,                  # 3
-                target_position,                  # 3
                 [float(new_ball_grasped)]        # 1
-            ])  # Total: 16
+            ])  # Total: 10
 
-            agent.update(state, action, reward, next_state)
+            agent.update(state, action, reward, next_state, image=rgb_image)
 
             episode_reward += reward
 
