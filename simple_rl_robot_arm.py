@@ -783,45 +783,45 @@ try:
 
             reward = 0
 
-            # Penalty for end-effector going below ground (normalized)
-            if new_ee_position[2] < 0.05:
-                reward -= 2.0  # Reduced penalty
+            # === Normalized Reward Structure ===
+            # Shaped rewards guide learning, but FINAL GOALS (grasp + delivery) have biggest rewards
 
-            # Graduated penalty for getting too close to ground (safety margin)
-            elif new_ee_position[2] < 0.1:
-                reward -= (0.1 - new_ee_position[2]) * 5.0  # Reduced: Max penalty -0.25
-
-            # Vision reward: Small bonus for seeing the ball (not the main objective)
-            if ball_visible:
-                # Small reward for keeping ball in view (helps with exploration)
-                vision_reward = min(ball_pixel_count / 500.0, 0.3)  # Slightly increased
-                reward += vision_reward
-            # No penalty for not seeing - too harsh
-
-            # Stage 1: Reach the ball (reward for getting closer)
+            # Shaping: Getting closer to ball (guides early learning)
             distance_improvement = ball_distance - new_ball_distance
-            reward += distance_improvement * 5.0  # Increased! Make progress more rewarding
+            reward += distance_improvement * 10.0  # Dense signal for learning
 
-            # Small positive reward for being close to ball
-            if new_ball_distance < 0.2:
-                reward += 0.5  # Bonus for proximity
+            # Shaping: Proximity bonus (encourage staying close)
+            if new_ball_distance < 0.3:
+                proximity_reward = (0.3 - new_ball_distance) * 3.0  # Max +0.9
+                reward += proximity_reward
 
-            # No time penalty - let agent take time to learn
+            if new_ball_distance < 0.15:
+                reward += 1.0  # Grasp-ready position
 
-            # Stage 2: Grasp the ball
+            # Shaping: Vision (tiny helper)
+            if ball_visible:
+                reward += 0.1
+
+            # Penalty: Ground avoidance
+            if new_ee_position[2] < 0.05:
+                reward -= 1.0
+            elif new_ee_position[2] < 0.1:
+                reward -= (0.1 - new_ee_position[2]) * 2.0  # Max -0.1
+
+            # === FINAL GOAL 1: GRASP (Big reward!) ===
             new_joint_positions = robot.get_joint_positions()[0]
             new_gripper_width = new_joint_positions[7] + new_joint_positions[8]
             if new_ball_distance < 0.08 and new_gripper_width < 0.02:
-                reward += 10.0  # BIG grasping bonus (normalized)
+                reward += 50.0  # MAJOR reward for grasping!
                 ball_grasped = True
 
-                # Stage 3: Move ball to goal (reward for getting closer to goal)
+                # Shaping after grasp: Move ball to goal
                 goal_improvement = goal_distance - new_goal_distance
-                reward += goal_improvement * 5.0  # Progress reward
+                reward += goal_improvement * 10.0
 
-                # Stage 4: Success - ball at goal
+                # === FINAL GOAL 2: DELIVERY (Biggest reward!) ===
                 if new_goal_distance < 0.15:
-                    reward += 50.0  # HUGE success bonus (normalized)
+                    reward += 100.0  # MASSIVE reward for completing task!
                     print(f"Episode {episode}: Ball delivered to goal at step {step}!")
                     break
             else:
