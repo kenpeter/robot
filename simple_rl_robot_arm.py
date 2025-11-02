@@ -514,11 +514,12 @@ sphere_path = "/World/Target"
 sphere = UsdGeom.Sphere.Define(stage, sphere_path)
 sphere.GetRadiusAttr().Set(0.05)
 sphere_translate = sphere.AddTranslateOp()
-sphere_translate.Set(Gf.Vec3d(0.3, 0.3, 0.5))
+sphere_translate.Set(Gf.Vec3d(0.3, 0.3, 0.05))  # Ball on floor (z = radius)
 
-# Add physics to ball
+# Add physics to ball (kinematic - won't fall)
 sphere_prim = stage.GetPrimAtPath(sphere_path)
-UsdPhysics.RigidBodyAPI.Apply(sphere_prim)
+rigid_body_api = UsdPhysics.RigidBodyAPI.Apply(sphere_prim)
+rigid_body_api.CreateKinematicEnabledAttr(True)  # Make it kinematic (stationary)
 UsdPhysics.CollisionAPI.Apply(sphere_prim)
 UsdPhysics.MassAPI.Apply(sphere_prim).CreateMassAttr(0.05)  # 50g ball
 
@@ -551,7 +552,7 @@ agent = DiTAgent(
 agent.load_model(MODEL_PATH)
 
 num_episodes = 1000
-max_steps_per_episode = 500
+max_steps_per_episode = 1000  # Increased from 500 to give more time
 goal_position = np.array([-0.3, 0.3, 0.3])  # Fixed goal location
 save_interval = 10  # Save model every 10 episodes
 
@@ -633,9 +634,9 @@ try:
                 print(f"  Ball distance: {ball_distance:.3f}, EE pos: {ee_position}")
 
             # Apply action: first 7 = arm joints, last 1 = gripper
-            # Use moderate action scaling for smooth but effective movement
+            # Use larger action scaling for faster learning
             new_positions = joint_positions.copy()
-            new_positions[:7] += action[:7] * 0.05  # Balanced scaling
+            new_positions[:7] += action[:7] * 0.1  # Increased from 0.05 for faster movement
             new_positions[:7] = np.clip(new_positions[:7], -2.8, 2.8)  # Franka joint limits
 
             # Gripper control: positive = close, negative = open
