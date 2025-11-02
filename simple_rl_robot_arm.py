@@ -31,16 +31,8 @@ from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.storage.native import get_assets_root_path
 
-# Import Flash Attention 4
-try:
-    from flash_attention_4_wrapper import flash_attention_4
-
-    USE_FA4 = True
-    print("Flash Attention 4 loaded successfully")
-except Exception as e:
-    USE_FA4 = False
-    flash_attention_4 = None
-    print(f"Flash Attention 4 not available ({e}), using standard attention")
+# Note: Using Kimi Linear Attention (RecurrentKDA) in DiTBlocks for O(n) complexity
+print("Using Kimi Linear Attention (RecurrentKDA) for efficient transformers")
 
 
 # Kimi Linear Attention (RecurrentKDA)
@@ -140,71 +132,57 @@ class DiTBlock(nn.Module):
         return x, new_kimi_state
 
 
-class VisionTransformer(nn.Module):
-    """Lightweight Vision Transformer (ViT) for RGB images"""
-    def __init__(self, output_dim=128, img_size=84, patch_size=14, num_heads=4, depth=2):
+class SimpleCNN(nn.Module):
+    """Simple CNN for visual feature extraction"""
+    def __init__(self, output_dim=128, img_size=84):
         super().__init__()
         self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = (img_size // patch_size) ** 2  # 6x6 = 36 patches
-        self.patch_dim = 3 * patch_size * patch_size  # 3 * 14 * 14 = 588
 
-        # Patch embedding
-        self.patch_embed = nn.Linear(self.patch_dim, output_dim)
+        # Simple convolutional layers
+        self.conv = nn.Sequential(
+            # 84x84x3 -> 42x42x32
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(32),
 
-        # Positional embedding (learnable)
-        self.pos_embed = nn.Parameter(torch.randn(1, self.num_patches + 1, output_dim) * 0.02)
+            # 42x42x32 -> 21x21x64
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(64),
 
-        # CLS token
-        self.cls_token = nn.Parameter(torch.randn(1, 1, output_dim))
+            # 21x21x64 -> 10x10x128
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(128),
 
-        # Kimi Linear Attention layers instead of standard transformer
-        self.kimi_layers = nn.ModuleList([
-            RecurrentKDA(output_dim, num_heads) for _ in range(depth)
-        ])
-
-        # Output projection
-        self.head = nn.Sequential(
-            nn.LayerNorm(output_dim),
-            nn.Linear(output_dim, output_dim)
+            # 10x10x128 -> 5x5x128
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm2d(128),
         )
 
-    def patchify(self, x):
-        """Convert image to patches"""
-        # x: [B, C, H, W]
-        B, C, H, W = x.shape
-        x = x.reshape(B, C, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size)
-        x = x.permute(0, 2, 4, 1, 3, 5).contiguous()  # [B, H', W', C, patch_size, patch_size]
-        x = x.reshape(B, self.num_patches, self.patch_dim)  # [B, num_patches, patch_dim]
-        return x
+        # Adaptive pooling to ensure consistent output size
+        self.pool = nn.AdaptiveAvgPool2d((4, 4))  # Always output 4x4
+
+        # Calculate flattened size: 4x4x128 = 2048
+        self.flatten_size = 4 * 4 * 128
+
+        # FC layers
+        self.fc = nn.Sequential(
+            nn.Linear(self.flatten_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, output_dim)
+        )
 
     def forward(self, x):
         # x: [B, H, W, C] from Isaac Sim -> [B, C, H, W] for PyTorch
         if len(x.shape) == 4 and x.shape[-1] == 3:
             x = x.permute(0, 3, 1, 2)  # BHWC -> BCHW
 
-        B = x.shape[0]
-
-        # Patchify and embed
-        patches = self.patchify(x)  # [B, num_patches, patch_dim]
-        x = self.patch_embed(patches)  # [B, num_patches, output_dim]
-
-        # Add CLS token
-        cls_tokens = self.cls_token.expand(B, -1, -1)  # [B, 1, output_dim]
-        x = torch.cat([cls_tokens, x], dim=1)  # [B, num_patches+1, output_dim]
-
-        # Add positional embedding
-        x = x + self.pos_embed
-
-        # Kimi Linear Attention layers
-        kimi_state = None
-        for layer in self.kimi_layers:
-            x, kimi_state = layer(x, kimi_state)
-
-        # Use CLS token as output
-        x = x[:, 0]  # [B, output_dim]
-        x = self.head(x)
-
+        x = self.conv(x)
+        x = self.pool(x)  # Ensure consistent spatial size
+        x = x.reshape(x.size(0), -1)  # Flatten
+        x = self.fc(x)
         return x
 
 
@@ -219,9 +197,9 @@ class DiffusionTransformer(nn.Module):
         self.hidden_dim = hidden_dim
         self.use_vision = use_vision
 
-        # Vision encoder (ViT)
+        # Vision encoder (CNN)
         if use_vision:
-            self.vision_encoder = VisionTransformer(output_dim=hidden_dim)
+            self.vision_encoder = SimpleCNN(output_dim=hidden_dim)
 
         # Timestep embedding (for diffusion process)
         self.time_embed = nn.Sequential(
@@ -299,20 +277,25 @@ class DiTAgent:
         self.use_vision = use_vision
         self.device = device
 
-        # Diffusion hyperparameters
-        self.num_diffusion_steps = 10  # Reduced for faster inference
+        # Diffusion hyperparameters (simplified for stability)
+        self.num_diffusion_steps = 5  # Reduced from 10 for faster inference
         self.beta_start = 0.0001
         self.beta_end = 0.02
 
-        # Create diffusion schedule
+        # Create diffusion schedule with careful numerical stability
         self.betas = torch.linspace(
-            self.beta_start, self.beta_end, self.num_diffusion_steps
+            self.beta_start, self.beta_end, self.num_diffusion_steps, dtype=torch.float32
         ).to(device)
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
 
+        # Clamp to avoid numerical issues
+        self.alphas_cumprod = torch.clamp(self.alphas_cumprod, min=1e-8, max=1.0)
+
         # Initialize DiT model with vision
-        self.model = DiffusionTransformer(state_dim, action_dim, use_vision=use_vision).to(device)
+        self.model = DiffusionTransformer(
+            state_dim, action_dim, hidden_dim=128, num_layers=3, num_heads=4, use_vision=use_vision
+        ).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
 
         # Experience replay buffer
@@ -329,56 +312,69 @@ class DiTAgent:
         """Generate action using reverse diffusion process"""
         self.model.eval()
         with torch.no_grad():
+            # Check for NaN in state
+            if np.any(np.isnan(state)):
+                print(f"WARNING: NaN detected in state: {state}")
+                state = np.nan_to_num(state, 0.0)
+
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
 
             # Process image if provided
             image_tensor = None
             if image is not None and self.use_vision:
+                # Check for NaN in image
+                if np.any(np.isnan(image)):
+                    print(f"WARNING: NaN detected in image")
+                    image = np.nan_to_num(image, 0.0)
                 image_tensor = torch.FloatTensor(image).unsqueeze(0).to(self.device) / 255.0
 
             # Start from random noise
-            action = torch.randn(1, self.action_dim).to(self.device)
+            action = torch.randn(1, self.action_dim, dtype=torch.float32).to(self.device) * 0.5
 
-            # Reverse diffusion process
+            # Reverse diffusion process (DDPM sampling)
             for t in reversed(range(self.num_diffusion_steps)):
-                timestep = torch.FloatTensor([[t / self.num_diffusion_steps]]).to(
-                    self.device
-                )
+                timestep = torch.FloatTensor([[t / self.num_diffusion_steps]]).to(self.device)
 
                 # Predict noise
                 predicted_noise = self.model(action, state_tensor, timestep, image_tensor)
 
-                # Denoise
-                alpha = self.alphas[t]
-                alpha_cumprod = self.alphas_cumprod[t]
-                beta = self.betas[t]
+                # Check for NaN in predicted noise
+                if torch.isnan(predicted_noise).any():
+                    print(f"WARNING: NaN in predicted_noise at step {t}")
+                    predicted_noise = torch.zeros_like(predicted_noise)
 
-                if t > 0:
-                    noise = torch.randn_like(action)
-                    alpha_cumprod_prev = self.alphas_cumprod[t - 1]
-                    sigma = torch.sqrt(
-                        beta * (1 - alpha_cumprod_prev) / (1 - alpha_cumprod)
-                    )
-                else:
-                    noise = 0
-                    sigma = 0
+                # Denoise using DDPM formula with numerical stability
+                alpha_t = self.alphas[t]
+                alpha_cumprod_t = self.alphas_cumprod[t]
+                beta_t = self.betas[t]
+
+                # Compute coefficients with clamping
+                coef1 = 1.0 / torch.sqrt(alpha_t + 1e-8)
+                coef2 = beta_t / (torch.sqrt(1.0 - alpha_cumprod_t + 1e-8))
 
                 # Update action
-                action = (
-                    action - beta / torch.sqrt(1 - alpha_cumprod) * predicted_noise
-                ) / torch.sqrt(alpha)
-                action = action + sigma * noise
+                action = coef1 * (action - coef2 * predicted_noise)
 
-            # Add exploration noise during training (reduced)
+                # Add noise if not final step
+                if t > 0:
+                    noise = torch.randn_like(action) * 0.1  # Reduced noise
+                    action = action + noise
+
+            # Add exploration noise during training
             if not deterministic:
                 action = action + self.noise_scale * 0.1 * torch.randn_like(action)
 
             action = torch.clamp(action, -1.0, 1.0)  # Keep actions normalized
 
+            # Final NaN check
+            if torch.isnan(action).any():
+                print("WARNING: NaN in action output, returning random")
+                action = torch.randn_like(action) * 0.3
+
         return action.cpu().numpy()[0]
 
     def update(self, state, action, reward, next_state, image=None):
-        """Store experience and train the model"""
+        """Store experience and train the diffusion model"""
         # Add to buffer
         self.buffer.append((state, action, reward, next_state, image))
         if len(self.buffer) > self.buffer_size:
@@ -392,7 +388,7 @@ class DiTAgent:
         indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
         batch = [self.buffer[i] for i in indices]
 
-        # Convert to numpy arrays first for better performance
+        # Convert to tensors
         states = torch.FloatTensor(np.array([s for s, a, r, ns, img in batch])).to(self.device)
         actions = torch.FloatTensor(np.array([a for s, a, r, ns, img in batch])).to(self.device)
         rewards = torch.FloatTensor(np.array([r for s, a, r, ns, img in batch])).to(self.device)
@@ -407,18 +403,15 @@ class DiTAgent:
         # Diffusion training
         self.model.train()
 
-        # Sample random timestep
-        t = torch.randint(0, self.num_diffusion_steps, (self.batch_size,)).to(
-            self.device
-        )
+        # Sample random timesteps
+        t = torch.randint(0, self.num_diffusion_steps, (self.batch_size,), dtype=torch.long).to(self.device)
 
-        # Add noise to actions
+        # Add noise to actions (forward diffusion process)
         noise = torch.randn_like(actions)
         alpha_cumprod_t = self.alphas_cumprod[t].view(-1, 1)
-        noisy_actions = (
-            torch.sqrt(alpha_cumprod_t) * actions
-            + torch.sqrt(1 - alpha_cumprod_t) * noise
-        )
+
+        # x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * noise
+        noisy_actions = torch.sqrt(alpha_cumprod_t + 1e-8) * actions + torch.sqrt(1.0 - alpha_cumprod_t + 1e-8) * noise
 
         # Predict noise
         timesteps = (t.float() / self.num_diffusion_steps).view(-1, 1)
@@ -427,11 +420,11 @@ class DiTAgent:
         # Compute loss (MSE between predicted and actual noise)
         loss = F.mse_loss(predicted_noise, noise)
 
-        # Add reward-weighted term
-        reward_weights = torch.sigmoid(rewards / 10.0).view(-1, 1)
-        weighted_loss = (loss * reward_weights.mean()).mean()
+        # Add reward weighting (prioritize good experiences)
+        reward_weights = torch.sigmoid(rewards / 10.0)
+        weighted_loss = (loss * reward_weights.mean())
 
-        # Optimize
+        # Optimize with gradient clipping
         self.optimizer.zero_grad()
         weighted_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -542,6 +535,11 @@ goal_translate.Set(Gf.Vec3d(-0.3, 0.3, 0.3))  # Goal position
 # Initialize world
 my_world.reset()
 
+# Initialize robot articulation (CRITICAL - must be after world reset)
+robot.initialize()
+ball.initialize()
+end_effector.initialize()
+
 # RL Training parameters
 MODEL_PATH = "rl_robot_arm_model.pth"
 state_dim = 10  # 9 joints + 1 ball_grasped (NO ball position, using vision instead!)
@@ -563,12 +561,15 @@ print(f"Model will be saved to: {MODEL_PATH}")
 
 try:
     for episode in range(agent.episode_count, agent.episode_count + num_episodes):
-        # Reset arm to safe initial position (smaller range to avoid physics issues)
-        initial_pos = np.random.uniform(-0.5, 0.5, 7)
+        # Reset arm to safe initial position (very conservative range)
+        initial_pos = np.array([0.0, -0.3, 0.0, -1.5, 0.0, 1.2, 0.0])  # Known safe pose
+        # Add small random perturbation
+        initial_pos += np.random.uniform(-0.1, 0.1, 7)
         robot.set_joint_positions(np.concatenate([initial_pos, [0.04, 0.04]]))
 
-        # Step world to apply joint positions
-        my_world.step(render=False)
+        # Step world multiple times to stabilize physics
+        for _ in range(10):
+            my_world.step(render=False)
 
         # Reset ball to random position using RigidPrim
         target_position = np.array([
@@ -626,17 +627,23 @@ try:
             # Get action from agent WITH VISION
             action = agent.get_action(state, image=rgb_image)
 
+            # Debug: Print action every 50 steps
+            if step % 50 == 0:
+                print(f"Step {step}: Action range [{action.min():.3f}, {action.max():.3f}], Mean: {action.mean():.3f}")
+                print(f"  Ball distance: {ball_distance:.3f}, EE pos: {ee_position}")
+
             # Apply action: first 7 = arm joints, last 1 = gripper
-            # Use much smaller action scaling to prevent instability
+            # Use moderate action scaling for smooth but effective movement
             new_positions = joint_positions.copy()
-            new_positions[:7] += action[:7] * 0.01  # Reduced from 0.1 to 0.01
-            new_positions[:7] = np.clip(new_positions[:7], -2.0, 2.0)  # Tighter limits
+            new_positions[:7] += action[:7] * 0.05  # Balanced scaling
+            new_positions[:7] = np.clip(new_positions[:7], -2.8, 2.8)  # Franka joint limits
 
             # Gripper control: positive = close, negative = open
             gripper_action = np.clip(action[7], -1.0, 1.0)
             new_positions[7:9] = np.clip(new_positions[7:9] + gripper_action * 0.005, 0.0, 0.04)  # Slower gripper
 
-            robot.set_joint_positions([new_positions])
+            # Apply the positions (position control mode)
+            robot.set_joint_positions(new_positions)
 
             # Step simulation
             my_world.step(render=True)
