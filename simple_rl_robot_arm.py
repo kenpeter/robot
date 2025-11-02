@@ -531,7 +531,7 @@ goal_path = "/World/Goal"
 goal_cube = UsdGeom.Cube.Define(stage, goal_path)
 goal_cube.GetSizeAttr().Set(0.15)
 goal_translate = goal_cube.AddTranslateOp()
-goal_translate.Set(Gf.Vec3d(-0.3, 0.3, 0.3))  # Goal position
+goal_translate.Set(Gf.Vec3d(-0.3, 0.3, 0.075))  # Goal position on floor (half cube size)
 
 # Initialize world
 my_world.reset()
@@ -552,8 +552,8 @@ agent = DiTAgent(
 agent.load_model(MODEL_PATH)
 
 num_episodes = 1000
-max_steps_per_episode = 1000  # Increased from 500 to give more time
-goal_position = np.array([-0.3, 0.3, 0.3])  # Fixed goal location
+max_steps_per_episode = 3000  # Increased to 3000 steps per episode
+goal_position = np.array([-0.3, 0.3, 0.05])  # Goal location on floor
 save_interval = 10  # Save model every 10 episodes
 
 print("Starting RL Training...")
@@ -572,11 +572,11 @@ try:
         for _ in range(10):
             my_world.step(render=False)
 
-        # Reset ball to random position using RigidPrim
+        # Reset ball to random position on floor using RigidPrim
         target_position = np.array([
-            np.random.uniform(0.2, 0.5),
-            np.random.uniform(-0.3, 0.3),
-            np.random.uniform(0.3, 0.7),
+            np.random.uniform(0.2, 0.6),   # x: in front of robot
+            np.random.uniform(-0.3, 0.3),  # y: left/right
+            0.05,                          # z: on floor (ball radius)
         ], dtype=np.float32).flatten()  # Ensure 1D
         ball.set_world_poses(positions=np.array([target_position]))
 
