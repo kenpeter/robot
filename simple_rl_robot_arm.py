@@ -627,6 +627,19 @@ UsdPhysics.MassAPI.Apply(sphere_prim).CreateMassAttr(0.05)  # 50g ball
 # Create RigidPrim for tracking
 ball = RigidPrim(sphere_path, name="ball")
 
+# === ADD LIGHTING (CRITICAL for camera vision) ===
+# Add bright dome light for even illumination
+dome_light_path = "/World/DomeLight"
+dome_light = UsdLux.DomeLight.Define(stage, dome_light_path)
+dome_light.CreateIntensityAttr(1000.0)  # Bright lighting
+
+# Add directional light from above
+distant_light_path = "/World/DistantLight"
+distant_light = UsdLux.DistantLight.Define(stage, distant_light_path)
+distant_light.CreateIntensityAttr(2000.0)
+distant_light_xform = distant_light.AddRotateXYZOp()
+distant_light_xform.Set(Gf.Vec3f(-45, 0, 0))  # Angle from above
+
 # Add goal location marker (green box)
 goal_path = "/World/Goal"
 goal_cube = UsdGeom.Cube.Define(stage, goal_path)
