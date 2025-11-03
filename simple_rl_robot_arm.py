@@ -627,10 +627,13 @@ end_effector.initialize()
 
 # RL Training parameters
 MODEL_PATH = "rl_robot_arm_model.pth"
-state_dim = 10  # 9 joints + 1 ball_grasped (NO ball position, using vision instead!)
-agent = DiTAgent(
-    state_dim=state_dim, action_dim=8, use_vision=True
-)  # 7 arm joints + 1 gripper
+
+# Using Cartesian control: (x, y, z, gripper) - GitHub best practice for grasping
+# Simpler 4D action space instead of 8D joint control
+state_dim = 10  # 9 joints + 1 ball_grasped
+action_dim = 4  # dx, dy, dz, gripper
+
+agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=True)
 
 # Try to load existing model
 agent.load_model(MODEL_PATH)
@@ -668,6 +671,11 @@ try:
             0.4 * curriculum_progress
         )  # 0.2->0.6 as training progresses
 
+        # === DOMAIN RANDOMIZATION (GitHub best practice - improves generalization) ===
+        # Randomize ball size for robust policy (sim-to-real transfer)
+        ball_radius_variation = np.random.uniform(0.9, 1.1)  # ±10% size
+        ball_z = 0.05 * ball_radius_variation  # Adjust height
+
         # Reset ball to random position on floor using RigidPrim
         target_position = np.array(
             [
@@ -675,7 +683,7 @@ try:
                     min_distance, max_distance
                 ),  # x: curriculum-based distance
                 np.random.uniform(-0.3, 0.3),  # y: left/right
-                0.05,  # z: on floor (ball radius)
+                ball_z,  # z: randomized based on size
             ],
             dtype=np.float32,
         ).flatten()  # Ensure 1D
@@ -684,6 +692,8 @@ try:
         episode_reward = 0
         ball_grasped = False
         last_ball_visible = False  # Track previous visibility for smoothing
+        closest_distance = float('inf')  # Track closest distance for HER
+        step = 0  # Initialize step counter
 
         for step in range(max_steps_per_episode):
             # Step simulation FIRST to update physics
@@ -806,21 +816,31 @@ try:
                     f"  Vision: Dark pixels={ball_pixel_count}, Ball visible={ball_visible}"
                 )
 
-            # Apply action: first 7 = arm joints, last 1 = gripper
-            # Use larger action scaling for faster learning
+            # === CARTESIAN ACTION EXECUTION ===
+            # Action = [dx, dy, dz, gripper] - 4D end-effector control
             new_positions = joint_positions.copy()
-            new_positions[:7] += (
-                action[:7] * 0.1
-            )  # Increased from 0.05 for faster movement
-            new_positions[:7] = np.clip(
-                new_positions[:7], -2.8, 2.8
-            )  # Franka joint limits
 
-            # Gripper control: positive = close, negative = open
-            gripper_action = np.clip(action[7], -1.0, 1.0)
+            # Extract Cartesian delta from action
+            delta_pos = action[:3] * 0.02  # Cartesian movements (2cm max per step)
+
+            # Calculate target end-effector position
+            target_position = ee_position + delta_pos
+            target_position = np.clip(target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0])
+
+            # Simplified differential IK (proportional control toward target)
+            # Maps desired end-effector motion to joint space
+            delta_ee = (target_position - ee_position) * 3.0
+
+            # Distribute motion across joints (simplified Jacobian approximation)
+            new_positions[:3] += delta_ee * 0.5  # First 3 joints control position
+            new_positions[3:7] += delta_ee[:3].repeat(1.33)[:4] * 0.3  # Last 4 joints for orientation
+            new_positions[:7] = np.clip(new_positions[:7], -2.8, 2.8)
+
+            # Gripper control (action[3])
+            gripper_action = np.clip(action[3], -1.0, 1.0)
             new_positions[7:9] = np.clip(
                 new_positions[7:9] + gripper_action * 0.005, 0.0, 0.04
-            )  # Slower gripper
+            )
 
             # Apply the positions (position control mode)
             robot.set_joint_positions(new_positions)
@@ -832,6 +852,10 @@ try:
             new_ee_position = np.array(new_ee_position, dtype=np.float32).flatten()
             new_ball_distance = np.linalg.norm(new_ee_position - new_ball_pos)
             new_goal_distance = np.linalg.norm(new_ball_pos - goal_position)
+
+            # Track closest distance this episode (for HER)
+            if new_ball_distance < closest_distance:
+                closest_distance = new_ball_distance
 
             reward = 0
 
@@ -908,11 +932,22 @@ try:
             elif new_ee_position[2] < 0.1:
                 reward -= (0.1 - new_ee_position[2]) * 2.0  # Max -0.1
 
-            # === FINAL GOAL 1: GRASP (Big reward!) ===
+            # === GRIPPER CONTROL SHAPING (Research-backed 2024) ===
             new_joint_positions = robot.get_joint_positions()[0]
             new_gripper_width = new_joint_positions[7] + new_joint_positions[8]
+
+            # Encourage gripper closing when near ball (learns closing behavior)
+            if new_ball_distance < 0.15:
+                # Reward for closing gripper when close to ball
+                gripper_close_action = 0.08 - new_gripper_width  # How much gripper closed
+                if gripper_close_action > 0:
+                    # Scaled reward: closer to ball = more reward for closing
+                    proximity_factor = (0.15 - new_ball_distance) / 0.15  # 0-1
+                    reward += gripper_close_action * 5.0 * proximity_factor  # Max ~+2.5
+
+            # === FINAL GOAL 1: GRASP (Big reward!) ===
             if new_ball_distance < 0.08 and new_gripper_width < 0.02:
-                reward += 50.0  # MAJOR reward for grasping!
+                reward += 50.0  # MAJOR reward for successful grasp!
                 ball_grasped = True
 
                 # Shaping after grasp: Move ball to goal
@@ -937,6 +972,30 @@ try:
             loss = agent.update(state, action, reward, next_state, image=rgb_image)
 
             episode_reward += reward
+
+        # === HINDSIGHT EXPERIENCE REPLAY (HER) - Research-backed 2024 ===
+        # If episode failed to grasp, relabel experiences as "reaching" successes
+        # This turns sparse rewards into dense learning signal
+        if not ball_grasped and len(agent.buffer) > 0 and closest_distance < 0.5:
+            # HER insight: Even failed episodes have value if they got close
+            # Relabel close approaches as successes for "reaching" goal
+
+            # Sample last 50 experiences from this episode for relabeling
+            relabel_count = min(50, step + 1)
+            for i in range(relabel_count):
+                if len(agent.buffer) > i:
+                    # Get recent experience
+                    idx = len(agent.buffer) - 1 - i
+                    exp = agent.buffer[idx]
+
+                    # Relabel reward: if got close, add bonus (hindsight success)
+                    # This creates alternative "goals" - pretending closeness was the objective
+                    s, a, r, ns, img = exp
+                    # Bonus based on closest distance achieved
+                    bonus_reward = max(0, (0.5 - closest_distance) * 2.0)  # Max +1.0 for 0m
+                    if bonus_reward > 0.1:
+                        # Store relabeled experience (augments learning from failures)
+                        agent.buffer.append((s, a, r + bonus_reward, ns, img))
 
         # Track statistics
         agent.total_reward_history.append(episode_reward)
