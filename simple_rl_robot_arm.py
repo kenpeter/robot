@@ -959,106 +959,86 @@ try:
 
             reward = 0
 
-            # === Normalized Reward Structure ===
-            # Shaped rewards guide learning, but FINAL GOALS (grasp + delivery) have biggest rewards
+            # === NORMALIZED Reward Structure (all rewards scaled to -1 to +1 range per step) ===
+            # Goal: Keep per-step rewards small and consistent, milestone rewards 5-10x larger
+            # This prevents reward explosion and helps training stability
 
-            # closer more reward: closer -> more reward
-
-            # Shaping: Getting closer to ball (linear - guides early learning)
+            # 1. Distance shaping: Getting closer to ball (CLIPPED for normalization)
             distance_improvement = ball_distance - new_ball_distance
-            reward += distance_improvement * 10.0  # Dense signal for learning
+            # Normalize: typical improvement is ~0.01-0.05 per step, scale to -0.5 to +0.5
+            reward += np.clip(distance_improvement * 10.0, -0.5, 0.5)
 
-            # closer more reward: closer -> more reward
-
-            # EXPONENTIAL proximity reward (research-backed: reward grows as distance shrinks)
-            # This creates a strong gradient near the ball, solving sparse reward problem
+            # 2. Proximity reward (exponential - stronger gradient near ball)
             if new_ball_distance < 0.5:
-                # Exponential: r = e^(-k*distance) scaled to 0-10 range
-                # At 0.5m: ~0, At 0.1m: ~5, At 0.05m: ~7, At 0.01m: ~9
-                exponential_reward = 10.0 * (
+                # Normalize to 0-1 range instead of 0-10
+                exponential_reward = 1.0 * (
                     1.0 - np.exp(-5.0 * (0.5 - new_ball_distance))
                 )
-                reward += exponential_reward
+                reward += exponential_reward * 0.3  # Scale to max +0.3
 
-            # === LYAPUNOV-BASED PHYSICS-INFORMED REWARD ===
-
-            # closer slow down: closer -> slow down
-
-            # Penalize high velocity when close to ball (encourages stable approach)
-            # Lyapunov function: V = distance^2 + velocity^2
-            # Stable if dV/dt < 0 (distance decreasing faster than velocity increasing)
+            # 3. Velocity control: Encourage slow, stable approach when close
             if new_ball_distance < 0.3:
-                # Estimate end-effector velocity from position change
-                ee_velocity = (
-                    np.linalg.norm(new_ee_position - ee_position) / 0.01
-                )  # dt ~0.01s per step
-                # Penalize high velocity near target (encourages smooth, stable approach)
+                ee_velocity = np.linalg.norm(new_ee_position - ee_position) / 0.01
                 if ee_velocity > 0.5:  # Too fast when close
-                    velocity_penalty = -(ee_velocity - 0.5) * 0.5  # Max penalty ~-1.0
+                    # Normalized velocity penalty: clip to -0.2
+                    velocity_penalty = -np.clip((ee_velocity - 0.5) * 0.4, 0, 0.2)
                     reward += velocity_penalty
                 else:
-                    # Bonus for slow, controlled approach
-                    reward += 0.2
+                    # Small bonus for controlled approach
+                    reward += 0.1
 
-            # === RESEARCH-BACKED VISUAL SERVOING REWARDS ===
-            # From 2024 papers: reward visual alignment, not just visibility
+            # 4. Visual servoing rewards (normalized)
             if ball_visible:
-                # 1. Basic visibility reward (small)
-                reward += 0.1
+                # Basic visibility bonus
+                reward += 0.05
 
-                # 2. Visual centering reward (align ball with image center)
-                # Image center is (0.5, 0.5), reward when ball is centered
+                # Visual centering (align ball with image center)
                 center_distance = np.sqrt(
                     (ball_centroid_x - 0.5) ** 2 + (ball_centroid_y - 0.5) ** 2
                 )
-                # Max distance from center is ~0.707 (corner to center)
-                # Reward ranges from 0 (corner) to +1.0 (perfectly centered)
                 centering_reward = (0.707 - center_distance) / 0.707
-                reward += centering_reward * 0.5  # Scale to max +0.5
+                reward += centering_reward * 0.2  # Scale to max +0.2
 
-                # 3. Size-based reward (closer objects appear larger)
-                # More pixels = closer to ball (correlates with distance)
-                # Encourage keeping ball in view AND getting closer
-                size_reward = min(ball_pixel_count / 1000.0, 0.5)  # Max +0.5
-                reward += size_reward * 0.3  # Scale to max +0.15
+                # Size-based (closer = larger in view)
+                size_reward = min(ball_pixel_count / 200.0, 1.0)
+                reward += size_reward * 0.1  # Scale to max +0.1
             else:
-                # Penalty for losing visual tracking (important for visual servoing)
+                # Penalty for losing visual tracking
                 if last_ball_visible:
-                    reward -= 0.3  # Lost tracking
+                    reward -= 0.2
 
-            # Penalty: Ground avoidance
+            # 5. Safety: Ground avoidance (normalized)
             if new_ee_position[2] < 0.05:
-                reward -= 1.0
+                reward -= 0.5
             elif new_ee_position[2] < 0.1:
                 reward -= (0.1 - new_ee_position[2]) * 2.0  # Max -0.1
 
-            # === GRIPPER CONTROL SHAPING (Research-backed 2024) ===
+            # 6. Gripper control (normalized)
             new_joint_positions = robot.get_joint_positions()[0]
             new_gripper_width = new_joint_positions[7] + new_joint_positions[8]
 
-            # Encourage gripper closing when near ball (learns closing behavior)
+            # Encourage gripper closing when near ball
             if new_ball_distance < 0.15:
-                # Reward for closing gripper when close to ball
-                gripper_close_action = (
-                    0.08 - new_gripper_width
-                )  # How much gripper closed
+                gripper_close_action = 0.08 - new_gripper_width
                 if gripper_close_action > 0:
-                    # Scaled reward: closer to ball = more reward for closing
-                    proximity_factor = (0.15 - new_ball_distance) / 0.15  # 0-1
-                    reward += gripper_close_action * 5.0 * proximity_factor  # Max ~+2.5
+                    proximity_factor = (0.15 - new_ball_distance) / 0.15
+                    # Normalize to max +0.3 instead of +2.5
+                    reward += gripper_close_action * 3.0 * proximity_factor * 0.1
 
-            # === FINAL GOAL 1: GRASP (Big reward!) ===
+            # === MILESTONE REWARDS (5-10x larger than per-step rewards) ===
+
+            # MILESTONE 1: Successful grasp (5x per-step reward)
             if new_ball_distance < 0.08 and new_gripper_width < 0.02:
-                reward += 50.0  # MAJOR reward for successful grasp!
+                reward += 5.0  # Normalized milestone reward
                 ball_grasped = True
 
-                # Shaping after grasp: Move ball to goal
+                # Shaping after grasp: Move ball to goal (normalized)
                 goal_improvement = goal_distance - new_goal_distance
-                reward += goal_improvement * 10.0
+                reward += np.clip(goal_improvement * 10.0, -0.5, 0.5)
 
-                # === FINAL GOAL 2: DELIVERY (Biggest reward!) ===
+                # MILESTONE 2: Successful delivery (10x per-step reward)
                 if new_goal_distance < 0.15:
-                    reward += 100.0  # MASSIVE reward for completing task!
+                    reward += 10.0  # Normalized final milestone reward
                     print(f"Episode {episode}: Ball delivered to goal at step {step}!")
                     break
             else:
