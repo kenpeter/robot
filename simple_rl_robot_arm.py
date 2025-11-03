@@ -833,7 +833,11 @@ try:
 
             # Distribute motion across joints (simplified Jacobian approximation)
             new_positions[:3] += delta_ee * 0.5  # First 3 joints control position
-            new_positions[3:7] += delta_ee[:3].repeat(1.33)[:4] * 0.3  # Last 4 joints for orientation
+
+            # Repeat delta for remaining 4 joints (orientation control)
+            delta_repeat = np.tile(delta_ee, 2)[:4]  # Repeat and take first 4 elements
+            new_positions[3:7] += delta_repeat * 0.3
+
             new_positions[:7] = np.clip(new_positions[:7], -2.8, 2.8)
 
             # Gripper control (action[3])
