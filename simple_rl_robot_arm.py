@@ -589,7 +589,7 @@ wrist_camera = Camera(
 wrist_camera.initialize()
 
 # Add target sphere (ball to pick up) with physics
-from pxr import UsdGeom, Gf, UsdLux, UsdPhysics
+from pxr import UsdGeom, Gf, UsdLux, UsdPhysics, UsdShade
 
 stage = my_world.stage
 sphere_path = "/World/Target"
@@ -598,8 +598,22 @@ sphere.GetRadiusAttr().Set(0.05)
 sphere_translate = sphere.AddTranslateOp()
 sphere_translate.Set(Gf.Vec3d(0.3, 0.3, 0.05))  # Ball on floor (z = radius)
 
-# Add physics to ball (kinematic - won't fall)
+# Add BLACK material to ball (so camera can detect it)
+from pxr import Sdf
+material_path = "/World/Looks/BlackMaterial"
+material = UsdShade.Material.Define(stage, material_path)
+shader = UsdShade.Shader.Define(stage, material_path + "/Shader")
+shader.CreateIdAttr("UsdPreviewSurface")
+shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.0, 0.0, 0.0))  # Pure black
+shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.4)
+material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+
+# Bind material to ball
 sphere_prim = stage.GetPrimAtPath(sphere_path)
+binding_api = UsdShade.MaterialBindingAPI.Apply(sphere_prim)
+binding_api.Bind(material)
+
+# Add physics to ball (kinematic - won't fall)
 rigid_body_api = UsdPhysics.RigidBodyAPI.Apply(sphere_prim)
 rigid_body_api.CreateKinematicEnabledAttr(True)  # Make it kinematic (stationary)
 UsdPhysics.CollisionAPI.Apply(sphere_prim)
