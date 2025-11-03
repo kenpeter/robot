@@ -575,23 +575,33 @@ end_effector = RigidPrim("/World/Franka/panda_hand", name="end_effector")
 # Add wrist camera for vision
 from isaacsim.core.utils.prims import create_prim
 from isaacsim.sensors.camera import Camera
+from pxr import UsdGeom, Gf, UsdLux, UsdPhysics, UsdShade
 
 # === OVERHEAD CAMERA (Eye-to-Hand) - GitHub best practice ===
 # Fixed camera above workspace for global view (like visual-pushing-grasping)
+# Workspace bounds: X[-0.6, 0.8], Y[-0.6, 0.6], Z[0.05, 1.0]
+# Center camera over workspace center: X=0.1, Y=0.0
 camera_prim_path = "/World/OverheadCamera"
 create_prim(camera_prim_path, "Camera")
+
+# Use set_camera_view to properly position and orient camera
+# Lower camera height to make objects larger in view (closer = bigger objects)
+eye = Gf.Vec3d(0.1, 0.0, 1.2)  # 1.2m high - closer to objects for larger view
+target = Gf.Vec3d(0.1, 0.0, 0.0)  # Look at ground at workspace center
+set_camera_view(eye=eye, target=target, camera_prim_path=camera_prim_path)
+
+# Adjust horizontal aperture for much wider field of view
+camera_prim = my_world.stage.GetPrimAtPath(camera_prim_path)
+camera_prim.GetAttribute("horizontalAperture").Set(80.0)  # Much wider FOV for entire workspace
+camera_prim.GetAttribute("verticalAperture").Set(80.0)  # Match vertical for square aspect ratio
+
 overhead_camera = Camera(
     prim_path=camera_prim_path,
     resolution=(84, 84),  # Small resolution for faster processing
-    position=np.array([0.0, 0.0, 1.2]),  # 1.2m above origin (bird's eye view)
-    orientation=np.array(
-        [0.7071, 0, 0, 0.7071]
-    ),  # Look straight down (90deg rotation around X-axis)
 )
 overhead_camera.initialize()
 
 # Add target sphere (ball to pick up) with physics
-from pxr import UsdGeom, Gf, UsdLux, UsdPhysics, UsdShade
 
 stage = my_world.stage
 sphere_path = "/World/Target"
@@ -823,21 +833,21 @@ try:
                 and rgb_image.size > 0
                 and not np.all(rgb_image == 0)
             ):
-                # With overhead camera, detect RED ball
-                # Look for bright red pixels: high R, low G, low B
-                red_mask = (
-                    (rgb_image[:, :, 0] > 200)  # High red channel
-                    & (rgb_image[:, :, 1] < 100)  # Low green
-                    & (rgb_image[:, :, 2] < 100)  # Low blue
+                # With overhead camera, detect CYAN ball (material renders as cyan, not red)
+                # Look for cyan pixels: low R, high G, high B
+                cyan_mask = (
+                    (rgb_image[:, :, 0] < 100)  # Low red channel
+                    & (rgb_image[:, :, 1] > 150)  # High green
+                    & (rgb_image[:, :, 2] > 150)  # High blue
                 )
-                ball_pixel_count = np.sum(red_mask)
+                ball_pixel_count = np.sum(cyan_mask)
 
-                # Overhead view: ball should be 100-800 pixels (small sphere from above)
-                ball_visible = (ball_pixel_count > 100) and (ball_pixel_count < 800)
+                # Overhead view: ball should be 10-200 pixels (small sphere from above at 1.2m height)
+                ball_visible = (ball_pixel_count > 10) and (ball_pixel_count < 200)
 
                 # Calculate ball centroid in image (for visual servoing reward)
                 if ball_visible:
-                    y_coords, x_coords = np.where(red_mask)
+                    y_coords, x_coords = np.where(cyan_mask)
                     if len(x_coords) > 0:
                         ball_centroid_x = np.mean(x_coords) / 84.0  # Normalize to 0-1
                         ball_centroid_y = np.mean(y_coords) / 84.0  # Normalize to 0-1
@@ -846,32 +856,44 @@ try:
                 if not ball_visible and last_ball_visible and ball_distance < 0.3:
                     ball_visible = True  # Assume still visible (avoid flicker)
 
-                # Save one debug image (first valid frame)
+                # Save one debug image (first valid frame) showing ball and bucket
                 if not vision_debug_saved and ball_pixel_count > 0:
                     try:
                         import cv2
 
+                        # Detect green bucket pixels
+                        green_mask = (
+                            (rgb_image[:, :, 0] < 100)  # Low red
+                            & (rgb_image[:, :, 1] > 100)  # High green
+                            & (rgb_image[:, :, 2] < 100)  # Low blue
+                        )
+                        green_pixel_count = np.sum(green_mask)
+
+                        # Create debug image with both ball and bucket highlighted
                         debug_img = rgb_image.copy()
-                        # Draw mask overlay
-                        debug_img[red_mask] = [
-                            0,
-                            255,
-                            0,
-                        ]  # Highlight detected red pixels in green
+                        # Highlight cyan ball pixels in bright green
+                        debug_img[cyan_mask] = [0, 255, 0]
+                        # Highlight green bucket pixels in yellow
+                        debug_img[green_mask] = [255, 255, 0]
+
+                        # Save raw camera view
                         cv2.imwrite(
-                            "debug_camera_view.png",
+                            "rl_camera_raw.png",
                             cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR),
                         )
+                        # Save annotated view with ball and bucket highlighted
                         cv2.imwrite(
-                            "debug_camera_mask.png",
+                            "rl_camera_annotated.png",
                             cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR),
                         )
-                        print(f"\n=== VISION DEBUG: Saved debug images ===")
-                        print(
-                            f"    Red pixels: {ball_pixel_count}, Ball visible: {ball_visible}"
-                        )
+                        print(f"\n=== VISION DEBUG: Saved camera images ===")
+                        print(f"    Cyan ball pixels: {ball_pixel_count}, Ball visible: {ball_visible}")
+                        print(f"    Green bucket pixels: {green_pixel_count}")
+                        print(f"    Saved: rl_camera_raw.png")
+                        print(f"    Saved: rl_camera_annotated.png")
                         vision_debug_saved = True
-                    except:
+                    except Exception as e:
+                        print(f"Failed to save debug images: {e}")
                         pass  # OpenCV not available, skip image save
 
             # Update last visibility for next frame
@@ -884,7 +906,7 @@ try:
                 )
                 print(f"  Ball dist: {ball_distance:.3f}, EE: {ee_position}")
                 print(
-                    f"  Vision: Red pixels={ball_pixel_count}, Ball visible={ball_visible}"
+                    f"  Vision: Cyan pixels={ball_pixel_count}, Ball visible={ball_visible}"
                 )
 
             # === CARTESIAN ACTION EXECUTION ===
