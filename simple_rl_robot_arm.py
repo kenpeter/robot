@@ -498,8 +498,8 @@ class DiTAgent:
         self.loss_history.append(weighted_loss.item())
         self.step_count += 1
 
-        # Decay exploration noise
-        self.noise_scale = max(0.05, self.noise_scale * 0.999)
+        # Decay exploration noise - slower decay, higher minimum for better exploration
+        self.noise_scale = max(0.15, self.noise_scale * 0.9995)
 
         # Return loss for logging
         return weighted_loss.item()
@@ -592,8 +592,12 @@ set_camera_view(eye=eye, target=target, camera_prim_path=camera_prim_path)
 
 # Adjust horizontal aperture for much wider field of view
 camera_prim = my_world.stage.GetPrimAtPath(camera_prim_path)
-camera_prim.GetAttribute("horizontalAperture").Set(80.0)  # Much wider FOV for entire workspace
-camera_prim.GetAttribute("verticalAperture").Set(80.0)  # Match vertical for square aspect ratio
+camera_prim.GetAttribute("horizontalAperture").Set(
+    80.0
+)  # Much wider FOV for entire workspace
+camera_prim.GetAttribute("verticalAperture").Set(
+    80.0
+)  # Match vertical for square aspect ratio
 
 overhead_camera = Camera(
     prim_path=camera_prim_path,
@@ -680,7 +684,7 @@ agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=True)
 # Try to load existing model
 agent.load_model(MODEL_PATH)
 
-num_episodes = 1000
+num_episodes = 100
 # 500 step for reach grasp delivery
 max_steps_per_episode = 500
 goal_position = np.array([-0.3, 0.3, 0.05])  # Goal location on floor
@@ -888,7 +892,9 @@ try:
                             cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR),
                         )
                         print(f"\n=== VISION DEBUG: Saved camera images ===")
-                        print(f"    Ball pixels: {ball_pixel_count}, Ball visible: {ball_visible}")
+                        print(
+                            f"    Ball pixels: {ball_pixel_count}, Ball visible: {ball_visible}"
+                        )
                         print(f"    Green bucket pixels: {green_pixel_count}")
                         print(f"    Saved: rl_camera_raw.png")
                         print(f"    Saved: rl_camera_annotated.png")
@@ -915,7 +921,9 @@ try:
             new_positions = joint_positions.copy()
 
             # Extract Cartesian delta from action
-            delta_pos = action[:3] * 0.02  # Cartesian movements (2cm max per step)
+            delta_pos = (
+                action[:3] * 0.05
+            )  # Cartesian movements (5cm max per step - increased for faster learning)
 
             # Calculate target end-effector position
             target_position = ee_position + delta_pos
@@ -970,11 +978,13 @@ try:
 
             # 2. Proximity reward (exponential - stronger gradient near ball)
             if new_ball_distance < 0.5:
-                # Normalize to 0-1 range instead of 0-10
+                # Stronger exponential reward to encourage getting very close
                 exponential_reward = 1.0 * (
                     1.0 - np.exp(-5.0 * (0.5 - new_ball_distance))
                 )
-                reward += exponential_reward * 0.3  # Scale to max +0.3
+                reward += (
+                    exponential_reward * 0.5
+                )  # Scale to max +0.5 (increased from 0.3)
 
             # 3. Velocity control: Encourage slow, stable approach when close
             if new_ball_distance < 0.3:
