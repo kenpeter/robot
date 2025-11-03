@@ -576,17 +576,19 @@ end_effector = RigidPrim("/World/Franka/panda_hand", name="end_effector")
 from isaacsim.core.utils.prims import create_prim
 from isaacsim.sensors.camera import Camera
 
-camera_prim_path = "/World/Franka/panda_hand/camera"
+# === OVERHEAD CAMERA (Eye-to-Hand) - GitHub best practice ===
+# Fixed camera above workspace for global view (like visual-pushing-grasping)
+camera_prim_path = "/World/OverheadCamera"
 create_prim(camera_prim_path, "Camera")
-wrist_camera = Camera(
+overhead_camera = Camera(
     prim_path=camera_prim_path,
     resolution=(84, 84),  # Small resolution for faster processing
-    position=np.array([0.08, 0.0, 0.02]),  # Further forward, slightly down
+    position=np.array([0.0, 0.0, 1.2]),  # 1.2m above origin (bird's eye view)
     orientation=np.array(
-        [0.9239, 0, 0.3827, 0]
-    ),  # Point forward and slightly down (45deg tilt)
+        [0.7071, 0, 0, 0.7071]
+    ),  # Look straight down (90deg rotation around X-axis)
 )
-wrist_camera.initialize()
+overhead_camera.initialize()
 
 # Add target sphere (ball to pick up) with physics
 from pxr import UsdGeom, Gf, UsdLux, UsdPhysics, UsdShade
@@ -598,16 +600,16 @@ sphere.GetRadiusAttr().Set(0.05)
 sphere_translate = sphere.AddTranslateOp()
 sphere_translate.Set(Gf.Vec3d(0.3, 0.3, 0.05))  # Ball on floor (z = radius)
 
-# Add BLACK material to ball (so camera can detect it)
+# Add RED material to ball (so camera can detect it)
 from pxr import Sdf
 
-material_path = "/World/Looks/BlackMaterial"
+material_path = "/World/Looks/RedMaterial"
 material = UsdShade.Material.Define(stage, material_path)
 shader = UsdShade.Shader.Define(stage, material_path + "/Shader")
 shader.CreateIdAttr("UsdPreviewSurface")
 shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-    Gf.Vec3f(0.0, 0.0, 0.0)
-)  # Pure black
+    Gf.Vec3f(1.0, 0.0, 0.0)
+)  # Pure red
 shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.4)
 material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
 
@@ -757,8 +759,8 @@ try:
             my_world.step(render=True)
 
             # THEN capture camera image (synchronized with current state)
-            wrist_camera.get_current_frame()
-            rgba_data = wrist_camera.get_rgba()
+            overhead_camera.get_current_frame()
+            rgba_data = overhead_camera.get_rgba()
 
             # Check if data is valid
             if rgba_data is None or rgba_data.size == 0:
@@ -808,22 +810,21 @@ try:
                 and rgb_image.size > 0
                 and not np.all(rgb_image == 0)
             ):
-                # Ball is black sphere - detect very dark pixels (near-black)
-                # Use stricter threshold to avoid ground/shadows
-                dark_mask = (
-                    (rgb_image[:, :, 0] < 30)
-                    & (rgb_image[:, :, 1] < 30)
-                    & (rgb_image[:, :, 2] < 30)
+                # With overhead camera, detect RED ball
+                # Look for bright red pixels: high R, low G, low B
+                red_mask = (
+                    (rgb_image[:, :, 0] > 200)  # High red channel
+                    & (rgb_image[:, :, 1] < 100)  # Low green
+                    & (rgb_image[:, :, 2] < 100)  # Low blue
                 )
-                ball_pixel_count = np.sum(dark_mask)
+                ball_pixel_count = np.sum(red_mask)
 
-                # Ball should be reasonable size (50-2000 pixels for 84x84 image)
-                # Too few = noise, too many = seeing ground
-                ball_visible = (ball_pixel_count > 50) and (ball_pixel_count < 2000)
+                # Overhead view: ball should be 100-800 pixels (small sphere from above)
+                ball_visible = (ball_pixel_count > 100) and (ball_pixel_count < 800)
 
                 # Calculate ball centroid in image (for visual servoing reward)
                 if ball_visible:
-                    y_coords, x_coords = np.where(dark_mask)
+                    y_coords, x_coords = np.where(red_mask)
                     if len(x_coords) > 0:
                         ball_centroid_x = np.mean(x_coords) / 84.0  # Normalize to 0-1
                         ball_centroid_y = np.mean(y_coords) / 84.0  # Normalize to 0-1
@@ -839,11 +840,11 @@ try:
 
                         debug_img = rgb_image.copy()
                         # Draw mask overlay
-                        debug_img[dark_mask] = [
+                        debug_img[red_mask] = [
                             0,
                             255,
                             0,
-                        ]  # Highlight detected pixels in green
+                        ]  # Highlight detected red pixels in green
                         cv2.imwrite(
                             "debug_camera_view.png",
                             cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR),
@@ -854,7 +855,7 @@ try:
                         )
                         print(f"\n=== VISION DEBUG: Saved debug images ===")
                         print(
-                            f"    Dark pixels: {ball_pixel_count}, Ball visible: {ball_visible}"
+                            f"    Red pixels: {ball_pixel_count}, Ball visible: {ball_visible}"
                         )
                         vision_debug_saved = True
                     except:
@@ -870,7 +871,7 @@ try:
                 )
                 print(f"  Ball dist: {ball_distance:.3f}, EE: {ee_position}")
                 print(
-                    f"  Vision: Dark pixels={ball_pixel_count}, Ball visible={ball_visible}"
+                    f"  Vision: Red pixels={ball_pixel_count}, Ball visible={ball_visible}"
                 )
 
             # === CARTESIAN ACTION EXECUTION ===
