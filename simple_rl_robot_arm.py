@@ -658,6 +658,35 @@ goal_position = np.array([-0.3, 0.3, 0.05])  # Goal location on floor
 save_interval = 10  # Save model every 10 episodes
 vision_debug_saved = False  # Flag to save one camera image for debugging
 
+# Create visual goal bucket - simple ring (no top, open for ball to drop in)
+# Just a visual marker - ball detection is done by distance check in reward function
+bucket_path = "/World/GoalBucket"
+bucket_ring = UsdGeom.Cylinder.Define(stage, bucket_path)
+bucket_ring.GetRadiusAttr().Set(0.10)  # 10cm radius
+bucket_ring.GetHeightAttr().Set(0.15)  # 15cm tall
+bucket_ring.GetAxisAttr().Set("Z")  # Upright
+bucket_ring_translate = bucket_ring.AddTranslateOp()
+bucket_ring_translate.Set(Gf.Vec3d(goal_position[0], goal_position[1], 0.075))  # Half height above floor
+
+# Add BRIGHT GREEN semi-transparent material (can see through to know it's hollow)
+bucket_material_path = "/World/Looks/GreenBucketMaterial"
+bucket_material = UsdShade.Material.Define(stage, bucket_material_path)
+bucket_shader = UsdShade.Shader.Define(stage, bucket_material_path + "/Shader")
+bucket_shader.CreateIdAttr("UsdPreviewSurface")
+bucket_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.2, 1.0, 0.3))  # Very bright green
+bucket_shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.4)  # Semi-glossy plastic
+bucket_shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)  # Non-metallic
+bucket_shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(0.5)  # 50% transparent - clearly see it's open/hollow
+bucket_material.CreateSurfaceOutput().ConnectToSource(bucket_shader.ConnectableAPI(), "surface")
+
+# Bind material to bucket
+bucket_prim = stage.GetPrimAtPath(bucket_path)
+bucket_binding = UsdShade.MaterialBindingAPI.Apply(bucket_prim)
+bucket_binding.Bind(bucket_material)
+
+# No collision - this is just a visual marker, not a physical container
+# Ball "delivery" is detected by goal_distance < 0.15 in reward function
+
 print("Starting RL Training...")
 print(f"Episodes: {num_episodes}, Max steps per episode: {max_steps_per_episode}")
 print(f"Model will be saved to: {MODEL_PATH}")
