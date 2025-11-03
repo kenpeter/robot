@@ -600,11 +600,14 @@ sphere_translate.Set(Gf.Vec3d(0.3, 0.3, 0.05))  # Ball on floor (z = radius)
 
 # Add BLACK material to ball (so camera can detect it)
 from pxr import Sdf
+
 material_path = "/World/Looks/BlackMaterial"
 material = UsdShade.Material.Define(stage, material_path)
 shader = UsdShade.Shader.Define(stage, material_path + "/Shader")
 shader.CreateIdAttr("UsdPreviewSurface")
-shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.0, 0.0, 0.0))  # Pure black
+shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+    Gf.Vec3f(0.0, 0.0, 0.0)
+)  # Pure black
 shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.4)
 material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
 
@@ -653,7 +656,8 @@ agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=True)
 agent.load_model(MODEL_PATH)
 
 num_episodes = 1000
-max_steps_per_episode = 500  # GitHub best practice: 500 steps for reach+grasp+deliver (down from 3000)
+# 500 step for reach grasp delivery
+max_steps_per_episode = 500
 goal_position = np.array([-0.3, 0.3, 0.05])  # Goal location on floor
 save_interval = 10  # Save model every 10 episodes
 vision_debug_saved = False  # Flag to save one camera image for debugging
@@ -666,18 +670,28 @@ bucket_ring.GetRadiusAttr().Set(0.10)  # 10cm radius
 bucket_ring.GetHeightAttr().Set(0.15)  # 15cm tall
 bucket_ring.GetAxisAttr().Set("Z")  # Upright
 bucket_ring_translate = bucket_ring.AddTranslateOp()
-bucket_ring_translate.Set(Gf.Vec3d(goal_position[0], goal_position[1], 0.075))  # Half height above floor
+bucket_ring_translate.Set(
+    Gf.Vec3d(goal_position[0], goal_position[1], 0.075)
+)  # Half height above floor
 
 # Add BRIGHT GREEN semi-transparent material (can see through to know it's hollow)
 bucket_material_path = "/World/Looks/GreenBucketMaterial"
 bucket_material = UsdShade.Material.Define(stage, bucket_material_path)
 bucket_shader = UsdShade.Shader.Define(stage, bucket_material_path + "/Shader")
 bucket_shader.CreateIdAttr("UsdPreviewSurface")
-bucket_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.2, 1.0, 0.3))  # Very bright green
-bucket_shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.4)  # Semi-glossy plastic
+bucket_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+    Gf.Vec3f(0.2, 1.0, 0.3)
+)  # Very bright green
+bucket_shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(
+    0.4
+)  # Semi-glossy plastic
 bucket_shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)  # Non-metallic
-bucket_shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(0.5)  # 50% transparent - clearly see it's open/hollow
-bucket_material.CreateSurfaceOutput().ConnectToSource(bucket_shader.ConnectableAPI(), "surface")
+bucket_shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(
+    0.5
+)  # 50% transparent - clearly see it's open/hollow
+bucket_material.CreateSurfaceOutput().ConnectToSource(
+    bucket_shader.ConnectableAPI(), "surface"
+)
 
 # Bind material to bucket
 bucket_prim = stage.GetPrimAtPath(bucket_path)
@@ -735,7 +749,7 @@ try:
         episode_reward = 0
         ball_grasped = False
         last_ball_visible = False  # Track previous visibility for smoothing
-        closest_distance = float('inf')  # Track closest distance for HER
+        closest_distance = float("inf")  # Track closest distance for HER
         step = 0  # Initialize step counter
 
         for step in range(max_steps_per_episode):
@@ -868,7 +882,9 @@ try:
 
             # Calculate target end-effector position
             target_position = ee_position + delta_pos
-            target_position = np.clip(target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0])
+            target_position = np.clip(
+                target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
+            )
 
             # Simplified differential IK (proportional control toward target)
             # Maps desired end-effector motion to joint space
@@ -986,7 +1002,9 @@ try:
             # Encourage gripper closing when near ball (learns closing behavior)
             if new_ball_distance < 0.15:
                 # Reward for closing gripper when close to ball
-                gripper_close_action = 0.08 - new_gripper_width  # How much gripper closed
+                gripper_close_action = (
+                    0.08 - new_gripper_width
+                )  # How much gripper closed
                 if gripper_close_action > 0:
                     # Scaled reward: closer to ball = more reward for closing
                     proximity_factor = (0.15 - new_ball_distance) / 0.15  # 0-1
@@ -1039,7 +1057,9 @@ try:
                     # This creates alternative "goals" - pretending closeness was the objective
                     s, a, r, ns, img = exp
                     # Bonus based on closest distance achieved
-                    bonus_reward = max(0, (0.5 - closest_distance) * 2.0)  # Max +1.0 for 0m
+                    bonus_reward = max(
+                        0, (0.5 - closest_distance) * 2.0
+                    )  # Max +1.0 for 0m
                     if bonus_reward > 0.1:
                         # Store relabeled experience (augments learning from failures)
                         agent.buffer.append((s, a, r + bonus_reward, ns, img))
