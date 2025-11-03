@@ -684,7 +684,7 @@ agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=True)
 # Try to load existing model
 agent.load_model(MODEL_PATH)
 
-num_episodes = 100
+num_episodes = 2000  # Train much longer for complex vision task
 # 500 step for reach grasp delivery
 max_steps_per_episode = 500
 goal_position = np.array([-0.3, 0.3, 0.05])  # Goal location on floor
