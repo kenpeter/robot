@@ -639,7 +639,7 @@ agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=True)
 agent.load_model(MODEL_PATH)
 
 num_episodes = 1000
-max_steps_per_episode = 3000  # Balanced: enough time but fast iteration
+max_steps_per_episode = 500  # GitHub best practice: 500 steps for reach+grasp+deliver (down from 3000)
 goal_position = np.array([-0.3, 0.3, 0.05])  # Goal location on floor
 save_interval = 10  # Save model every 10 episodes
 vision_debug_saved = False  # Flag to save one camera image for debugging
