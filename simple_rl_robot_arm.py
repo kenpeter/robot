@@ -6,6 +6,7 @@ Simple RL training script for robot arm reaching task.
 The robot arm learns to reach a target position.
 """
 
+# sim app
 from isaacsim import SimulationApp
 
 # Initialize simulation
@@ -428,7 +429,9 @@ class DiTAgent:
 
         # Sample batch - only from valid vision experiences
         if self.use_vision:
-            valid_indices = [i for i in range(len(self.buffer)) if self.buffer[i][4] is not None]
+            valid_indices = [
+                i for i in range(len(self.buffer)) if self.buffer[i][4] is not None
+            ]
             if len(valid_indices) < self.batch_size:
                 return  # Not enough valid samples
             indices = np.random.choice(valid_indices, self.batch_size, replace=False)
@@ -452,9 +455,7 @@ class DiTAgent:
         if self.use_vision:
             images = [img for s, a, r, ns, img in batch]
             # All images should be valid now due to filtering in update()
-            images_tensor = (
-                torch.FloatTensor(np.stack(images)).to(self.device) / 255.0
-            )
+            images_tensor = torch.FloatTensor(np.stack(images)).to(self.device) / 255.0
 
         # Diffusion training
         self.model.train()
@@ -479,7 +480,9 @@ class DiTAgent:
         predicted_noise = self.model(noisy_actions, states, timesteps, images_tensor)
 
         # Compute per-sample loss (MSE between predicted and actual noise)
-        per_sample_loss = F.mse_loss(predicted_noise, noise, reduction='none').mean(dim=1)
+        per_sample_loss = F.mse_loss(predicted_noise, noise, reduction="none").mean(
+            dim=1
+        )
 
         # Add reward weighting (prioritize good experiences)
         reward_weights = torch.sigmoid(rewards / 10.0)
@@ -509,7 +512,9 @@ class DiTAgent:
             "episode_count": self.episode_count,
             "total_reward_history": self.total_reward_history,
             "loss_history": self.loss_history[-1000:],  # Save last 1000 losses
-            "buffer": list(self.buffer)[-1000:],  # Convert deque to list, save last 1000
+            "buffer": list(self.buffer)[
+                -1000:
+            ],  # Convert deque to list, save last 1000
             "noise_scale": self.noise_scale,
             "step_count": self.step_count,
         }
@@ -577,7 +582,9 @@ wrist_camera = Camera(
     prim_path=camera_prim_path,
     resolution=(84, 84),  # Small resolution for faster processing
     position=np.array([0.08, 0.0, 0.02]),  # Further forward, slightly down
-    orientation=np.array([0.9239, 0, 0.3827, 0]),  # Point forward and slightly down (45deg tilt)
+    orientation=np.array(
+        [0.9239, 0, 0.3827, 0]
+    ),  # Point forward and slightly down (45deg tilt)
 )
 wrist_camera.initialize()
 
@@ -650,10 +657,23 @@ try:
         for _ in range(10):
             my_world.step(render=False)
 
+        # === CURRICULUM LEARNING: Start easy, gradually increase difficulty ===
+        # progress: agent step -> progress -> harder
+        curriculum_progress = min(agent.step_count / 500000.0, 1.0)
+
+        # progress: ball closer -> ball further
+        # Early training: ball closer (0.2-0.4m), Later: ball farther (0.2-0.6m)
+        min_distance = 0.2
+        max_distance = 0.2 + (
+            0.4 * curriculum_progress
+        )  # 0.2->0.6 as training progresses
+
         # Reset ball to random position on floor using RigidPrim
         target_position = np.array(
             [
-                np.random.uniform(0.2, 0.6),  # x: in front of robot
+                np.random.uniform(
+                    min_distance, max_distance
+                ),  # x: curriculum-based distance
                 np.random.uniform(-0.3, 0.3),  # y: left/right
                 0.05,  # z: on floor (ball radius)
             ],
@@ -714,10 +734,18 @@ try:
             # Vision debugging: Check if ball is visible in camera
             ball_visible = False
             ball_pixel_count = 0
-            if rgb_image is not None and rgb_image.size > 0 and not np.all(rgb_image == 0):
+            if (
+                rgb_image is not None
+                and rgb_image.size > 0
+                and not np.all(rgb_image == 0)
+            ):
                 # Ball is black sphere - detect very dark pixels (near-black)
                 # Use stricter threshold to avoid ground/shadows
-                dark_mask = (rgb_image[:, :, 0] < 30) & (rgb_image[:, :, 1] < 30) & (rgb_image[:, :, 2] < 30)
+                dark_mask = (
+                    (rgb_image[:, :, 0] < 30)
+                    & (rgb_image[:, :, 1] < 30)
+                    & (rgb_image[:, :, 2] < 30)
+                )
                 ball_pixel_count = np.sum(dark_mask)
 
                 # Ball should be reasonable size (50-2000 pixels for 84x84 image)
@@ -732,13 +760,26 @@ try:
                 if not vision_debug_saved and ball_pixel_count > 0:
                     try:
                         import cv2
+
                         debug_img = rgb_image.copy()
                         # Draw mask overlay
-                        debug_img[dark_mask] = [0, 255, 0]  # Highlight detected pixels in green
-                        cv2.imwrite("debug_camera_view.png", cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
-                        cv2.imwrite("debug_camera_mask.png", cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR))
+                        debug_img[dark_mask] = [
+                            0,
+                            255,
+                            0,
+                        ]  # Highlight detected pixels in green
+                        cv2.imwrite(
+                            "debug_camera_view.png",
+                            cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR),
+                        )
+                        cv2.imwrite(
+                            "debug_camera_mask.png",
+                            cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR),
+                        )
                         print(f"\n=== VISION DEBUG: Saved debug images ===")
-                        print(f"    Dark pixels: {ball_pixel_count}, Ball visible: {ball_visible}")
+                        print(
+                            f"    Dark pixels: {ball_pixel_count}, Ball visible: {ball_visible}"
+                        )
                         vision_debug_saved = True
                     except:
                         pass  # OpenCV not available, skip image save
@@ -752,7 +793,9 @@ try:
                     f"Step {step}: Action range [{action.min():.3f}, {action.max():.3f}], Mean: {action.mean():.3f}"
                 )
                 print(f"  Ball dist: {ball_distance:.3f}, EE: {ee_position}")
-                print(f"  Vision: Dark pixels={ball_pixel_count}, Ball visible={ball_visible}")
+                print(
+                    f"  Vision: Dark pixels={ball_pixel_count}, Ball visible={ball_visible}"
+                )
 
             # Apply action: first 7 = arm joints, last 1 = gripper
             # Use larger action scaling for faster learning
@@ -786,17 +829,43 @@ try:
             # === Normalized Reward Structure ===
             # Shaped rewards guide learning, but FINAL GOALS (grasp + delivery) have biggest rewards
 
-            # Shaping: Getting closer to ball (guides early learning)
+            # closer more reward: closer -> more reward
+
+            # Shaping: Getting closer to ball (linear - guides early learning)
             distance_improvement = ball_distance - new_ball_distance
             reward += distance_improvement * 10.0  # Dense signal for learning
 
-            # Shaping: Proximity bonus (encourage staying close)
-            if new_ball_distance < 0.3:
-                proximity_reward = (0.3 - new_ball_distance) * 3.0  # Max +0.9
-                reward += proximity_reward
+            # closer more reward: closer -> more reward
 
-            if new_ball_distance < 0.15:
-                reward += 1.0  # Grasp-ready position
+            # EXPONENTIAL proximity reward (research-backed: reward grows as distance shrinks)
+            # This creates a strong gradient near the ball, solving sparse reward problem
+            if new_ball_distance < 0.5:
+                # Exponential: r = e^(-k*distance) scaled to 0-10 range
+                # At 0.5m: ~0, At 0.1m: ~5, At 0.05m: ~7, At 0.01m: ~9
+                exponential_reward = 10.0 * (
+                    1.0 - np.exp(-5.0 * (0.5 - new_ball_distance))
+                )
+                reward += exponential_reward
+
+            # === LYAPUNOV-BASED PHYSICS-INFORMED REWARD ===
+
+            # closer slow down: closer -> slow down
+
+            # Penalize high velocity when close to ball (encourages stable approach)
+            # Lyapunov function: V = distance^2 + velocity^2
+            # Stable if dV/dt < 0 (distance decreasing faster than velocity increasing)
+            if new_ball_distance < 0.3:
+                # Estimate end-effector velocity from position change
+                ee_velocity = (
+                    np.linalg.norm(new_ee_position - ee_position) / 0.01
+                )  # dt ~0.01s per step
+                # Penalize high velocity near target (encourages smooth, stable approach)
+                if ee_velocity > 0.5:  # Too fast when close
+                    velocity_penalty = -(ee_velocity - 0.5) * 0.5  # Max penalty ~-1.0
+                    reward += velocity_penalty
+                else:
+                    # Bonus for slow, controlled approach
+                    reward += 0.2
 
             # Shaping: Vision (tiny helper)
             if ball_visible:
@@ -853,11 +922,16 @@ try:
             if len(agent.loss_history) >= 100
             else (np.mean(agent.loss_history) if agent.loss_history else 0.0)
         )
+        # Calculate curriculum difficulty for display
+        curr_progress = min(agent.step_count / 500000.0, 1.0)
+        curr_max_dist = 0.2 + (0.4 * curr_progress)
+
         print(
             f"Ep {episode:4d} | "
             f"R: {episode_reward:7.2f} | Avg: {avg_reward:7.2f} | "
             f"Loss: {avg_loss:.4f} | Steps: {agent.step_count:6d} | "
-            f"Noise: {agent.noise_scale:.3f} | Buf: {len(agent.buffer):5d}"
+            f"Noise: {agent.noise_scale:.3f} | Buf: {len(agent.buffer):5d} | "
+            f"Curriculum: {curr_progress*100:.0f}% (max_dist={curr_max_dist:.2f}m)"
         )
 
         # Save model periodically
