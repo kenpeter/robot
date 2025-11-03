@@ -734,6 +734,8 @@ try:
             # Vision debugging: Check if ball is visible in camera
             ball_visible = False
             ball_pixel_count = 0
+            ball_centroid_x = 0.0
+            ball_centroid_y = 0.0
             if (
                 rgb_image is not None
                 and rgb_image.size > 0
@@ -751,6 +753,13 @@ try:
                 # Ball should be reasonable size (50-2000 pixels for 84x84 image)
                 # Too few = noise, too many = seeing ground
                 ball_visible = (ball_pixel_count > 50) and (ball_pixel_count < 2000)
+
+                # Calculate ball centroid in image (for visual servoing reward)
+                if ball_visible:
+                    y_coords, x_coords = np.where(dark_mask)
+                    if len(x_coords) > 0:
+                        ball_centroid_x = np.mean(x_coords) / 84.0  # Normalize to 0-1
+                        ball_centroid_y = np.mean(y_coords) / 84.0  # Normalize to 0-1
 
                 # Temporal smoothing: If ball was visible last frame and close in distance, keep visible
                 if not ball_visible and last_ball_visible and ball_distance < 0.3:
@@ -867,9 +876,31 @@ try:
                     # Bonus for slow, controlled approach
                     reward += 0.2
 
-            # Shaping: Vision (tiny helper)
+            # === RESEARCH-BACKED VISUAL SERVOING REWARDS ===
+            # From 2024 papers: reward visual alignment, not just visibility
             if ball_visible:
+                # 1. Basic visibility reward (small)
                 reward += 0.1
+
+                # 2. Visual centering reward (align ball with image center)
+                # Image center is (0.5, 0.5), reward when ball is centered
+                center_distance = np.sqrt(
+                    (ball_centroid_x - 0.5) ** 2 + (ball_centroid_y - 0.5) ** 2
+                )
+                # Max distance from center is ~0.707 (corner to center)
+                # Reward ranges from 0 (corner) to +1.0 (perfectly centered)
+                centering_reward = (0.707 - center_distance) / 0.707
+                reward += centering_reward * 0.5  # Scale to max +0.5
+
+                # 3. Size-based reward (closer objects appear larger)
+                # More pixels = closer to ball (correlates with distance)
+                # Encourage keeping ball in view AND getting closer
+                size_reward = min(ball_pixel_count / 1000.0, 0.5)  # Max +0.5
+                reward += size_reward * 0.3  # Scale to max +0.15
+            else:
+                # Penalty for losing visual tracking (important for visual servoing)
+                if last_ball_visible:
+                    reward -= 0.3  # Lost tracking
 
             # Penalty: Ground avoidance
             if new_ee_position[2] < 0.05:
