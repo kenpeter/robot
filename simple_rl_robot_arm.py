@@ -833,21 +833,22 @@ try:
                 and rgb_image.size > 0
                 and not np.all(rgb_image == 0)
             ):
-                # With overhead camera, detect CYAN ball (material renders as cyan, not red)
-                # Look for cyan pixels: low R, high G, high B
-                cyan_mask = (
-                    (rgb_image[:, :, 0] < 100)  # Low red channel
-                    & (rgb_image[:, :, 1] > 150)  # High green
-                    & (rgb_image[:, :, 2] > 150)  # High blue
+                # With overhead camera, detect ball (renders as pink/red with high lighting)
+                # Look for reddish/pink pixels that stand out from blue background
+                # Ball appears as R>150 with washed out colors due to lighting
+                ball_mask = (
+                    (rgb_image[:, :, 0] > 140)  # Reddish (higher than background)
+                    & (rgb_image[:, :, 1] < 210)  # Not pure white
+                    & (rgb_image[:, :, 2] < 210)  # Not pure white
                 )
-                ball_pixel_count = np.sum(cyan_mask)
+                ball_pixel_count = np.sum(ball_mask)
 
-                # Overhead view: ball should be 10-200 pixels (small sphere from above at 1.2m height)
-                ball_visible = (ball_pixel_count > 10) and (ball_pixel_count < 200)
+                # Overhead view: ball should be 5-200 pixels (small sphere from above at 1.2m height)
+                ball_visible = (ball_pixel_count > 5) and (ball_pixel_count < 200)
 
                 # Calculate ball centroid in image (for visual servoing reward)
                 if ball_visible:
-                    y_coords, x_coords = np.where(cyan_mask)
+                    y_coords, x_coords = np.where(ball_mask)
                     if len(x_coords) > 0:
                         ball_centroid_x = np.mean(x_coords) / 84.0  # Normalize to 0-1
                         ball_centroid_y = np.mean(y_coords) / 84.0  # Normalize to 0-1
@@ -871,8 +872,8 @@ try:
 
                         # Create debug image with both ball and bucket highlighted
                         debug_img = rgb_image.copy()
-                        # Highlight cyan ball pixels in bright green
-                        debug_img[cyan_mask] = [0, 255, 0]
+                        # Highlight ball pixels in bright green
+                        debug_img[ball_mask] = [0, 255, 0]
                         # Highlight green bucket pixels in yellow
                         debug_img[green_mask] = [255, 255, 0]
 
@@ -887,7 +888,7 @@ try:
                             cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR),
                         )
                         print(f"\n=== VISION DEBUG: Saved camera images ===")
-                        print(f"    Cyan ball pixels: {ball_pixel_count}, Ball visible: {ball_visible}")
+                        print(f"    Ball pixels: {ball_pixel_count}, Ball visible: {ball_visible}")
                         print(f"    Green bucket pixels: {green_pixel_count}")
                         print(f"    Saved: rl_camera_raw.png")
                         print(f"    Saved: rl_camera_annotated.png")
@@ -906,7 +907,7 @@ try:
                 )
                 print(f"  Ball dist: {ball_distance:.3f}, EE: {ee_position}")
                 print(
-                    f"  Vision: Cyan pixels={ball_pixel_count}, Ball visible={ball_visible}"
+                    f"  Vision: Ball pixels={ball_pixel_count}, Ball visible={ball_visible}"
                 )
 
             # === CARTESIAN ACTION EXECUTION ===
