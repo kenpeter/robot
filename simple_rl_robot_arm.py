@@ -28,10 +28,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
 from isaacsim.core.api import World
-from isaacsim.core.prims import Articulation, RigidPrim
+from isaacsim.core.prims import RigidPrim
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.storage.native import get_assets_root_path
+from isaacsim.robot.manipulators import SingleManipulator
+from isaacsim.robot.manipulators.grippers import ParallelGripper
+from isaacsim.robot_motion.motion_generation import ArticulationMotionPolicy, interface_config_loader, RmpFlow
 
 # Note: Using Kimi Linear Attention (RecurrentKDA) in DiTBlocks for O(n) complexity
 print("Using Kimi Linear Attention (RecurrentKDA) for efficient transformers")
@@ -498,8 +501,8 @@ class DiTAgent:
         self.loss_history.append(weighted_loss.item())
         self.step_count += 1
 
-        # Decay exploration noise - slower decay, higher minimum for better exploration
-        self.noise_scale = max(0.15, self.noise_scale * 0.9995)
+        # Decay exploration noise - reduce to 0.05 for better signal-to-noise ratio
+        self.noise_scale = max(0.05, self.noise_scale * 0.999)
 
         # Return loss for logging
         return weighted_loss.item()
@@ -564,13 +567,26 @@ set_camera_view(
     camera_prim_path="/OmniverseKit_Persp",
 )
 
-# Add Franka robot arm
+# Add Franka robot arm with gripper
 asset_path = assets_root_path + "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
-add_reference_to_stage(usd_path=asset_path, prim_path="/World/Franka")
-robot = Articulation(prim_paths_expr="/World/Franka", name="franka_arm")
+robot_prim = add_reference_to_stage(usd_path=asset_path, prim_path="/World/Franka")
 
-# Get end-effector link for position tracking
-end_effector = RigidPrim("/World/Franka/panda_hand", name="end_effector")
+# Configure gripper
+gripper = ParallelGripper(
+    end_effector_prim_path="/World/Franka/panda_rightfinger",
+    joint_prim_names=["panda_finger_joint1", "panda_finger_joint2"],
+    joint_opened_positions=np.array([0.04, 0.04]),
+    joint_closed_positions=np.array([0.0, 0.0]),
+    action_deltas=np.array([0.01, 0.01]),
+)
+
+# Create SingleManipulator (has get_articulation_controller method needed by ArticulationMotionPolicy)
+robot = SingleManipulator(
+    prim_path="/World/Franka",
+    name="franka_arm",
+    end_effector_prim_path="/World/Franka/panda_rightfinger",
+    gripper=gripper,
+)
 
 # Add wrist camera for vision
 from isaacsim.core.utils.prims import create_prim
@@ -610,9 +626,11 @@ overhead_camera.initialize()
 stage = my_world.stage
 sphere_path = "/World/Target"
 sphere = UsdGeom.Sphere.Define(stage, sphere_path)
-sphere.GetRadiusAttr().Set(0.05)
+sphere.GetRadiusAttr().Set(
+    0.04
+)  # 4cm radius (8cm diameter) - max size for Franka gripper
 sphere_translate = sphere.AddTranslateOp()
-sphere_translate.Set(Gf.Vec3d(0.3, 0.3, 0.05))  # Ball on floor (z = radius)
+sphere_translate.Set(Gf.Vec3d(0.3, 0.3, 0.04))  # Ball on floor (z = radius)
 
 # Add RED material to ball (so camera can detect it)
 from pxr import Sdf
@@ -669,7 +687,30 @@ my_world.reset()
 # Initialize robot articulation (CRITICAL - must be after world reset)
 robot.initialize()
 ball.initialize()
-end_effector.initialize()
+# SingleManipulator has built-in end_effector property (initialized automatically)
+
+# Initialize RMPflow motion policy for accurate end-effector control (REQUIRED for grasping)
+print("Initializing RMPflow ArticulationMotionPolicy...")
+
+robot_description_path = (
+    assets_root_path
+    + "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka_description.yaml"
+)
+
+# Load RMPflow configuration (working examples use this method)
+rmp_flow_config = interface_config_loader.load_supported_motion_policy_config(
+    "Franka", "RMPflow"
+)
+rmp_flow = RmpFlow(**rmp_flow_config)
+
+# Create motion policy with physics timestep
+physics_dt = 1.0 / 60.0  # 60Hz control loop
+motion_policy = ArticulationMotionPolicy(
+    robot,
+    rmp_flow,
+    physics_dt
+)
+print("✓ RMPflow initialized - robot can now accurately reach and grasp the ball!")
 
 # RL Training parameters
 MODEL_PATH = "rl_robot_arm_model.pth"
@@ -760,7 +801,9 @@ try:
         # === DOMAIN RANDOMIZATION (GitHub best practice - improves generalization) ===
         # Randomize ball size for robust policy (sim-to-real transfer)
         ball_radius_variation = np.random.uniform(0.9, 1.1)  # ±10% size
-        ball_z = 0.05 * ball_radius_variation  # Adjust height
+        ball_z = (
+            0.15 * ball_radius_variation
+        )  # Adjust height (increased from 0.05 to match new radius)
 
         # Reset ball to random position on floor using RigidPrim
         target_position = np.array(
@@ -805,7 +848,7 @@ try:
             joint_positions = robot.get_joint_positions()[0]
             ball_pos, _ = ball.get_world_poses()
             ball_pos = np.array(ball_pos, dtype=np.float32).flatten()
-            ee_position, _ = end_effector.get_world_poses()
+            ee_position, _ = robot.end_effector.get_world_pose()
             ee_position = np.array(ee_position, dtype=np.float32).flatten()
 
             # Calculate distances (for reward only, not in state!)
@@ -815,8 +858,8 @@ try:
             # Gripper width
             gripper_width = joint_positions[7] + joint_positions[8]
 
-            # Check if ball is grasped
-            if ball_distance < 0.08 and gripper_width < 0.02:
+            # Check if ball is grasped (increased threshold for larger ball)
+            if ball_distance < 0.20 and gripper_width < 0.02:
                 ball_grasped = True
 
             # Build state: joints + ball_grasped (NO ball position!)
@@ -931,35 +974,70 @@ try:
                 target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
             )
 
-            # Simplified differential IK (proportional control toward target)
-            # Maps desired end-effector motion to joint space
-            delta_ee = (target_position - ee_position) * 3.0
+            # === USE RMPFLOW MOTION POLICY FOR ACCURATE REACHING ===
+            # RMPflow provides accurate task-space control for physical grasping
+            # RL learns high-level strategy (where to move), RMPflow handles precise low-level control
 
-            # Distribute motion across joints (simplified Jacobian approximation)
-            new_positions[:3] += delta_ee * 0.5  # First 3 joints control position
-
-            # Repeat delta for remaining 4 joints (orientation control)
-            delta_repeat = np.tile(delta_ee, 2)[:4]  # Repeat and take first 4 elements
-            new_positions[3:7] += delta_repeat * 0.3
-
-            new_positions[:7] = np.clip(new_positions[:7], -2.8, 2.8)
-
-            # Gripper control (action[3])
-            gripper_action = np.clip(action[3], -1.0, 1.0)
-            new_positions[7:9] = np.clip(
-                new_positions[7:9] + gripper_action * 0.005, 0.0, 0.04
+            # Set target on RmpFlow object (not on ArticulationMotionPolicy!)
+            rmp_flow.set_end_effector_target(
+                target_position=target_position,
+                target_orientation=None  # Let RMPflow handle orientation
             )
 
-            # Apply the positions (position control mode)
-            robot.set_joint_positions(new_positions)
+            # Get next action from motion policy wrapper (only arm joints - 7 DOF)
+            actions = motion_policy.get_next_articulation_action(physics_dt)
 
-            # Multi-stage reward function (step happens at start of next loop)
-            new_ball_pos, _ = ball.get_world_poses()
-            new_ball_pos = np.array(new_ball_pos, dtype=np.float32).flatten()
-            new_ee_position, _ = end_effector.get_world_poses()
-            new_ee_position = np.array(new_ee_position, dtype=np.float32).flatten()
-            new_ball_distance = np.linalg.norm(new_ee_position - new_ball_pos)
-            new_goal_distance = np.linalg.norm(new_ball_pos - goal_position)
+            # Apply RMPflow arm motion
+            robot.apply_action(actions)
+
+            # Gripper control (action[3] from RL agent)
+            gripper_action = np.clip(action[3], -1.0, 1.0)
+            current_joints = robot.get_joint_positions()[0].copy()  # Must copy!
+            current_width = current_joints[7] + current_joints[8]
+            target_width = np.clip(current_width + gripper_action * 0.005, 0.0, 0.04)
+
+            # Apply velocity-limited gripper motion
+            max_gripper_vel = 0.01  # 1cm/s maximum gripper velocity
+            gripper_delta = np.clip(
+                target_width - current_width, -max_gripper_vel, max_gripper_vel
+            )
+
+            # Set gripper joints separately (RMPflow doesn't control gripper)
+            current_joints[7:9] = np.clip(
+                current_joints[7:9] + gripper_delta / 2, 0.0, 0.04
+            )  # Split motion between fingers
+            robot.set_joint_positions(current_joints)
+
+            # === Enhanced State Tracking and Distance Calculation ===
+            # Get current poses with error handling
+            try:
+                new_ball_pos, _ = ball.get_world_poses()
+                new_ball_pos = np.array(new_ball_pos, dtype=np.float32).flatten()
+                new_ee_position, _ = robot.end_effector.get_world_pose()
+                new_ee_position = np.array(new_ee_position, dtype=np.float32).flatten()
+            except Exception as e:
+                print(f"Error getting poses: {e}")
+                # Use previous values if there's an error
+                new_ball_pos = ball_pos
+                new_ee_position = ee_position
+
+            # Calculate distances with stability checks
+            try:
+                # End-effector to ball distance
+                new_ball_distance = np.linalg.norm(new_ee_position - new_ball_pos)
+                if np.isnan(new_ball_distance) or np.isinf(new_ball_distance):
+                    print("Warning: Invalid ball distance, using previous value")
+                    new_ball_distance = ball_distance
+
+                # Ball to goal distance
+                new_goal_distance = np.linalg.norm(new_ball_pos - goal_position)
+                if np.isnan(new_goal_distance) or np.isinf(new_goal_distance):
+                    print("Warning: Invalid goal distance, using previous value")
+                    new_goal_distance = goal_distance
+            except Exception as e:
+                print(f"Error calculating distances: {e}")
+                new_ball_distance = ball_distance
+                new_goal_distance = goal_distance
 
             # Track closest distance this episode (for HER)
             if new_ball_distance < closest_distance:
@@ -967,27 +1045,55 @@ try:
 
             reward = 0
 
-            # === NORMALIZED Reward Structure (all rewards scaled to -1 to +1 range per step) ===
-            # Goal: Keep per-step rewards small and consistent, milestone rewards 5-10x larger
-            # This prevents reward explosion and helps training stability
+            # === ENHANCED REWARD STRUCTURE WITH PHASED OBJECTIVES ===
 
-            # 1. Distance shaping: Getting closer to ball (CLIPPED for normalization)
-            distance_improvement = ball_distance - new_ball_distance
-            # Normalize: typical improvement is ~0.01-0.05 per step, scale to -0.5 to +0.5
-            reward += np.clip(distance_improvement * 10.0, -0.5, 0.5)
+            reward = 0.0
 
-            # 2. Proximity reward (exponential - stronger gradient near ball)
-            if new_ball_distance < 0.5:
-                # Stronger exponential reward to encourage getting very close
-                exponential_reward = 1.0 * (
-                    1.0 - np.exp(-5.0 * (0.5 - new_ball_distance))
-                )
-                reward += (
-                    exponential_reward * 0.5
-                )  # Scale to max +0.5 (increased from 0.3)
+            # Phase 1: Initial Approach (>0.3m)
+            if new_ball_distance > 0.3:
+                # Aggressive distance reduction with velocity bonus
+                distance_improvement = ball_distance - new_ball_distance
+                reward += np.clip(
+                    distance_improvement * 15.0, -0.8, 0.8
+                )  # Stronger shaping
 
-            # 3. Velocity control: Encourage slow, stable approach when close
-            if new_ball_distance < 0.3:
+                # Bonus for maintaining speed during approach
+                if distance_improvement > 0.02:  # Moving at least 2cm/step
+                    reward += 0.2
+
+            # Phase 2: Precision Control (0.12-0.3m)
+            elif new_ball_distance > 0.12:  # Above grasp threshold
+                # Fine-grained distance control
+                distance_improvement = ball_distance - new_ball_distance
+                reward += np.clip(
+                    distance_improvement * 20.0, -1.0, 1.0
+                )  # Very sensitive to progress
+
+                # Strong gradient for getting closer
+                proximity_factor = (
+                    1.0 - (new_ball_distance - 0.12) / 0.18
+                )  # Normalized 0-1
+                reward += proximity_factor * 0.8  # Up to 0.8 reward for being close
+
+                # Stability bonus - penalize jerky motion
+                if abs(distance_improvement) < 0.01:  # Smooth motion
+                    reward += 0.3
+
+            # Phase 3: Final Approach & Grasp (<0.12m)
+            else:
+                # Ultra-precise control near ball
+                distance_improvement = ball_distance - new_ball_distance
+                reward += np.clip(
+                    distance_improvement * 30.0, -1.5, 1.5
+                )  # Extremely sensitive
+
+                # Strong success gradient
+                grasp_progress = 1.0 - (new_ball_distance / 0.12)  # 0-1 normalized
+                reward += grasp_progress * 1.5  # Up to 1.5 reward
+
+                # Bonus for achieving grasp
+                if new_ball_distance < 0.06:  # Within grasp threshold
+                    reward += 2.0  # Major milestone reward
                 ee_velocity = np.linalg.norm(new_ee_position - ee_position) / 0.01
                 if ee_velocity > 0.5:  # Too fast when close
                     # Normalized velocity penalty: clip to -0.2
@@ -1038,7 +1144,8 @@ try:
             # === MILESTONE REWARDS (5-10x larger than per-step rewards) ===
 
             # MILESTONE 1: Successful grasp (5x per-step reward)
-            if new_ball_distance < 0.08 and new_gripper_width < 0.02:
+            # Ball radius 0.04m + gripper fingers → grasp threshold 0.06m
+            if new_ball_distance < 0.06 and new_gripper_width < 0.02:
                 reward += 5.0  # Normalized milestone reward
                 ball_grasped = True
 
@@ -1055,7 +1162,7 @@ try:
                 ball_grasped = False
 
             # Update agent (state WITHOUT ball position, using vision!)
-            new_ball_grasped = new_ball_distance < 0.08 and new_gripper_width < 0.02
+            new_ball_grasped = new_ball_distance < 0.20 and new_gripper_width < 0.02
             next_state = np.concatenate(
                 [new_joint_positions, [float(new_ball_grasped)]]  # 9  # 1
             )  # Total: 10
