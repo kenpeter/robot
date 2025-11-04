@@ -51,9 +51,9 @@ if robot_prim:
         for grandchild in child.GetChildren():
             print(f"  - {grandchild.GetPath()}")
 
-# Configure gripper
+# Configure gripper - use panda_hand as end effector
 gripper = ParallelGripper(
-    end_effector_prim_path="/World/Franka/panda_rightfinger",  # Use the right finger as end effector
+    end_effector_prim_path="/World/Franka/panda_hand",
     joint_prim_names=[
         "panda_finger_joint1",
         "panda_finger_joint2",
@@ -67,7 +67,7 @@ robot = my_world.scene.add(
     SingleManipulator(
         prim_path="/World/Franka",
         name="franka_arm",
-        end_effector_prim_path="/World/Franka/panda_rightfinger",
+        end_effector_prim_path="/World/Franka/panda_hand",
         gripper=gripper,
     )
 )
@@ -163,9 +163,12 @@ print(f"\n1. Ball position: {ball_pos} (kinematic)", flush=True)
 # PHASE 1: Reach above ball
 print("\n2. PHASE 1: Moving above ball...", flush=True)
 above_ball = ball_pos.copy()
-above_ball[2] += 0.15  # 15cm above ball
+above_ball[2] += 0.20  # 20cm above ball (higher approach)
 
-for step in range(100):
+# Disable collision checking for the ball temporarily to allow approach
+rmp_flow.disable_obstacle(ball_path)
+
+for step in range(150):
     rmp_flow.set_end_effector_target(
         target_position=above_ball, target_orientation=None
     )
@@ -184,7 +187,7 @@ for step in range(100):
     if step % 25 == 0:
         ee_pos, _ = robot.end_effector.get_world_pose()
         distance = np.linalg.norm(np.array(ee_pos) - above_ball)
-        print(f"   Step {step}: distance to above-ball = {distance:.4f}m", flush=True)
+        print(f"   Step {step}: distance to above-ball = {distance:.4f}m, EE pos: {np.array(ee_pos)}", flush=True)
 
 ee_pos, _ = robot.end_effector.get_world_pose()
 distance = np.linalg.norm(np.array(ee_pos) - above_ball)
@@ -193,9 +196,9 @@ print(f"✓ Reached above ball (distance: {distance:.4f}m)", flush=True)
 # PHASE 2: Lower to ball
 print("\n3. PHASE 2: Lowering to ball...", flush=True)
 grasp_target = ball_pos.copy()
-grasp_target[2] += 0.005  # Target slightly above center for better contact
+grasp_target[2] = ball_pos[2]  # Target at ball center height
 
-for step in range(100):
+for step in range(150):
     rmp_flow.set_end_effector_target(
         target_position=grasp_target, target_orientation=None
     )
@@ -210,7 +213,7 @@ for step in range(100):
     if step % 30 == 0:
         ee_pos_debug, _ = robot.end_effector.get_world_pose()
         distance_debug = np.linalg.norm(np.array(ee_pos_debug) - grasp_target)
-        print(f"   Step {step}: distance to grasp = {distance_debug:.4f}m", flush=True)
+        print(f"   Step {step}: distance to grasp = {distance_debug:.4f}m, EE pos: {np.array(ee_pos_debug)}", flush=True)
 
 ee_pos, _ = robot.end_effector.get_world_pose()
 ee_to_ball = np.linalg.norm(np.array(ee_pos) - np.array(ball_pos))
