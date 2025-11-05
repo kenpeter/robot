@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Simple RL training script for robot arm reaching task.
-The robot arm learns to reach a target position.
+OFFLINE RL Training - Train on expert_dataset.pkl
+The robot learns to grasp from pre-collected expert demonstrations.
+No online data collection - pure behavioral cloning with Diffusion Policy.
 """
 
 # sim app
@@ -28,6 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
+import pickle
 from isaacsim.core.api import World
 from isaacsim.core.prims import RigidPrim
 from isaacsim.core.utils.stage import add_reference_to_stage
@@ -341,6 +343,10 @@ class DiTAgent:
         self.buffer_size = 10000
         self.batch_size = 64
 
+        # Expert demonstration tracking
+        self.expert_buffer = deque(maxlen=3000)  # Keep last 3000 expert experiences
+        self.expert_sample_ratio = 0.3  # 30% of each batch from expert demos
+
         # Training stats
         self.episode_count = 0
         self.total_reward_history = []
@@ -425,30 +431,50 @@ class DiTAgent:
 
         return action.cpu().numpy()[0]
 
-    def update(self, state, action, reward, next_state, image=None):
+    def update(self, state, action, reward, next_state, image=None, is_expert=False):
         """Store experience and train the diffusion model"""
         # Only store experiences with valid vision data
         if self.use_vision and (image is None or image.size == 0 or np.all(image == 0)):
             return  # Skip invalid vision experiences
 
-        # Add to buffer (deque auto-evicts oldest when full)
-        self.buffer.append((state, action, reward, next_state, image))
+        experience = (state, action, reward, next_state, image)
+
+        # Add to appropriate buffer
+        self.buffer.append(experience)
+        if is_expert:
+            self.expert_buffer.append(experience)  # Also store in expert buffer
 
         # Train if enough samples
         if len(self.buffer) < self.batch_size:
             return
 
-        # Sample batch - only from valid vision experiences
+        # === PRIORITIZED SAMPLING: Mix expert + RL experiences ===
+        # Sample 30% from expert buffer, 70% from main buffer
+        num_expert_samples = int(self.batch_size * self.expert_sample_ratio)
+
+        batch = []
+
+        # Sample from expert buffer if available
+        if len(self.expert_buffer) > 0 and num_expert_samples > 0:
+            expert_indices = np.random.choice(
+                len(self.expert_buffer),
+                min(num_expert_samples, len(self.expert_buffer)),
+                replace=False
+            )
+            batch.extend([self.expert_buffer[i] for i in expert_indices])
+
+        # Fill remaining with RL experiences
+        remaining_needed = self.batch_size - len(batch)
         if self.use_vision:
             valid_indices = [
                 i for i in range(len(self.buffer)) if self.buffer[i][4] is not None
             ]
-            if len(valid_indices) < self.batch_size:
+            if len(valid_indices) < remaining_needed:
                 return  # Not enough valid samples
-            indices = np.random.choice(valid_indices, self.batch_size, replace=False)
+            indices = np.random.choice(valid_indices, remaining_needed, replace=False)
         else:
-            indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
-        batch = [self.buffer[i] for i in indices]
+            indices = np.random.choice(len(self.buffer), remaining_needed, replace=False)
+        batch.extend([self.buffer[i] for i in indices])
 
         # Convert to tensors
         states = torch.FloatTensor(np.array([s for s, a, r, ns, img in batch])).to(
@@ -509,8 +535,8 @@ class DiTAgent:
         self.loss_history.append(weighted_loss.item())
         self.step_count += 1
 
-        # Decay exploration noise - reduce to 0.05 for better signal-to-noise ratio
-        self.noise_scale = max(0.05, self.noise_scale * 0.999)
+        # Decay exploration noise - floor at 0.10 for bold exploration
+        self.noise_scale = max(0.10, self.noise_scale * 0.999)
 
         # Return loss for logging
         return weighted_loss.item()
@@ -526,11 +552,12 @@ class DiTAgent:
             "buffer": list(self.buffer)[
                 -1000:
             ],  # Convert deque to list, save last 1000
+            "expert_buffer": list(self.expert_buffer),  # Save ALL expert demos
             "noise_scale": self.noise_scale,
             "step_count": self.step_count,
         }
         torch.save(model_data, filepath)
-        print(f"Model saved to {filepath}")
+        print(f"Model saved to {filepath} (including {len(self.expert_buffer)} expert demos)")
 
     def load_model(self, filepath):
         """Load agent state from file"""
@@ -549,11 +576,16 @@ class DiTAgent:
         # Load buffer and convert back to deque
         buffer_list = model_data.get("buffer", [])
         self.buffer = deque(buffer_list, maxlen=self.buffer_size)
+
+        # Load expert buffer
+        expert_buffer_list = model_data.get("expert_buffer", [])
+        self.expert_buffer = deque(expert_buffer_list, maxlen=3000)
+
         self.noise_scale = model_data.get("noise_scale", 0.3)
 
         print(f"Model loaded from {filepath}")
         print(
-            f"Resuming from episode {self.episode_count}, step {self.step_count}, buffer size: {len(self.buffer)}"
+            f"Resuming from episode {self.episode_count}, step {self.step_count}, buffer size: {len(self.buffer)}, expert demos: {len(self.expert_buffer)}"
         )
         return True
 
@@ -604,7 +636,7 @@ robot = SingleManipulator(
 # Add wrist camera for vision
 from isaacsim.core.utils.prims import create_prim
 from isaacsim.sensors.camera import Camera
-from pxr import UsdGeom, Gf, UsdLux, UsdPhysics, UsdShade
+from pxr import Gf, UsdLux
 
 # === OVERHEAD CAMERA (Eye-to-Hand) - GitHub best practice ===
 # Fixed camera above workspace for global view (like visual-pushing-grasping)
@@ -634,17 +666,17 @@ overhead_camera = Camera(
 )
 overhead_camera.initialize()
 
-# === RED CUBE SETUP (randomized position) ===
-# Add red cube (instead of ball) with random initial position
+# === RED CUBE SETUP (matching test_grasp_official.py) ===
+# Add red cube with same setup as test_grasp_official.py
 from isaacsim.core.api.objects import DynamicCuboid
 
-# Randomize cube initial position within reachable workspace
+# Use exact same cube size as test_grasp_official.py
 cube_size = 0.0515  # 5.15cm cube (same as test_grasp_official.py)
-cube_initial_x = np.random.uniform(0.2, 0.5)  # Reachable by UR10e
-cube_initial_y = np.random.uniform(-0.2, 0.2)
+cube_initial_x = 0.5  # Same as test_grasp_official.py
+cube_initial_y = 0.2  # Same as test_grasp_official.py
 cube_initial_z = cube_size / 2.0  # On ground plane
 
-print(f"\n=== RANDOMIZED SCENE ===")
+print(f"\n=== RED CUBE SETUP (matching test_grasp_official.py) ===")
 print(
     f"Cube initial position: [{cube_initial_x:.3f}, {cube_initial_y:.3f}, {cube_initial_z:.3f}]"
 )
@@ -682,36 +714,7 @@ distant_light.CreateIntensityAttr(2000.0)
 distant_light_xform = distant_light.AddRotateXYZOp()
 distant_light_xform.Set(Gf.Vec3f(-45, 0, 0))  # Angle from above
 
-# === RANDOMIZED GOAL/TARGET LOCATION ===
-# Add goal location marker (green box) with random position
-goal_x = np.random.uniform(-0.4, -0.1)  # Different area than cube
-goal_y = np.random.uniform(-0.2, 0.2)
-goal_z = 0.075  # Half of green marker size
-
-print(f"Goal position: [{goal_x:.3f}, {goal_y:.3f}, {goal_z:.3f}]")
 print("=" * 50 + "\n")
-
-goal_path = "/World/Goal"
-goal_cube = UsdGeom.Cube.Define(stage, goal_path)
-goal_cube.GetSizeAttr().Set(0.15)
-goal_translate = goal_cube.AddTranslateOp()
-goal_translate.Set(Gf.Vec3d(goal_x, goal_y, goal_z))
-
-# Add GREEN material to goal marker
-from pxr import Sdf
-
-goal_material_path = "/World/Looks/GreenMaterial"
-goal_material = UsdShade.Material.Define(stage, goal_material_path)
-goal_shader = UsdShade.Shader.Define(stage, goal_material_path + "/Shader")
-goal_shader.CreateIdAttr("UsdPreviewSurface")
-goal_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-    Gf.Vec3f(0.0, 1.0, 0.0)
-)  # Pure green
-goal_material.CreateSurfaceOutput().ConnectToSource(
-    goal_shader.ConnectableAPI(), "surface"
-)
-goal_prim = stage.GetPrimAtPath(goal_path)
-UsdShade.MaterialBindingAPI.Apply(goal_prim).Bind(goal_material)
 
 # Initialize world
 my_world.reset()
@@ -755,530 +758,156 @@ agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=True)
 # Try to load existing model
 agent.load_model(MODEL_PATH)
 
-num_episodes = 2000  # Train much longer for complex vision task
-# 500 step for reach grasp delivery
-max_steps_per_episode = 500
-save_interval = 10  # Save model every 10 episodes
-vision_debug_saved = False  # Flag to save one camera image for debugging
+# === LOAD EXPERT DATASET ===
+DATASET_PATH = "expert_dataset.pkl"
+print("\n" + "=" * 70)
+print(" LOADING EXPERT DATASET FOR OFFLINE TRAINING")
+print("=" * 70)
 
-# NOTE: Goal position is now RANDOMIZED per episode (see episode loop below)
-# No static goal marker created here - goal visualization moved to episode loop
+if not os.path.exists(DATASET_PATH):
+    print(f"\n❌ ERROR: Dataset not found at {DATASET_PATH}")
+    print("Please run: python collect_expert_dataset.py")
+    print("=" * 70)
+    simulation_app.close()
+    sys.exit(1)
 
-print("Starting RL Training...")
-print(f"Episodes: {num_episodes}, Max steps per episode: {max_steps_per_episode}")
-print(f"Model will be saved to: {MODEL_PATH}")
+print(f"\nLoading dataset from {DATASET_PATH}...")
+with open(DATASET_PATH, 'rb') as f:
+    expert_dataset = pickle.load(f)
+
+print(f"✓ Dataset loaded successfully!")
+print(f"  Total experiences: {len(expert_dataset['states'])}")
+print(f"  State shape: {expert_dataset['states'].shape}")
+print(f"  Action shape: {expert_dataset['actions'].shape}")
+print(f"  Image shape: {expert_dataset['images'].shape}")
+print("=" * 70 + "\n")
+
+# Old expert seeding functions removed - using pre-collected dataset instead
+
+# Training parameters
+NUM_EPOCHS = 200
+VISUALIZATION_INTERVAL = 20  # Visualize learned policy every 20 epochs
+save_interval = 10  # Save model every 10 epochs
+
+print("\n" + "=" * 70)
+print(" STARTING OFFLINE TRAINING")
+print("=" * 70)
+print(f"Training on {len(expert_dataset['states'])} expert experiences")
+print(f"Epochs: {NUM_EPOCHS}")
+print(f"Visualization every: {VISUALIZATION_INTERVAL} epochs")
+print(f"Model will be saved to: {MODEL_PATH}\n")
 
 try:
-    for episode in range(agent.episode_count, agent.episode_count + num_episodes):
-        # Reset arm to UPRIGHT vertical position for UR10e
-        # UR10e has 12 DOF total: 6 arm joints + 6 gripper joints (with mimic)
-        # Arm joints: shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3
-        # Gripper joints: finger_joint, left_inner_finger, left_inner_knuckle,
-        #                 right_inner_finger, right_inner_knuckle, right_outer_knuckle
-        # ALL ZEROS = arm points straight up (perpendicular to floor)
-        initial_pos = np.array(
-            [0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0]
-        )  # Standard ready pose
-        initial_pos += np.random.uniform(-0.05, 0.05, 6)  # Tiny perturbation
-
-        # Gripper open position: all joints at 0
-        gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 6 gripper joints
-        robot.set_joint_positions(np.concatenate([initial_pos, gripper_open]))
-
-        # Step world multiple times to stabilize physics
-        for _ in range(10):
-            my_world.step(render=False)
-
-        # === CURRICULUM LEARNING: Start easy, gradually increase difficulty ===
-        # progress: agent step -> progress -> harder
-        curriculum_progress = min(agent.step_count / 500000.0, 1.0)
-
-        # progress: ball closer -> ball further
-        # Early training: ball closer (0.2-0.4m), Later: ball farther (0.2-0.6m)
-        min_distance = 0.2
-        max_distance = 0.2 + (
-            0.4 * curriculum_progress
-        )  # 0.2->0.6 as training progresses
-
-        # === DOMAIN RANDOMIZATION (GitHub best practice - improves generalization) ===
-        # Reset RED CUBE to random position - FARTHER from robot base (at origin)
-        cube_x = np.random.uniform(0.4, 0.6)  # Farther in positive X direction
-        cube_y = np.random.uniform(-0.3, 0.3)  # Wider Y range
-        cube_z = cube_size / 2.0  # On ground plane
-
-        cube_position = np.array([cube_x, cube_y, cube_z], dtype=np.float32).flatten()
-        ball.set_world_pose(
-            position=cube_position
-        )  # ball variable = cube (uses singular)
-
-        # Randomize GOAL position - FARTHER on opposite side
-        goal_x = np.random.uniform(-0.6, -0.3)  # Farther in negative X direction
-        goal_y = np.random.uniform(-0.3, 0.3)  # Wider Y range
-        goal_z = 0.075  # Half of green marker size
-        goal_position = np.array([goal_x, goal_y, goal_z], dtype=np.float32)
-
-        # Update goal marker position
-        goal_translate.Set(Gf.Vec3d(goal_x, goal_y, goal_z))
-
-        episode_reward = 0
-        ball_grasped = False
-        last_ball_visible = False  # Track previous visibility for smoothing
-        closest_distance = float("inf")  # Track closest distance for HER
-        step = 0  # Initialize step counter
-
-        for step in range(max_steps_per_episode):
-            # Step simulation FIRST to update physics
-            my_world.step(render=True)
-
-            # THEN capture camera image (synchronized with current state)
-            overhead_camera.get_current_frame()
-            rgba_data = overhead_camera.get_rgba()
-
-            # Check if data is valid
-            if rgba_data is None or rgba_data.size == 0:
-                # Use dummy image if camera not ready
-                rgb_image = np.zeros((84, 84, 3), dtype=np.uint8)
-            else:
-                # Reshape from flat array to image if needed
-                if len(rgba_data.shape) == 1:
-                    rgba_data = rgba_data.reshape(84, 84, 4)
-                rgb_image = rgba_data[:, :, :3].astype(
-                    np.uint8
-                )  # Get RGB only (84x84x3)
-
-            # Get robot state (after step, synchronized with image)
-            joint_positions_raw = robot.get_joint_positions()
-            # Handle both tuple and direct array returns
-            if isinstance(joint_positions_raw, tuple):
-                joint_positions = joint_positions_raw[0]
-            else:
-                joint_positions = joint_positions_raw
-
-            ball_pos, _ = ball.get_world_pose()  # DynamicCuboid uses singular
-            ball_pos = np.array(ball_pos, dtype=np.float32).flatten()
-            ee_position, _ = robot.end_effector.get_world_pose()
-            ee_position = np.array(ee_position, dtype=np.float32).flatten()
-
-            # Calculate distances (for reward only, not in state!)
-            ball_distance = np.linalg.norm(ee_position - ball_pos)
-            goal_distance = np.linalg.norm(ball_pos - goal_position)
-
-            # Gripper state (UR10e has 6 gripper joints, but finger_joint is main control)
-            # joint_positions[6] = finger_joint: 0 = open, 40 = closed
-            if len(joint_positions) > 6:
-                gripper_position = joint_positions[6]  # Main gripper joint
-            else:
-                print(
-                    f"Warning: joint_positions has only {len(joint_positions)} elements"
-                )
-                gripper_position = 0.0
-
-            # Check if cube is grasped (cube is easier than ball)
-            # Distance < 0.15m and gripper is closing (position > 0.02)
-            if ball_distance < 0.15 and gripper_position > 0.02:
-                ball_grasped = True
-
-            # Build state: joints + cube_grasped (NO cube position!)
-            state = np.concatenate(
-                [joint_positions, [float(ball_grasped)]]  # 12 joints  # 1 grasped flag
-            )  # Total: 13
-
-            # Get action from agent WITH VISION
-            action = agent.get_action(state, image=rgb_image)
-
-            # Vision debugging: Check if RED CUBE is visible in camera
-            ball_visible = False  # Keep variable name for compatibility
-            ball_pixel_count = 0
-            ball_centroid_x = 0.0
-            ball_centroid_y = 0.0
-            if (
-                rgb_image is not None
-                and rgb_image.size > 0
-                and not np.all(rgb_image == 0)
-            ):
-                # With overhead camera, detect RED CUBE (renders as red with high lighting)
-                # Look for reddish pixels that stand out from blue background
-                # Cube appears as R>140 with washed out colors due to lighting
-                ball_mask = (
-                    (rgb_image[:, :, 0] > 140)  # Reddish (higher than background)
-                    & (rgb_image[:, :, 1] < 210)  # Not pure white
-                    & (rgb_image[:, :, 2] < 210)  # Not pure white
-                )
-                ball_pixel_count = np.sum(ball_mask)
-
-                # Overhead view: cube should be 5-300 pixels (5.15cm cube from above at 1.2m height)
-                ball_visible = (ball_pixel_count > 5) and (ball_pixel_count < 300)
-
-                # Calculate cube centroid in image (for visual servoing reward)
-                if ball_visible:
-                    y_coords, x_coords = np.where(ball_mask)
-                    if len(x_coords) > 0:
-                        ball_centroid_x = np.mean(x_coords) / 84.0  # Normalize to 0-1
-                        ball_centroid_y = np.mean(y_coords) / 84.0  # Normalize to 0-1
-
-                # Temporal smoothing: If cube was visible last frame and close in distance, keep visible
-                if not ball_visible and last_ball_visible and ball_distance < 0.3:
-                    ball_visible = True  # Assume still visible (avoid flicker)
-
-                # Save one debug image (first valid frame) showing cube and goal marker
-                if not vision_debug_saved and ball_pixel_count > 0:
-                    try:
-                        import cv2
-
-                        # Detect green bucket pixels
-                        green_mask = (
-                            (rgb_image[:, :, 0] < 100)  # Low red
-                            & (rgb_image[:, :, 1] > 100)  # High green
-                            & (rgb_image[:, :, 2] < 100)  # Low blue
-                        )
-                        green_pixel_count = np.sum(green_mask)
-
-                        # Create debug image with both cube and goal marker highlighted
-                        debug_img = rgb_image.copy()
-                        # Highlight cube pixels in bright green
-                        debug_img[ball_mask] = [0, 255, 0]
-                        # Highlight green goal marker pixels in yellow
-                        debug_img[green_mask] = [255, 255, 0]
-
-                        # Save raw camera view
-                        cv2.imwrite(
-                            "rl_camera_raw.png",
-                            cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR),
-                        )
-                        # Save annotated view with cube and goal marker highlighted
-                        cv2.imwrite(
-                            "rl_camera_annotated.png",
-                            cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR),
-                        )
-                        print(f"\n=== VISION DEBUG: Saved camera images ===")
-                        print(
-                            f"    Cube pixels: {ball_pixel_count}, Cube visible: {ball_visible}"
-                        )
-                        print(f"    Green goal marker pixels: {green_pixel_count}")
-                        print(f"    Saved: rl_camera_raw.png")
-                        print(f"    Saved: rl_camera_annotated.png")
-                        vision_debug_saved = True
-                    except Exception as e:
-                        print(f"Failed to save debug images: {e}")
-                        pass  # OpenCV not available, skip image save
-
-            # Update last visibility for next frame
-            last_ball_visible = ball_visible
-
-            # Debug: Print action and vision info every 50 steps
-            if step % 50 == 0:
-                print(
-                    f"Step {step}: Action range [{action.min():.3f}, {action.max():.3f}], Mean: {action.mean():.3f}"
-                )
-                print(f"  Cube dist: {ball_distance:.3f}, EE: {ee_position}")
-                print(
-                    f"  Vision: Cube pixels={ball_pixel_count}, Cube visible={ball_visible}"
-                )
-
-            # === CARTESIAN ACTION EXECUTION ===
-            # Action = [dx, dy, dz, gripper] - 4D end-effector control
-            new_positions = joint_positions.copy()
-
-            # Extract Cartesian delta from action
-            delta_pos = (
-                action[:3] * 0.05
-            )  # Cartesian movements (5cm max per step - increased for faster learning)
-
-            # Calculate target end-effector position
-            target_position = ee_position + delta_pos
-            target_position = np.clip(
-                target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
-            )
-
-            # === USE RMPFLOW MOTION POLICY FOR ACCURATE REACHING ===
-            # RMPflow provides accurate task-space control for physical grasping
-            # RL learns high-level strategy (where to move), RMPflow handles precise low-level control
-
-            # Set target on RmpFlow object (not on ArticulationMotionPolicy!)
-            rmp_flow.set_end_effector_target(
-                target_position=target_position,
-                target_orientation=None,  # Let RMPflow handle orientation
-            )
-
-            # Get next action from motion policy wrapper (only arm joints - 7 DOF)
-            actions = motion_policy.get_next_articulation_action(physics_dt)
-
-            # Apply RMPflow arm motion
-            robot.apply_action(actions)
-
-            # Gripper control (action[3] from RL agent)
-            # UR10e has 6 gripper joints, but we control via finger_joint (index 6)
-            # The mimic joints will automatically follow
-            gripper_action = np.clip(action[3], -1.0, 1.0)
-
-            # Get current joint positions with safe handling
-            current_joints_raw = robot.get_joint_positions()
-            if isinstance(current_joints_raw, tuple):
-                current_joints = current_joints_raw[0].copy()
-            else:
-                current_joints = current_joints_raw.copy()
-
-            if len(current_joints) > 6:
-                current_gripper = current_joints[6]  # finger_joint
-
-                # Map action to gripper position change: -1 = open, +1 = close
-                # Scale factor 0.01 for smooth control
-                target_gripper = np.clip(
-                    current_gripper + gripper_action * 0.01, 0.0, 0.04
-                )
-
-                # Apply velocity-limited gripper motion
-                max_gripper_vel = 0.005  # 0.5cm/step maximum velocity
-                gripper_delta = np.clip(
-                    target_gripper - current_gripper, -max_gripper_vel, max_gripper_vel
-                )
-
-                # Set gripper joint (RMPflow doesn't control gripper)
-                # Only update finger_joint - mimic joints auto-follow
-                current_joints[6] = np.clip(current_gripper + gripper_delta, 0.0, 0.04)
-                robot.set_joint_positions(current_joints)
-            else:
-                print(
-                    f"Warning: Cannot control gripper, only {len(current_joints)} joints available"
-                )
-
-            # === Enhanced State Tracking and Distance Calculation ===
-            # Get current poses with error handling
-            try:
-                new_ball_pos, _ = ball.get_world_pose()  # DynamicCuboid uses singular
-                new_ball_pos = np.array(new_ball_pos, dtype=np.float32).flatten()
-                new_ee_position, _ = robot.end_effector.get_world_pose()
-                new_ee_position = np.array(new_ee_position, dtype=np.float32).flatten()
-            except Exception as e:
-                print(f"Error getting poses: {e}")
-                # Use previous values if there's an error
-                new_ball_pos = ball_pos
-                new_ee_position = ee_position
-
-            # Calculate distances with stability checks
-            try:
-                # End-effector to ball distance
-                new_ball_distance = np.linalg.norm(new_ee_position - new_ball_pos)
-                if np.isnan(new_ball_distance) or np.isinf(new_ball_distance):
-                    print("Warning: Invalid ball distance, using previous value")
-                    new_ball_distance = ball_distance
-
-                # Ball to goal distance
-                new_goal_distance = np.linalg.norm(new_ball_pos - goal_position)
-                if np.isnan(new_goal_distance) or np.isinf(new_goal_distance):
-                    print("Warning: Invalid goal distance, using previous value")
-                    new_goal_distance = goal_distance
-            except Exception as e:
-                print(f"Error calculating distances: {e}")
-                new_ball_distance = ball_distance
-                new_goal_distance = goal_distance
-
-            # Track closest distance this episode (for HER)
-            if new_ball_distance < closest_distance:
-                closest_distance = new_ball_distance
-
-            reward = 0
-
-            # === ENHANCED REWARD STRUCTURE WITH PHASED OBJECTIVES ===
-
-            reward = 0.0
-
-            # Phase 1: Initial Approach (>0.3m)
-            if new_ball_distance > 0.3:
-                # Aggressive distance reduction with velocity bonus
-                distance_improvement = ball_distance - new_ball_distance
-                reward += np.clip(
-                    distance_improvement * 15.0, -0.8, 0.8
-                )  # Stronger shaping
-
-                # Bonus for maintaining speed during approach
-                if distance_improvement > 0.02:  # Moving at least 2cm/step
-                    reward += 0.2
-
-            # Phase 2: Precision Control (0.12-0.3m)
-            elif new_ball_distance > 0.12:  # Above grasp threshold
-                # Fine-grained distance control
-                distance_improvement = ball_distance - new_ball_distance
-                reward += np.clip(
-                    distance_improvement * 20.0, -1.0, 1.0
-                )  # Very sensitive to progress
-
-                # Strong gradient for getting closer
-                proximity_factor = (
-                    1.0 - (new_ball_distance - 0.12) / 0.18
-                )  # Normalized 0-1
-                reward += proximity_factor * 0.8  # Up to 0.8 reward for being close
-
-                # Stability bonus - penalize jerky motion
-                if abs(distance_improvement) < 0.01:  # Smooth motion
-                    reward += 0.3
-
-            # Phase 3: Final Approach & Grasp (<0.12m)
-            else:
-                # Ultra-precise control near ball
-                distance_improvement = ball_distance - new_ball_distance
-                reward += np.clip(
-                    distance_improvement * 30.0, -1.5, 1.5
-                )  # Extremely sensitive
-
-                # Strong success gradient
-                grasp_progress = 1.0 - (new_ball_distance / 0.12)  # 0-1 normalized
-                reward += grasp_progress * 1.5  # Up to 1.5 reward
-
-                # Bonus for achieving grasp
-                if new_ball_distance < 0.06:  # Within grasp threshold
-                    reward += 2.0  # Major milestone reward
-                ee_velocity = np.linalg.norm(new_ee_position - ee_position) / 0.01
-                if ee_velocity > 0.5:  # Too fast when close
-                    # Normalized velocity penalty: clip to -0.2
-                    velocity_penalty = -np.clip((ee_velocity - 0.5) * 0.4, 0, 0.2)
-                    reward += velocity_penalty
-                else:
-                    # Small bonus for controlled approach
-                    reward += 0.1
-
-            # 4. Visual servoing rewards (normalized)
-            if ball_visible:
-                # Basic visibility bonus
-                reward += 0.05
-
-                # Visual centering (align ball with image center)
-                center_distance = np.sqrt(
-                    (ball_centroid_x - 0.5) ** 2 + (ball_centroid_y - 0.5) ** 2
-                )
-                centering_reward = (0.707 - center_distance) / 0.707
-                reward += centering_reward * 0.2  # Scale to max +0.2
-
-                # Size-based (closer = larger in view)
-                size_reward = min(ball_pixel_count / 200.0, 1.0)
-                reward += size_reward * 0.1  # Scale to max +0.1
-            else:
-                # Penalty for losing visual tracking
-                if last_ball_visible:
-                    reward -= 0.2
-
-            # 5. Safety: Ground avoidance (normalized)
-            if new_ee_position[2] < 0.05:
-                reward -= 0.5
-            elif new_ee_position[2] < 0.1:
-                reward -= (0.1 - new_ee_position[2]) * 2.0  # Max -0.1
-
-            # 6. Gripper control (normalized) - UR10e uses single joint
-            new_joint_positions_raw = robot.get_joint_positions()
-            if isinstance(new_joint_positions_raw, tuple):
-                new_joint_positions = new_joint_positions_raw[0]
-            else:
-                new_joint_positions = new_joint_positions_raw
-
-            # UR10e: gripper position at index 6 (0 = open, 0.04 = closed)
-            if len(new_joint_positions) > 6:
-                new_gripper_position = new_joint_positions[6]
-            else:
-                new_gripper_position = 0.0
-
-            # Encourage gripper closing when near cube
-            if new_ball_distance < 0.15:
-                # For UR10e: gripper closes from 0 to 0.04
-                gripper_close_action = 0.04 - new_gripper_position
-                if gripper_close_action > 0:
-                    proximity_factor = (0.15 - new_ball_distance) / 0.15
-                    # Normalize to max +0.3
-                    reward += gripper_close_action * 3.0 * proximity_factor * 0.1
-
-            # === MILESTONE REWARDS (5-10x larger than per-step rewards) ===
-
-            # MILESTONE 1: Successful grasp (5x per-step reward)
-            # Cube is 5.15cm, gripper closes to 0.02 when grasping
-            if new_ball_distance < 0.10 and new_gripper_position > 0.02:
-                reward += 5.0  # Normalized milestone reward
-                ball_grasped = True
-
-                # Shaping after grasp: Move ball to goal (normalized)
-                goal_improvement = goal_distance - new_goal_distance
-                reward += np.clip(goal_improvement * 10.0, -0.5, 0.5)
-
-                # MILESTONE 2: Successful delivery (10x per-step reward)
-                if new_goal_distance < 0.15:
-                    reward += 10.0  # Normalized final milestone reward
-                    print(f"Episode {episode}: Ball delivered to goal at step {step}!")
-                    break
-            else:
-                ball_grasped = False
-
-            # Update agent (state WITHOUT cube position, using vision!)
-            new_ball_grasped = new_ball_distance < 0.15 and new_gripper_position > 0.02
-            next_state = np.concatenate(
-                [
-                    new_joint_positions,
-                    [float(new_ball_grasped)],
-                ]  # 12 joints  # 1 grasped
-            )  # Total: 13
-
-            # Update agent and track loss
-            loss = agent.update(state, action, reward, next_state, image=rgb_image)
-
-            episode_reward += reward
-
-        # === HINDSIGHT EXPERIENCE REPLAY (HER) - Research-backed 2024 ===
-        # If episode failed to grasp, relabel experiences as "reaching" successes
-        # This turns sparse rewards into dense learning signal
-        if not ball_grasped and len(agent.buffer) > 0 and closest_distance < 0.5:
-            # HER insight: Even failed episodes have value if they got close
-            # Relabel close approaches as successes for "reaching" goal
-
-            # Sample last 50 experiences from this episode for relabeling
-            relabel_count = min(50, step + 1)
-            for i in range(relabel_count):
-                if len(agent.buffer) > i:
-                    # Get recent experience
-                    idx = len(agent.buffer) - 1 - i
-                    exp = agent.buffer[idx]
-
-                    # Relabel reward: if got close, add bonus (hindsight success)
-                    # This creates alternative "goals" - pretending closeness was the objective
-                    s, a, r, ns, img = exp
-                    # Bonus based on closest distance achieved
-                    bonus_reward = max(
-                        0, (0.5 - closest_distance) * 2.0
-                    )  # Max +1.0 for 0m
-                    if bonus_reward > 0.1:
-                        # Store relabeled experience (augments learning from failures)
-                        agent.buffer.append((s, a, r + bonus_reward, ns, img))
-
-        # Track statistics
-        agent.total_reward_history.append(episode_reward)
-        agent.episode_count = episode + 1
-
-        # Print progress with detailed metrics (every episode)
-        avg_reward = (
-            np.mean(agent.total_reward_history[-10:])
-            if len(agent.total_reward_history) >= 10
-            else np.mean(agent.total_reward_history)
-        )
-        avg_loss = (
-            np.mean(agent.loss_history[-100:])
-            if len(agent.loss_history) >= 100
-            else (np.mean(agent.loss_history) if agent.loss_history else 0.0)
-        )
-        # Calculate curriculum difficulty for display
-        curr_progress = min(agent.step_count / 500000.0, 1.0)
-        curr_max_dist = 0.2 + (0.4 * curr_progress)
-
-        print(
-            f"Ep {episode:4d} | "
-            f"R: {episode_reward:7.2f} | Avg: {avg_reward:7.2f} | "
-            f"Loss: {avg_loss:.4f} | Steps: {agent.step_count:6d} | "
-            f"Noise: {agent.noise_scale:.3f} | Buf: {len(agent.buffer):5d} | "
-            f"Curriculum: {curr_progress*100:.0f}% (max_dist={curr_max_dist:.2f}m)"
-        )
-
-        # Save model periodically
-        if (episode + 1) % save_interval == 0:
+    for epoch in range(NUM_EPOCHS):
+        # Train on entire expert dataset
+        num_samples = len(expert_dataset['states'])
+        indices = np.random.permutation(num_samples)
+        epoch_losses = []
+
+        # Train on batches from expert dataset
+        for start_idx in range(0, num_samples, agent.batch_size):
+            end_idx = min(start_idx + agent.batch_size, num_samples)
+            batch_indices = indices[start_idx:end_idx]
+
+            # Get batch from expert dataset
+            for idx in batch_indices:
+                state = expert_dataset['states'][idx]
+                action = expert_dataset['actions'][idx]
+                reward = expert_dataset['rewards'][idx]
+                next_state = expert_dataset['next_states'][idx]
+                image = expert_dataset['images'][idx]
+
+                # Train on this experience (is_expert=True puts it in expert_buffer)
+                loss = agent.update(state, action, reward, next_state, image, is_expert=True)
+                if loss is not None:
+                    epoch_losses.append(loss)
+
+        # Log progress
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS} | Loss: {avg_loss:.6f} | Expert buffer: {len(agent.expert_buffer)}")
+
+        # Save checkpoint
+        if (epoch + 1) % save_interval == 0:
             agent.save_model(MODEL_PATH)
-            print(f"Progress saved at episode {episode}")
+            print(f"  → Checkpoint saved at epoch {epoch+1}\n")
+
+        # Visualize learned policy in Isaac Sim
+        if (epoch + 1) % VISUALIZATION_INTERVAL == 0:
+            print(f"\n🎬 VISUALIZATION Epoch {epoch+1}: Testing learned policy...")
+
+            # Reset robot
+            initial_pos = np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0])
+            gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            robot.set_joint_positions(np.concatenate([initial_pos, gripper_open]))
+
+            # Reset cube to random position
+            cube_size = 0.0515
+            cube_x = np.random.uniform(0.4, 0.6)
+            cube_y = np.random.uniform(-0.3, 0.3)
+            cube_z = cube_size / 2.0
+            ball.set_world_pose(position=np.array([cube_x, cube_y, cube_z]))
+
+            # Stabilize
+            for _ in range(10):
+                my_world.step(render=False)
+
+            # Run 100 steps with learned policy (visualization only)
+            for viz_step in range(100):
+                my_world.step(render=True)
+
+                # Get current state and image
+                overhead_camera.get_current_frame()
+                rgba_data = overhead_camera.get_rgba()
+                if rgba_data is not None and rgba_data.size > 0:
+                    if len(rgba_data.shape) == 1:
+                        rgba_data = rgba_data.reshape(84, 84, 4)
+                    rgb_image = rgba_data[:, :, :3].astype(np.uint8)
+                else:
+                    rgb_image = np.zeros((84, 84, 3), dtype=np.uint8)
+
+                joint_positions_raw = robot.get_joint_positions()
+                if isinstance(joint_positions_raw, tuple):
+                    joint_positions = joint_positions_raw[0]
+                else:
+                    joint_positions = joint_positions_raw
+
+                ball_pos, _ = ball.get_world_pose()
+                ball_pos = np.array(ball_pos).flatten()
+                ee_pos, _ = robot.end_effector.get_world_pose()
+                ee_pos = np.array(ee_pos).flatten()
+                ball_dist = np.linalg.norm(ee_pos - ball_pos)
+                gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
+                grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
+                state = np.concatenate([joint_positions, [grasped]])
+
+                # Get action from learned policy (deterministic=True for testing)
+                action = agent.get_action(state, image=rgb_image, deterministic=True)
+
+                # Execute action with RMPflow
+                delta_pos = action[:3] * 0.05
+                target_position = ee_pos + delta_pos
+                target_position = np.clip(target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0])
+                rmp_flow.set_end_effector_target(target_position=target_position, target_orientation=None)
+                actions = motion_policy.get_next_articulation_action(1.0/60.0)
+                robot.apply_action(actions)
+
+                # Gripper control
+                gripper_action = np.clip(action[3], -1.0, 1.0)
+                current_joints_raw = robot.get_joint_positions()
+                if isinstance(current_joints_raw, tuple):
+                    current_joints = current_joints_raw[0].copy()
+                else:
+                    current_joints = current_joints_raw.copy()
+                if len(current_joints) > 6:
+                    current_gripper = current_joints[6]
+                    target_gripper = np.clip(current_gripper + gripper_action * 0.01, 0.0, 0.04)
+                    current_joints[6] = target_gripper
+                    robot.set_joint_positions(current_joints)
+
+            print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}])\n")
 
 except KeyboardInterrupt:
-    print("\nTraining interrupted by user")
+    print("\nOffline training interrupted by user")
     agent.save_model(MODEL_PATH)
     print("Model saved before exit")
 except Exception as e:
@@ -1289,8 +918,8 @@ except Exception as e:
     agent.save_model(MODEL_PATH)
     print("Model saved after error")
 finally:
-    print(f"Training complete! Total episodes: {agent.episode_count}")
-    print(f"Final model saved to: {MODEL_PATH}")
+    print(f"\n✓ Offline training complete!")
+    print(f"✓ Final model saved to: {MODEL_PATH}")
     agent.save_model(MODEL_PATH)
 
     # Explicit cleanup to avoid shutdown crash
