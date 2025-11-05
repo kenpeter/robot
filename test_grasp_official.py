@@ -5,8 +5,11 @@ Based on Isaac Sim standalone_examples/api/isaacsim.robot.manipulators/ur10e/pic
 
 All-in-one file - simplified version using red cube.
 """
+
+# main app
 from isaacsim import SimulationApp
 
+# main app
 simulation_app = SimulationApp({"headless": False})
 
 import numpy as np
@@ -30,7 +33,13 @@ from isaacsim.storage.native import get_assets_root_path
 # ============================================================================
 class RMPFlowController(mg.MotionPolicyController):
     """RMPFlow motion controller for UR10e."""
-    def __init__(self, name: str, robot_articulation: Articulation, physics_dt: float = 1.0 / 60.0) -> None:
+
+    def __init__(
+        self,
+        name: str,
+        robot_articulation: Articulation,
+        physics_dt: float = 1.0 / 60.0,
+    ) -> None:
         # Get the directory where rmpflow config files are located
         rmpflow_dir = os.path.join(os.path.dirname(__file__), "rmpflow")
 
@@ -42,20 +51,26 @@ class RMPFlowController(mg.MotionPolicyController):
             maximum_substep_size=0.00334,
         )
 
-        self.articulation_rmp = mg.ArticulationMotionPolicy(robot_articulation, self.rmpflow, physics_dt)
+        self.articulation_rmp = mg.ArticulationMotionPolicy(
+            robot_articulation, self.rmpflow, physics_dt
+        )
 
-        mg.MotionPolicyController.__init__(self, name=name, articulation_motion_policy=self.articulation_rmp)
+        mg.MotionPolicyController.__init__(
+            self, name=name, articulation_motion_policy=self.articulation_rmp
+        )
         self._default_position, self._default_orientation = (
             self._articulation_motion_policy._robot_articulation.get_world_pose()
         )
         self._motion_policy.set_robot_base_pose(
-            robot_position=self._default_position, robot_orientation=self._default_orientation
+            robot_position=self._default_position,
+            robot_orientation=self._default_orientation,
         )
 
     def reset(self):
         mg.MotionPolicyController.reset(self)
         self._motion_policy.set_robot_base_pose(
-            robot_position=self._default_position, robot_orientation=self._default_orientation
+            robot_position=self._default_position,
+            robot_orientation=self._default_orientation,
         )
 
 
@@ -67,22 +82,27 @@ class PickPlaceController(manipulators_controllers.PickPlaceController):
     Pick and place controller for UR10e to grasp a ball.
     Uses the official PickPlaceController state machine with custom timing.
     """
+
     def __init__(
-        self, name: str, gripper: ParallelGripper, robot_articulation: SingleArticulation, events_dt=None
+        self,
+        name: str,
+        gripper: ParallelGripper,
+        robot_articulation: SingleArticulation,
+        events_dt=None,
     ) -> None:
         # Custom timing for ball grasping (10 phases)
         if events_dt is None:
             events_dt = [
                 0.008,  # Phase 0: Move above
                 0.003,  # Phase 1: Lower (slower than cube)
-                0.15,   # Phase 2: Settle (longer for ball)
-                0.08,   # Phase 3: Close (gentle grasp)
+                0.15,  # Phase 2: Settle (longer for ball)
+                0.08,  # Phase 3: Close (gentle grasp)
                 0.002,  # Phase 4: Lift
                 0.001,  # Phase 5: Move to place XY
                 0.002,  # Phase 6: Move to place height
-                0.8,    # Phase 7: Open gripper
+                0.8,  # Phase 7: Open gripper
                 0.008,  # Phase 8: Lift after release
-                0.008   # Phase 9: Return to start
+                0.008,  # Phase 9: Return to start
             ]
         manipulators_controllers.PickPlaceController.__init__(
             self,
@@ -103,6 +123,7 @@ class RedCubePickPlace(tasks.PickPlace):
     """
     Simple pick and place task with a RED cube instead of blue.
     """
+
     def __init__(
         self,
         name: str = "ur10e_red_cube_pick_place",
@@ -130,7 +151,8 @@ class RedCubePickPlace(tasks.PickPlace):
             raise Exception("Could not find Isaac Sim assets folder")
 
         asset_path = (
-            assets_root_path + "/Isaac/Samples/Rigging/Manipulator/configure_manipulator/ur10e/ur/ur_gripper.usd"
+            assets_root_path
+            + "/Isaac/Samples/Rigging/Manipulator/configure_manipulator/ur10e/ur/ur_gripper.usd"
         )
         add_reference_to_stage(usd_path=asset_path, prim_path="/ur")
 
@@ -164,8 +186,7 @@ class RedCubePickPlace(tasks.PickPlace):
 
         # Create a red material
         red_material = PreviewSurface(
-            prim_path="/World/Looks/RedMaterial",
-            color=np.array([1.0, 0.0, 0.0])
+            prim_path="/World/Looks/RedMaterial", color=np.array([1.0, 0.0, 0.0])
         )
 
         # Apply it to the cube
@@ -184,11 +205,12 @@ my_world = World(stage_units_in_meters=1.0, physics_dt=1 / 200, rendering_dt=20 
 
 # Set up RED cube pick and place task
 cube_size = np.array([0.0515, 0.0515, 0.0515])
-cube_initial_position = np.array([0.3, 0.3, 0.0])
+# Move cube farther from robot base (which is at origin)
+cube_initial_position = np.array([0.5, 0.2, 0.0])  # Farther in X, less Y
 cube_initial_position[2] = cube_size[2] / 2.0  # On ground plane
 
-# Target position for placement
-target_position = np.array([-0.3, 0.3, 0])
+# Target position for placement - farther from arm base
+target_position = np.array([-0.5, -0.2, 0])  # Opposite side, farther away
 target_position[2] = cube_size[2] / 2.0
 
 print(f"\nTask setup:")
@@ -201,7 +223,7 @@ my_task = RedCubePickPlace(
     name="ur10e_red_cube_pick_place",
     cube_initial_position=cube_initial_position,
     target_position=target_position,
-    cube_size=cube_size
+    cube_size=cube_size,
 )
 my_world.add_task(my_task)
 my_world.reset()
@@ -219,9 +241,7 @@ my_ur10e = my_world.scene.get_object(ur10e_name)
 
 # Initialize the pick-place controller
 my_controller = PickPlaceController(
-    name="controller",
-    robot_articulation=my_ur10e,
-    gripper=my_ur10e.gripper
+    name="controller", robot_articulation=my_ur10e, gripper=my_ur10e.gripper
 )
 
 articulation_controller = my_ur10e.get_articulation_controller()
@@ -281,7 +301,7 @@ while simulation_app.is_running():
                 "Lowering to target",
                 "Opening gripper",
                 "Lifting after release",
-                "Returning to start"
+                "Returning to start",
             ]
             if current_event < len(event_names):
                 print(f"Phase {current_event}: {event_names[current_event]}")

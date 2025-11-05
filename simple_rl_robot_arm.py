@@ -567,24 +567,26 @@ set_camera_view(
     camera_prim_path="/OmniverseKit_Persp",
 )
 
-# Add Franka robot arm with gripper
-asset_path = assets_root_path + "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
-robot_prim = add_reference_to_stage(usd_path=asset_path, prim_path="/World/Franka")
+# === UR10e ROBOT SETUP (from test_grasp_official.py) ===
+# Add UR10e robot arm with Robotiq gripper
+asset_path = assets_root_path + "/Isaac/Samples/Rigging/Manipulator/configure_manipulator/ur10e/ur/ur_gripper.usd"
+robot_prim = add_reference_to_stage(usd_path=asset_path, prim_path="/World/ur")
 
-# Configure gripper
+# Configure Robotiq 2F-140 gripper (parallel jaw)
 gripper = ParallelGripper(
-    end_effector_prim_path="/World/Franka/panda_rightfinger",
-    joint_prim_names=["panda_finger_joint1", "panda_finger_joint2"],
-    joint_opened_positions=np.array([0.04, 0.04]),
-    joint_closed_positions=np.array([0.0, 0.0]),
-    action_deltas=np.array([0.01, 0.01]),
+    end_effector_prim_path="/World/ur/ee_link/robotiq_arg2f_base_link",
+    joint_prim_names=["finger_joint"],
+    joint_opened_positions=np.array([0]),
+    joint_closed_positions=np.array([40]),
+    action_deltas=np.array([-40]),
+    use_mimic_joints=True,
 )
 
-# Create SingleManipulator (has get_articulation_controller method needed by ArticulationMotionPolicy)
+# Create SingleManipulator
 robot = SingleManipulator(
-    prim_path="/World/Franka",
-    name="franka_arm",
-    end_effector_prim_path="/World/Franka/panda_rightfinger",
+    prim_path="/World/ur",
+    name="ur10_robot",
+    end_effector_prim_path="/World/ur/ee_link/robotiq_arg2f_base_link",
     gripper=gripper,
 )
 
@@ -621,43 +623,38 @@ overhead_camera = Camera(
 )
 overhead_camera.initialize()
 
-# Add target sphere (ball to pick up) with physics
+# === RED CUBE SETUP (randomized position) ===
+# Add red cube (instead of ball) with random initial position
+from isaacsim.core.api.objects import DynamicCuboid
+
+# Randomize cube initial position within reachable workspace
+cube_size = 0.0515  # 5.15cm cube (same as test_grasp_official.py)
+cube_initial_x = np.random.uniform(0.2, 0.5)  # Reachable by UR10e
+cube_initial_y = np.random.uniform(-0.2, 0.2)
+cube_initial_z = cube_size / 2.0  # On ground plane
+
+print(f"\n=== RANDOMIZED SCENE ===")
+print(f"Cube initial position: [{cube_initial_x:.3f}, {cube_initial_y:.3f}, {cube_initial_z:.3f}]")
+
+cube = DynamicCuboid(
+    name="red_cube",
+    position=np.array([cube_initial_x, cube_initial_y, cube_initial_z]),
+    orientation=np.array([1, 0, 0, 0]),
+    prim_path="/World/Cube",
+    scale=np.array([cube_size, cube_size, cube_size]),
+    size=1.0,
+    color=np.array([1.0, 0.0, 0.0]),  # RED cube
+)
+my_world.scene.add(cube)
 
 stage = my_world.stage
-sphere_path = "/World/Target"
-sphere = UsdGeom.Sphere.Define(stage, sphere_path)
-sphere.GetRadiusAttr().Set(
-    0.04
-)  # 4cm radius (8cm diameter) - max size for Franka gripper
-sphere_translate = sphere.AddTranslateOp()
-sphere_translate.Set(Gf.Vec3d(0.3, 0.3, 0.04))  # Ball on floor (z = radius)
+sphere_path = "/World/Cube"  # Keep variable name for compatibility
+sphere_translate = None  # Will be set during reset
 
-# Add RED material to ball (so camera can detect it)
-from pxr import Sdf
+# Cube already has RED color from DynamicCuboid - no need for extra material
 
-material_path = "/World/Looks/RedMaterial"
-material = UsdShade.Material.Define(stage, material_path)
-shader = UsdShade.Shader.Define(stage, material_path + "/Shader")
-shader.CreateIdAttr("UsdPreviewSurface")
-shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-    Gf.Vec3f(1.0, 0.0, 0.0)
-)  # Pure red
-shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.4)
-material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
-
-# Bind material to ball
-sphere_prim = stage.GetPrimAtPath(sphere_path)
-binding_api = UsdShade.MaterialBindingAPI.Apply(sphere_prim)
-binding_api.Bind(material)
-
-# Add physics to ball (kinematic - won't fall)
-rigid_body_api = UsdPhysics.RigidBodyAPI.Apply(sphere_prim)
-rigid_body_api.CreateKinematicEnabledAttr(True)  # Make it kinematic (stationary)
-UsdPhysics.CollisionAPI.Apply(sphere_prim)
-UsdPhysics.MassAPI.Apply(sphere_prim).CreateMassAttr(0.05)  # 50g ball
-
-# Create RigidPrim for tracking
-ball = RigidPrim(sphere_path, name="ball")
+# Create RigidPrim reference for tracking cube position
+ball = cube  # Keep variable name "ball" for code compatibility
 
 # === ADD LIGHTING (CRITICAL for camera vision) ===
 # Add bright dome light for even illumination
@@ -672,14 +669,33 @@ distant_light.CreateIntensityAttr(2000.0)
 distant_light_xform = distant_light.AddRotateXYZOp()
 distant_light_xform.Set(Gf.Vec3f(-45, 0, 0))  # Angle from above
 
-# Add goal location marker (green box)
+# === RANDOMIZED GOAL/TARGET LOCATION ===
+# Add goal location marker (green box) with random position
+goal_x = np.random.uniform(-0.4, -0.1)  # Different area than cube
+goal_y = np.random.uniform(-0.2, 0.2)
+goal_z = 0.075  # Half of green marker size
+
+print(f"Goal position: [{goal_x:.3f}, {goal_y:.3f}, {goal_z:.3f}]")
+print("="*50 + "\n")
+
 goal_path = "/World/Goal"
 goal_cube = UsdGeom.Cube.Define(stage, goal_path)
 goal_cube.GetSizeAttr().Set(0.15)
 goal_translate = goal_cube.AddTranslateOp()
-goal_translate.Set(
-    Gf.Vec3d(-0.3, 0.3, 0.075)
-)  # Goal position on floor (half cube size)
+goal_translate.Set(Gf.Vec3d(goal_x, goal_y, goal_z))
+
+# Add GREEN material to goal marker
+from pxr import Sdf
+goal_material_path = "/World/Looks/GreenMaterial"
+goal_material = UsdShade.Material.Define(stage, goal_material_path)
+goal_shader = UsdShade.Shader.Define(stage, goal_material_path + "/Shader")
+goal_shader.CreateIdAttr("UsdPreviewSurface")
+goal_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+    Gf.Vec3f(0.0, 1.0, 0.0)
+)  # Pure green
+goal_material.CreateSurfaceOutput().ConnectToSource(goal_shader.ConnectableAPI(), "surface")
+goal_prim = stage.GetPrimAtPath(goal_path)
+UsdShade.MaterialBindingAPI.Apply(goal_prim).Bind(goal_material)
 
 # Initialize world
 my_world.reset()
@@ -689,19 +705,20 @@ robot.initialize()
 ball.initialize()
 # SingleManipulator has built-in end_effector property (initialized automatically)
 
-# Initialize RMPflow motion policy for accurate end-effector control (REQUIRED for grasping)
-print("Initializing RMPflow ArticulationMotionPolicy...")
+# === Initialize RMPflow for UR10e (from test_grasp_official.py approach) ===
+print("Initializing RMPflow ArticulationMotionPolicy for UR10e...")
 
-robot_description_path = (
-    assets_root_path
-    + "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka_description.yaml"
-)
+# Use custom RMPflow config for UR10e (same as test_grasp_official.py)
+import isaacsim.robot_motion.motion_generation as mg
 
-# Load RMPflow configuration (working examples use this method)
-rmp_flow_config = interface_config_loader.load_supported_motion_policy_config(
-    "Franka", "RMPflow"
+rmpflow_dir = os.path.join(os.path.dirname(__file__), "rmpflow")
+rmp_flow = mg.lula.motion_policies.RmpFlow(
+    robot_description_path=os.path.join(rmpflow_dir, "robot_descriptor.yaml"),
+    rmpflow_config_path=os.path.join(rmpflow_dir, "ur10e_rmpflow_common.yaml"),
+    urdf_path=os.path.join(rmpflow_dir, "ur10e.urdf"),
+    end_effector_frame_name="ee_link_robotiq_arg2f_base_link",
+    maximum_substep_size=0.00334,
 )
-rmp_flow = RmpFlow(**rmp_flow_config)
 
 # Create motion policy with physics timestep
 physics_dt = 1.0 / 60.0  # 60Hz control loop
@@ -710,14 +727,15 @@ motion_policy = ArticulationMotionPolicy(
     rmp_flow,
     physics_dt
 )
-print("✓ RMPflow initialized - robot can now accurately reach and grasp the ball!")
+print("✓ RMPflow initialized - robot can now accurately reach and grasp the cube!")
 
 # RL Training parameters
 MODEL_PATH = "rl_robot_arm_model.pth"
 
 # Using Cartesian control: (x, y, z, gripper) - GitHub best practice for grasping
-# Simpler 4D action space instead of 8D joint control
-state_dim = 10  # 9 joints + 1 ball_grasped
+# Simpler 4D action space instead of 12D joint control
+# UR10e has 12 DOF: 6 arm joints + 6 gripper joints (with mimic)
+state_dim = 13  # 12 joints + 1 cube_grasped
 action_dim = 4  # dx, dy, dz, gripper
 
 agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=True)
@@ -728,48 +746,11 @@ agent.load_model(MODEL_PATH)
 num_episodes = 2000  # Train much longer for complex vision task
 # 500 step for reach grasp delivery
 max_steps_per_episode = 500
-goal_position = np.array([-0.3, 0.3, 0.05])  # Goal location on floor
 save_interval = 10  # Save model every 10 episodes
 vision_debug_saved = False  # Flag to save one camera image for debugging
 
-# Create visual goal bucket - simple ring (no top, open for ball to drop in)
-# Just a visual marker - ball detection is done by distance check in reward function
-bucket_path = "/World/GoalBucket"
-bucket_ring = UsdGeom.Cylinder.Define(stage, bucket_path)
-bucket_ring.GetRadiusAttr().Set(0.10)  # 10cm radius
-bucket_ring.GetHeightAttr().Set(0.15)  # 15cm tall
-bucket_ring.GetAxisAttr().Set("Z")  # Upright
-bucket_ring_translate = bucket_ring.AddTranslateOp()
-bucket_ring_translate.Set(
-    Gf.Vec3d(goal_position[0], goal_position[1], 0.075)
-)  # Half height above floor
-
-# Add BRIGHT GREEN semi-transparent material (can see through to know it's hollow)
-bucket_material_path = "/World/Looks/GreenBucketMaterial"
-bucket_material = UsdShade.Material.Define(stage, bucket_material_path)
-bucket_shader = UsdShade.Shader.Define(stage, bucket_material_path + "/Shader")
-bucket_shader.CreateIdAttr("UsdPreviewSurface")
-bucket_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-    Gf.Vec3f(0.2, 1.0, 0.3)
-)  # Very bright green
-bucket_shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(
-    0.4
-)  # Semi-glossy plastic
-bucket_shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)  # Non-metallic
-bucket_shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(
-    0.5
-)  # 50% transparent - clearly see it's open/hollow
-bucket_material.CreateSurfaceOutput().ConnectToSource(
-    bucket_shader.ConnectableAPI(), "surface"
-)
-
-# Bind material to bucket
-bucket_prim = stage.GetPrimAtPath(bucket_path)
-bucket_binding = UsdShade.MaterialBindingAPI.Apply(bucket_prim)
-bucket_binding.Bind(bucket_material)
-
-# No collision - this is just a visual marker, not a physical container
-# Ball "delivery" is detected by goal_distance < 0.15 in reward function
+# NOTE: Goal position is now RANDOMIZED per episode (see episode loop below)
+# No static goal marker created here - goal visualization moved to episode loop
 
 print("Starting RL Training...")
 print(f"Episodes: {num_episodes}, Max steps per episode: {max_steps_per_episode}")
@@ -777,11 +758,17 @@ print(f"Model will be saved to: {MODEL_PATH}")
 
 try:
     for episode in range(agent.episode_count, agent.episode_count + num_episodes):
-        # Reset arm to safe initial position (very conservative range)
-        initial_pos = np.array([0.0, -0.3, 0.0, -1.5, 0.0, 1.2, 0.0])  # Known safe pose
-        # Add small random perturbation
-        initial_pos += np.random.uniform(-0.1, 0.1, 7)
-        robot.set_joint_positions(np.concatenate([initial_pos, [0.04, 0.04]]))
+        # Reset arm to safe initial position for UR10e
+        # UR10e has 12 DOF total: 6 arm joints + 6 gripper joints (with mimic)
+        # Arm joints: shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3
+        # Gripper joints: finger_joint, left_inner_finger, left_inner_knuckle,
+        #                 right_inner_finger, right_inner_knuckle, right_outer_knuckle
+        initial_pos = np.array([0.0, -1.57, 1.57, -1.57, -1.57, 0.0])  # Arm safe pose
+        initial_pos += np.random.uniform(-0.1, 0.1, 6)  # Small perturbation
+
+        # Gripper open position: all joints at 0
+        gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 6 gripper joints
+        robot.set_joint_positions(np.concatenate([initial_pos, gripper_open]))
 
         # Step world multiple times to stabilize physics
         for _ in range(10):
@@ -799,24 +786,22 @@ try:
         )  # 0.2->0.6 as training progresses
 
         # === DOMAIN RANDOMIZATION (GitHub best practice - improves generalization) ===
-        # Randomize ball size for robust policy (sim-to-real transfer)
-        ball_radius_variation = np.random.uniform(0.9, 1.1)  # ±10% size
-        ball_z = (
-            0.15 * ball_radius_variation
-        )  # Adjust height (increased from 0.05 to match new radius)
+        # Reset RED CUBE to random position - FARTHER from robot base (at origin)
+        cube_x = np.random.uniform(0.4, 0.6)  # Farther in positive X direction
+        cube_y = np.random.uniform(-0.3, 0.3)  # Wider Y range
+        cube_z = cube_size / 2.0  # On ground plane
 
-        # Reset ball to random position on floor using RigidPrim
-        target_position = np.array(
-            [
-                np.random.uniform(
-                    min_distance, max_distance
-                ),  # x: curriculum-based distance
-                np.random.uniform(-0.3, 0.3),  # y: left/right
-                ball_z,  # z: randomized based on size
-            ],
-            dtype=np.float32,
-        ).flatten()  # Ensure 1D
-        ball.set_world_poses(positions=np.array([target_position]))
+        cube_position = np.array([cube_x, cube_y, cube_z], dtype=np.float32).flatten()
+        ball.set_world_pose(position=cube_position)  # ball variable = cube (uses singular)
+
+        # Randomize GOAL position - FARTHER on opposite side
+        goal_x = np.random.uniform(-0.6, -0.3)  # Farther in negative X direction
+        goal_y = np.random.uniform(-0.3, 0.3)  # Wider Y range
+        goal_z = 0.075  # Half of green marker size
+        goal_position = np.array([goal_x, goal_y, goal_z], dtype=np.float32)
+
+        # Update goal marker position
+        goal_translate.Set(Gf.Vec3d(goal_x, goal_y, goal_z))
 
         episode_reward = 0
         ball_grasped = False
@@ -845,8 +830,14 @@ try:
                 )  # Get RGB only (84x84x3)
 
             # Get robot state (after step, synchronized with image)
-            joint_positions = robot.get_joint_positions()[0]
-            ball_pos, _ = ball.get_world_poses()
+            joint_positions_raw = robot.get_joint_positions()
+            # Handle both tuple and direct array returns
+            if isinstance(joint_positions_raw, tuple):
+                joint_positions = joint_positions_raw[0]
+            else:
+                joint_positions = joint_positions_raw
+
+            ball_pos, _ = ball.get_world_pose()  # DynamicCuboid uses singular
             ball_pos = np.array(ball_pos, dtype=np.float32).flatten()
             ee_position, _ = robot.end_effector.get_world_pose()
             ee_position = np.array(ee_position, dtype=np.float32).flatten()
@@ -855,23 +846,29 @@ try:
             ball_distance = np.linalg.norm(ee_position - ball_pos)
             goal_distance = np.linalg.norm(ball_pos - goal_position)
 
-            # Gripper width
-            gripper_width = joint_positions[7] + joint_positions[8]
+            # Gripper state (UR10e has 6 gripper joints, but finger_joint is main control)
+            # joint_positions[6] = finger_joint: 0 = open, 40 = closed
+            if len(joint_positions) > 6:
+                gripper_position = joint_positions[6]  # Main gripper joint
+            else:
+                print(f"Warning: joint_positions has only {len(joint_positions)} elements")
+                gripper_position = 0.0
 
-            # Check if ball is grasped (increased threshold for larger ball)
-            if ball_distance < 0.20 and gripper_width < 0.02:
+            # Check if cube is grasped (cube is easier than ball)
+            # Distance < 0.15m and gripper is closing (position > 0.02)
+            if ball_distance < 0.15 and gripper_position > 0.02:
                 ball_grasped = True
 
-            # Build state: joints + ball_grasped (NO ball position!)
+            # Build state: joints + cube_grasped (NO cube position!)
             state = np.concatenate(
-                [joint_positions, [float(ball_grasped)]]  # 9  # 1
-            )  # Total: 10
+                [joint_positions, [float(ball_grasped)]]  # 12 joints  # 1 grasped flag
+            )  # Total: 13
 
             # Get action from agent WITH VISION
             action = agent.get_action(state, image=rgb_image)
 
-            # Vision debugging: Check if ball is visible in camera
-            ball_visible = False
+            # Vision debugging: Check if RED CUBE is visible in camera
+            ball_visible = False  # Keep variable name for compatibility
             ball_pixel_count = 0
             ball_centroid_x = 0.0
             ball_centroid_y = 0.0
@@ -880,9 +877,9 @@ try:
                 and rgb_image.size > 0
                 and not np.all(rgb_image == 0)
             ):
-                # With overhead camera, detect ball (renders as pink/red with high lighting)
-                # Look for reddish/pink pixels that stand out from blue background
-                # Ball appears as R>150 with washed out colors due to lighting
+                # With overhead camera, detect RED CUBE (renders as red with high lighting)
+                # Look for reddish pixels that stand out from blue background
+                # Cube appears as R>140 with washed out colors due to lighting
                 ball_mask = (
                     (rgb_image[:, :, 0] > 140)  # Reddish (higher than background)
                     & (rgb_image[:, :, 1] < 210)  # Not pure white
@@ -890,21 +887,21 @@ try:
                 )
                 ball_pixel_count = np.sum(ball_mask)
 
-                # Overhead view: ball should be 5-200 pixels (small sphere from above at 1.2m height)
-                ball_visible = (ball_pixel_count > 5) and (ball_pixel_count < 200)
+                # Overhead view: cube should be 5-300 pixels (5.15cm cube from above at 1.2m height)
+                ball_visible = (ball_pixel_count > 5) and (ball_pixel_count < 300)
 
-                # Calculate ball centroid in image (for visual servoing reward)
+                # Calculate cube centroid in image (for visual servoing reward)
                 if ball_visible:
                     y_coords, x_coords = np.where(ball_mask)
                     if len(x_coords) > 0:
                         ball_centroid_x = np.mean(x_coords) / 84.0  # Normalize to 0-1
                         ball_centroid_y = np.mean(y_coords) / 84.0  # Normalize to 0-1
 
-                # Temporal smoothing: If ball was visible last frame and close in distance, keep visible
+                # Temporal smoothing: If cube was visible last frame and close in distance, keep visible
                 if not ball_visible and last_ball_visible and ball_distance < 0.3:
                     ball_visible = True  # Assume still visible (avoid flicker)
 
-                # Save one debug image (first valid frame) showing ball and bucket
+                # Save one debug image (first valid frame) showing cube and goal marker
                 if not vision_debug_saved and ball_pixel_count > 0:
                     try:
                         import cv2
@@ -917,11 +914,11 @@ try:
                         )
                         green_pixel_count = np.sum(green_mask)
 
-                        # Create debug image with both ball and bucket highlighted
+                        # Create debug image with both cube and goal marker highlighted
                         debug_img = rgb_image.copy()
-                        # Highlight ball pixels in bright green
+                        # Highlight cube pixels in bright green
                         debug_img[ball_mask] = [0, 255, 0]
-                        # Highlight green bucket pixels in yellow
+                        # Highlight green goal marker pixels in yellow
                         debug_img[green_mask] = [255, 255, 0]
 
                         # Save raw camera view
@@ -929,16 +926,16 @@ try:
                             "rl_camera_raw.png",
                             cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR),
                         )
-                        # Save annotated view with ball and bucket highlighted
+                        # Save annotated view with cube and goal marker highlighted
                         cv2.imwrite(
                             "rl_camera_annotated.png",
                             cv2.cvtColor(debug_img, cv2.COLOR_RGB2BGR),
                         )
                         print(f"\n=== VISION DEBUG: Saved camera images ===")
                         print(
-                            f"    Ball pixels: {ball_pixel_count}, Ball visible: {ball_visible}"
+                            f"    Cube pixels: {ball_pixel_count}, Cube visible: {ball_visible}"
                         )
-                        print(f"    Green bucket pixels: {green_pixel_count}")
+                        print(f"    Green goal marker pixels: {green_pixel_count}")
                         print(f"    Saved: rl_camera_raw.png")
                         print(f"    Saved: rl_camera_annotated.png")
                         vision_debug_saved = True
@@ -954,9 +951,9 @@ try:
                 print(
                     f"Step {step}: Action range [{action.min():.3f}, {action.max():.3f}], Mean: {action.mean():.3f}"
                 )
-                print(f"  Ball dist: {ball_distance:.3f}, EE: {ee_position}")
+                print(f"  Cube dist: {ball_distance:.3f}, EE: {ee_position}")
                 print(
-                    f"  Vision: Ball pixels={ball_pixel_count}, Ball visible={ball_visible}"
+                    f"  Vision: Cube pixels={ball_pixel_count}, Cube visible={ball_visible}"
                 )
 
             # === CARTESIAN ACTION EXECUTION ===
@@ -991,27 +988,41 @@ try:
             robot.apply_action(actions)
 
             # Gripper control (action[3] from RL agent)
+            # UR10e has 6 gripper joints, but we control via finger_joint (index 6)
+            # The mimic joints will automatically follow
             gripper_action = np.clip(action[3], -1.0, 1.0)
-            current_joints = robot.get_joint_positions()[0].copy()  # Must copy!
-            current_width = current_joints[7] + current_joints[8]
-            target_width = np.clip(current_width + gripper_action * 0.005, 0.0, 0.04)
 
-            # Apply velocity-limited gripper motion
-            max_gripper_vel = 0.01  # 1cm/s maximum gripper velocity
-            gripper_delta = np.clip(
-                target_width - current_width, -max_gripper_vel, max_gripper_vel
-            )
+            # Get current joint positions with safe handling
+            current_joints_raw = robot.get_joint_positions()
+            if isinstance(current_joints_raw, tuple):
+                current_joints = current_joints_raw[0].copy()
+            else:
+                current_joints = current_joints_raw.copy()
 
-            # Set gripper joints separately (RMPflow doesn't control gripper)
-            current_joints[7:9] = np.clip(
-                current_joints[7:9] + gripper_delta / 2, 0.0, 0.04
-            )  # Split motion between fingers
-            robot.set_joint_positions(current_joints)
+            if len(current_joints) > 6:
+                current_gripper = current_joints[6]  # finger_joint
+
+                # Map action to gripper position change: -1 = open, +1 = close
+                # Scale factor 0.01 for smooth control
+                target_gripper = np.clip(current_gripper + gripper_action * 0.01, 0.0, 0.04)
+
+                # Apply velocity-limited gripper motion
+                max_gripper_vel = 0.005  # 0.5cm/step maximum velocity
+                gripper_delta = np.clip(
+                    target_gripper - current_gripper, -max_gripper_vel, max_gripper_vel
+                )
+
+                # Set gripper joint (RMPflow doesn't control gripper)
+                # Only update finger_joint - mimic joints auto-follow
+                current_joints[6] = np.clip(current_gripper + gripper_delta, 0.0, 0.04)
+                robot.set_joint_positions(current_joints)
+            else:
+                print(f"Warning: Cannot control gripper, only {len(current_joints)} joints available")
 
             # === Enhanced State Tracking and Distance Calculation ===
             # Get current poses with error handling
             try:
-                new_ball_pos, _ = ball.get_world_poses()
+                new_ball_pos, _ = ball.get_world_pose()  # DynamicCuboid uses singular
                 new_ball_pos = np.array(new_ball_pos, dtype=np.float32).flatten()
                 new_ee_position, _ = robot.end_effector.get_world_pose()
                 new_ee_position = np.array(new_ee_position, dtype=np.float32).flatten()
@@ -1129,23 +1140,33 @@ try:
             elif new_ee_position[2] < 0.1:
                 reward -= (0.1 - new_ee_position[2]) * 2.0  # Max -0.1
 
-            # 6. Gripper control (normalized)
-            new_joint_positions = robot.get_joint_positions()[0]
-            new_gripper_width = new_joint_positions[7] + new_joint_positions[8]
+            # 6. Gripper control (normalized) - UR10e uses single joint
+            new_joint_positions_raw = robot.get_joint_positions()
+            if isinstance(new_joint_positions_raw, tuple):
+                new_joint_positions = new_joint_positions_raw[0]
+            else:
+                new_joint_positions = new_joint_positions_raw
 
-            # Encourage gripper closing when near ball
+            # UR10e: gripper position at index 6 (0 = open, 0.04 = closed)
+            if len(new_joint_positions) > 6:
+                new_gripper_position = new_joint_positions[6]
+            else:
+                new_gripper_position = 0.0
+
+            # Encourage gripper closing when near cube
             if new_ball_distance < 0.15:
-                gripper_close_action = 0.08 - new_gripper_width
+                # For UR10e: gripper closes from 0 to 0.04
+                gripper_close_action = 0.04 - new_gripper_position
                 if gripper_close_action > 0:
                     proximity_factor = (0.15 - new_ball_distance) / 0.15
-                    # Normalize to max +0.3 instead of +2.5
+                    # Normalize to max +0.3
                     reward += gripper_close_action * 3.0 * proximity_factor * 0.1
 
             # === MILESTONE REWARDS (5-10x larger than per-step rewards) ===
 
             # MILESTONE 1: Successful grasp (5x per-step reward)
-            # Ball radius 0.04m + gripper fingers → grasp threshold 0.06m
-            if new_ball_distance < 0.06 and new_gripper_width < 0.02:
+            # Cube is 5.15cm, gripper closes to 0.02 when grasping
+            if new_ball_distance < 0.10 and new_gripper_position > 0.02:
                 reward += 5.0  # Normalized milestone reward
                 ball_grasped = True
 
@@ -1161,11 +1182,11 @@ try:
             else:
                 ball_grasped = False
 
-            # Update agent (state WITHOUT ball position, using vision!)
-            new_ball_grasped = new_ball_distance < 0.20 and new_gripper_width < 0.02
+            # Update agent (state WITHOUT cube position, using vision!)
+            new_ball_grasped = new_ball_distance < 0.15 and new_gripper_position > 0.02
             next_state = np.concatenate(
-                [new_joint_positions, [float(new_ball_grasped)]]  # 9  # 1
-            )  # Total: 10
+                [new_joint_positions, [float(new_ball_grasped)]]  # 12 joints  # 1 grasped
+            )  # Total: 13
 
             # Update agent and track loss
             loss = agent.update(state, action, reward, next_state, image=rgb_image)
