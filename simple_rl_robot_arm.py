@@ -308,7 +308,7 @@ class DiTAgent:
         self.device = device
 
         # Diffusion hyperparameters (using KDA wrapper settings)
-        self.num_diffusion_steps = 15  # Increased for better quality with KDA
+        self.num_diffusion_steps = 5  # Increased for better quality with KDA
         self.beta_start = 0.0001
         self.beta_end = 0.02
 
@@ -757,7 +757,7 @@ agent.load_model(MODEL_PATH)
 
 num_episodes = 2000  # Train much longer for complex vision task
 # 500 step for reach grasp delivery
-max_steps_per_episode = 1000
+max_steps_per_episode = 500
 save_interval = 10  # Save model every 10 episodes
 vision_debug_saved = False  # Flag to save one camera image for debugging
 
