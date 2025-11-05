@@ -90,20 +90,9 @@ class PickPlaceController(manipulators_controllers.PickPlaceController):
         robot_articulation: SingleArticulation,
         events_dt=None,
     ) -> None:
-        # Custom timing for ball grasping (10 phases)
+        # Official Isaac Sim UR10e timing
         if events_dt is None:
-            events_dt = [
-                0.008,  # Phase 0: Move above
-                0.003,  # Phase 1: Lower (slower than cube)
-                0.15,  # Phase 2: Settle (longer for ball)
-                0.08,  # Phase 3: Close (gentle grasp)
-                0.002,  # Phase 4: Lift
-                0.001,  # Phase 5: Move to place XY
-                0.002,  # Phase 6: Move to place height
-                0.8,  # Phase 7: Open gripper
-                0.008,  # Phase 8: Lift after release
-                0.008,  # Phase 9: Return to start
-            ]
+            events_dt = [0.005, 0.002, 1, 0.05, 0.0008, 0.005, 0.0008, 0.1, 0.0008, 0.008]
         manipulators_controllers.PickPlaceController.__init__(
             self,
             name=name,
@@ -112,7 +101,7 @@ class PickPlaceController(manipulators_controllers.PickPlaceController):
             ),
             gripper=gripper,
             events_dt=events_dt,
-            end_effector_initial_height=0.5,  # Start higher for ball approach
+            end_effector_initial_height=0.6,  # Official Isaac Sim value
         )
 
 
@@ -204,24 +193,18 @@ print("=" * 70)
 my_world = World(stage_units_in_meters=1.0, physics_dt=1 / 200, rendering_dt=20 / 200)
 
 # Set up RED cube pick and place task
+# Use official example structure - let task set default cube position
 cube_size = np.array([0.0515, 0.0515, 0.0515])
-# Move cube farther from robot base (which is at origin)
-cube_initial_position = np.array([0.5, 0.2, 0.0])  # Farther in X, less Y
-cube_initial_position[2] = cube_size[2] / 2.0  # On ground plane
-
-# Target position for placement - farther from arm base
-target_position = np.array([-0.5, -0.2, 0])  # Opposite side, farther away
+target_position = np.array([-0.3, 0.3, 0])
 target_position[2] = cube_size[2] / 2.0
 
 print(f"\nTask setup:")
 print(f"  Cube size: {cube_size[0]*100:.1f}cm")
-print(f"  Initial position: {cube_initial_position}")
 print(f"  Target position: {target_position}")
 
 # Create the RED cube pick-place task
 my_task = RedCubePickPlace(
     name="ur10e_red_cube_pick_place",
-    cube_initial_position=cube_initial_position,
     target_position=target_position,
     cube_size=cube_size,
 )

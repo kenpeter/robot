@@ -77,10 +77,14 @@ class RMPFlowController(mg.MotionPolicyController):
 
 
 # ============================================================================
-# Pick-Place Controller Class (from test_grasp_official.py)
+# Pick-Place Controller Class (with parallel arm motion fix)
 # ============================================================================
 class PickPlaceController(manipulators_controllers.PickPlaceController):
-    """Pick and place controller for UR10e - from test_grasp_official.py"""
+    """
+    Pick and place controller for UR10e with extended timing for smooth motion.
+
+    Modified timing to ensure: lift up → move horizontally → lower down
+    """
 
     def __init__(
         self,
@@ -90,18 +94,9 @@ class PickPlaceController(manipulators_controllers.PickPlaceController):
         events_dt=None,
     ) -> None:
         if events_dt is None:
-            events_dt = [
-                0.008,  # Phase 0: Move above
-                0.003,  # Phase 1: Lower
-                0.15,   # Phase 2: Settle
-                0.08,   # Phase 3: Close
-                0.002,  # Phase 4: Lift
-                0.001,  # Phase 5: Move to place XY
-                0.002,  # Phase 6: Move to place height
-                0.8,    # Phase 7: Open gripper
-                0.008,  # Phase 8: Lift after release
-                0.008,  # Phase 9: Return to start
-            ]
+            # Official Isaac Sim UR10e timing
+            # [Phase 0-9]: Move above, Lower, Settle, Close, Lift, Move XY, Lower, Open, Lift, Return
+            events_dt = [0.005, 0.002, 1, 0.05, 0.0008, 0.005, 0.0008, 0.1, 0.0008, 0.008]
         manipulators_controllers.PickPlaceController.__init__(
             self,
             name=name,
@@ -110,7 +105,7 @@ class PickPlaceController(manipulators_controllers.PickPlaceController):
             ),
             gripper=gripper,
             events_dt=events_dt,
-            end_effector_initial_height=0.5,
+            end_effector_initial_height=0.6,  # Official Isaac Sim value
         )
 
 
@@ -155,7 +150,7 @@ class RedCubePickPlace(tasks.PickPlace):
             end_effector_prim_path="/ur/ee_link/robotiq_arg2f_base_link",
             joint_prim_names=["finger_joint"],
             joint_opened_positions=np.array([0]),
-            joint_closed_positions=np.array([40]),
+            joint_closed_positions=np.array([40]),  # Official example value
             action_deltas=np.array([-40]),
             use_mimic_joints=True,
         )
@@ -251,27 +246,24 @@ try:
     for episode in range(NUM_EPISODES):
         print(f"\n--- Episode {episode+1}/{NUM_EPISODES} ---")
 
-        # Randomize cube and target positions
-        cube_x = np.random.uniform(0.3, 0.6)
-        cube_y = np.random.uniform(-0.3, 0.3)
-        cube_initial_position = np.array([cube_x, cube_y, cube_size[2] / 2.0])
-
-        target_x = np.random.uniform(-0.6, -0.3)
-        target_y = np.random.uniform(-0.3, 0.3)
+        # Randomize target position only (cube uses default position from task)
+        # Keep target in comfortable workspace to avoid tangles
+        target_x = np.random.uniform(-0.5, -0.2)
+        target_y = np.random.uniform(-0.2, 0.2)
         target_position = np.array([target_x, target_y, cube_size[2] / 2.0])
 
-        print(f"  Cube: ({cube_x:.2f}, {cube_y:.2f})")
         print(f"  Target: ({target_x:.2f}, {target_y:.2f})")
 
-        # Reset first to initialize physics
+        # Reset world
         my_world.reset()
 
-        # AFTER reset, update positions using set_world_pose (recommended by Isaac Sim docs)
-        my_cube.set_world_pose(position=cube_initial_position, orientation=np.array([1.0, 0.0, 0.0, 0.0]))
-
-        # Update target position in observations dict (internal task state)
-        # The target isn't a physical object, so we manually update the observations
+        # After reset, update target position in task
         my_task._target_position = target_position
+
+        # Get cube position after reset to print it
+        observations = my_world.get_observations()
+        cube_pos = observations[cube_name]["position"]
+        print(f"  Cube: ({cube_pos[0]:.2f}, {cube_pos[1]:.2f})")
 
         # Reset controller with new positions
         my_controller.reset()
@@ -319,11 +311,12 @@ try:
                 state = np.concatenate([current_joints, [grasped]])
 
                 # Get expert action from official controller
+                # Using official Isaac Sim example offset
                 actions = my_controller.forward(
                     picking_position=observations[cube_name]["position"],
                     placing_position=observations[cube_name]["target_position"],
                     current_joint_positions=current_joints,
-                    end_effector_offset=np.array([0, 0, 0.20]),
+                    end_effector_offset=np.array([0, 0, 0.20]),  # Official example value
                 )
 
                 # Apply action
