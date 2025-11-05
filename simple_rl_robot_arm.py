@@ -34,7 +34,11 @@ from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.storage.native import get_assets_root_path
 from isaacsim.robot.manipulators import SingleManipulator
 from isaacsim.robot.manipulators.grippers import ParallelGripper
-from isaacsim.robot_motion.motion_generation import ArticulationMotionPolicy, interface_config_loader, RmpFlow
+from isaacsim.robot_motion.motion_generation import (
+    ArticulationMotionPolicy,
+    interface_config_loader,
+    RmpFlow,
+)
 
 # Note: Using Kimi Linear Attention (RecurrentKDA) in DiTBlocks for O(n) complexity
 print("Using Kimi Linear Attention (RecurrentKDA) for efficient transformers")
@@ -569,7 +573,10 @@ set_camera_view(
 
 # === UR10e ROBOT SETUP (from test_grasp_official.py) ===
 # Add UR10e robot arm with Robotiq gripper
-asset_path = assets_root_path + "/Isaac/Samples/Rigging/Manipulator/configure_manipulator/ur10e/ur/ur_gripper.usd"
+asset_path = (
+    assets_root_path
+    + "/Isaac/Samples/Rigging/Manipulator/configure_manipulator/ur10e/ur/ur_gripper.usd"
+)
 robot_prim = add_reference_to_stage(usd_path=asset_path, prim_path="/World/ur")
 
 # Configure Robotiq 2F-140 gripper (parallel jaw)
@@ -634,7 +641,9 @@ cube_initial_y = np.random.uniform(-0.2, 0.2)
 cube_initial_z = cube_size / 2.0  # On ground plane
 
 print(f"\n=== RANDOMIZED SCENE ===")
-print(f"Cube initial position: [{cube_initial_x:.3f}, {cube_initial_y:.3f}, {cube_initial_z:.3f}]")
+print(
+    f"Cube initial position: [{cube_initial_x:.3f}, {cube_initial_y:.3f}, {cube_initial_z:.3f}]"
+)
 
 cube = DynamicCuboid(
     name="red_cube",
@@ -676,7 +685,7 @@ goal_y = np.random.uniform(-0.2, 0.2)
 goal_z = 0.075  # Half of green marker size
 
 print(f"Goal position: [{goal_x:.3f}, {goal_y:.3f}, {goal_z:.3f}]")
-print("="*50 + "\n")
+print("=" * 50 + "\n")
 
 goal_path = "/World/Goal"
 goal_cube = UsdGeom.Cube.Define(stage, goal_path)
@@ -686,6 +695,7 @@ goal_translate.Set(Gf.Vec3d(goal_x, goal_y, goal_z))
 
 # Add GREEN material to goal marker
 from pxr import Sdf
+
 goal_material_path = "/World/Looks/GreenMaterial"
 goal_material = UsdShade.Material.Define(stage, goal_material_path)
 goal_shader = UsdShade.Shader.Define(stage, goal_material_path + "/Shader")
@@ -693,7 +703,9 @@ goal_shader.CreateIdAttr("UsdPreviewSurface")
 goal_shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
     Gf.Vec3f(0.0, 1.0, 0.0)
 )  # Pure green
-goal_material.CreateSurfaceOutput().ConnectToSource(goal_shader.ConnectableAPI(), "surface")
+goal_material.CreateSurfaceOutput().ConnectToSource(
+    goal_shader.ConnectableAPI(), "surface"
+)
 goal_prim = stage.GetPrimAtPath(goal_path)
 UsdShade.MaterialBindingAPI.Apply(goal_prim).Bind(goal_material)
 
@@ -722,11 +734,7 @@ rmp_flow = mg.lula.motion_policies.RmpFlow(
 
 # Create motion policy with physics timestep
 physics_dt = 1.0 / 60.0  # 60Hz control loop
-motion_policy = ArticulationMotionPolicy(
-    robot,
-    rmp_flow,
-    physics_dt
-)
+motion_policy = ArticulationMotionPolicy(robot, rmp_flow, physics_dt)
 print("✓ RMPflow initialized - robot can now accurately reach and grasp the cube!")
 
 # RL Training parameters
@@ -745,7 +753,7 @@ agent.load_model(MODEL_PATH)
 
 num_episodes = 2000  # Train much longer for complex vision task
 # 500 step for reach grasp delivery
-max_steps_per_episode = 500
+max_steps_per_episode = 1000
 save_interval = 10  # Save model every 10 episodes
 vision_debug_saved = False  # Flag to save one camera image for debugging
 
@@ -758,13 +766,16 @@ print(f"Model will be saved to: {MODEL_PATH}")
 
 try:
     for episode in range(agent.episode_count, agent.episode_count + num_episodes):
-        # Reset arm to safe initial position for UR10e
+        # Reset arm to UPRIGHT vertical position for UR10e
         # UR10e has 12 DOF total: 6 arm joints + 6 gripper joints (with mimic)
         # Arm joints: shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3
         # Gripper joints: finger_joint, left_inner_finger, left_inner_knuckle,
         #                 right_inner_finger, right_inner_knuckle, right_outer_knuckle
-        initial_pos = np.array([0.0, -1.57, 1.57, -1.57, -1.57, 0.0])  # Arm safe pose
-        initial_pos += np.random.uniform(-0.1, 0.1, 6)  # Small perturbation
+        # ALL ZEROS = arm points straight up (perpendicular to floor)
+        initial_pos = np.array(
+            [0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0]
+        )  # Standard ready pose
+        initial_pos += np.random.uniform(-0.05, 0.05, 6)  # Tiny perturbation
 
         # Gripper open position: all joints at 0
         gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])  # 6 gripper joints
@@ -792,7 +803,9 @@ try:
         cube_z = cube_size / 2.0  # On ground plane
 
         cube_position = np.array([cube_x, cube_y, cube_z], dtype=np.float32).flatten()
-        ball.set_world_pose(position=cube_position)  # ball variable = cube (uses singular)
+        ball.set_world_pose(
+            position=cube_position
+        )  # ball variable = cube (uses singular)
 
         # Randomize GOAL position - FARTHER on opposite side
         goal_x = np.random.uniform(-0.6, -0.3)  # Farther in negative X direction
@@ -851,7 +864,9 @@ try:
             if len(joint_positions) > 6:
                 gripper_position = joint_positions[6]  # Main gripper joint
             else:
-                print(f"Warning: joint_positions has only {len(joint_positions)} elements")
+                print(
+                    f"Warning: joint_positions has only {len(joint_positions)} elements"
+                )
                 gripper_position = 0.0
 
             # Check if cube is grasped (cube is easier than ball)
@@ -978,7 +993,7 @@ try:
             # Set target on RmpFlow object (not on ArticulationMotionPolicy!)
             rmp_flow.set_end_effector_target(
                 target_position=target_position,
-                target_orientation=None  # Let RMPflow handle orientation
+                target_orientation=None,  # Let RMPflow handle orientation
             )
 
             # Get next action from motion policy wrapper (only arm joints - 7 DOF)
@@ -1004,7 +1019,9 @@ try:
 
                 # Map action to gripper position change: -1 = open, +1 = close
                 # Scale factor 0.01 for smooth control
-                target_gripper = np.clip(current_gripper + gripper_action * 0.01, 0.0, 0.04)
+                target_gripper = np.clip(
+                    current_gripper + gripper_action * 0.01, 0.0, 0.04
+                )
 
                 # Apply velocity-limited gripper motion
                 max_gripper_vel = 0.005  # 0.5cm/step maximum velocity
@@ -1017,7 +1034,9 @@ try:
                 current_joints[6] = np.clip(current_gripper + gripper_delta, 0.0, 0.04)
                 robot.set_joint_positions(current_joints)
             else:
-                print(f"Warning: Cannot control gripper, only {len(current_joints)} joints available")
+                print(
+                    f"Warning: Cannot control gripper, only {len(current_joints)} joints available"
+                )
 
             # === Enhanced State Tracking and Distance Calculation ===
             # Get current poses with error handling
@@ -1185,7 +1204,10 @@ try:
             # Update agent (state WITHOUT cube position, using vision!)
             new_ball_grasped = new_ball_distance < 0.15 and new_gripper_position > 0.02
             next_state = np.concatenate(
-                [new_joint_positions, [float(new_ball_grasped)]]  # 12 joints  # 1 grasped
+                [
+                    new_joint_positions,
+                    [float(new_ball_grasped)],
+                ]  # 12 joints  # 1 grasped
             )  # Total: 13
 
             # Update agent and track loss
