@@ -15,6 +15,7 @@ simulation_app = SimulationApp(
         "headless": False,
         "width": 1280,
         "height": 720,
+        # ray trace vs path trace: ray trace -> good performance -> path trace -> more real
         "renderer": "RayTracedLighting",
     }
 )
@@ -288,23 +289,26 @@ class DiffusionTransformer(nn.Module):
         return noise_pred
 
 
+# rl agent using DiT
 class DiTAgent:
     """RL Agent using Diffusion Transformer for action generation"""
 
+    # self, state dim, action dim, use vision, device cuda
     def __init__(
         self,
         state_dim,
         action_dim,
         use_vision=True,
-        device="cuda" if torch.cuda.is_available() else "cpu",
+        device="cuda",
     ):
+        # state + action -> new state: state -> action -> new state
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.use_vision = use_vision
         self.device = device
 
         # Diffusion hyperparameters (using KDA wrapper settings)
-        self.num_diffusion_steps = 10  # Increased for better quality with KDA
+        self.num_diffusion_steps = 15  # Increased for better quality with KDA
         self.beta_start = 0.0001
         self.beta_end = 0.02
 
