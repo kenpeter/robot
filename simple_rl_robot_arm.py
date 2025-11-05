@@ -772,9 +772,11 @@ try:
         # Gripper joints: finger_joint, left_inner_finger, left_inner_knuckle,
         #                 right_inner_finger, right_inner_knuckle, right_outer_knuckle
         # ALL ZEROS = arm points straight up (perpendicular to floor)
-        initial_pos = np.array(
-            [0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0]
-        )  # Standard ready pose
+
+        # Reset arm to UPRIGHT vertical position for UR10e (suggested safe initial pose)
+        initial_pos = np.deg2rad(
+            np.array([0.0, 45.0, 90.0, 45.0, 90.0, 0.0])
+        )  # Degrees to radians
         initial_pos += np.random.uniform(-0.05, 0.05, 6)  # Tiny perturbation
 
         # Gripper open position: all joints at 0
