@@ -94,9 +94,15 @@ class PickPlaceController(manipulators_controllers.PickPlaceController):
         events_dt=None,
     ) -> None:
         if events_dt is None:
-            # Official Isaac Sim UR10e timing
+            # Modified timing for proper release and movement
             # [Phase 0-9]: Move above, Lower, Settle, Close, Lift, Move XY, Lower, Open, Lift, Return
-            events_dt = [0.005, 0.002, 1, 0.05, 0.0008, 0.005, 0.0008, 0.1, 0.0008, 0.008]
+            events_dt = [0.005, 0.002, 1, 0.05, 0.001, 0.008, 0.002, 0.3, 0.003, 0.008]
+            # Key changes from official:
+            # - Phase 4 (Lift): 0.0008 -> 0.001 (slightly more time)
+            # - Phase 5 (Move XY): 0.005 -> 0.008 (more time for horizontal move)
+            # - Phase 6 (Lower): 0.0008 -> 0.002 (more time to lower)
+            # - Phase 7 (Open): 0.1 -> 0.3 (3x longer to ensure gripper fully opens before arm moves)
+            # - Phase 8 (Lift): 0.0008 -> 0.003 (more time to clear cube)
         manipulators_controllers.PickPlaceController.__init__(
             self,
             name=name,
@@ -242,40 +248,28 @@ my_controller = PickPlaceController(
 )
 articulation_controller = my_ur10e.get_articulation_controller()
 
+reset_needed = False
+task_completed = False
+
 try:
     for episode in range(NUM_EPISODES):
         print(f"\n--- Episode {episode+1}/{NUM_EPISODES} ---")
 
-        # Randomize target position only (cube uses default position from task)
-        # Keep target in comfortable workspace to avoid tangles
-        target_x = np.random.uniform(-0.5, -0.2)
-        target_y = np.random.uniform(-0.2, 0.2)
-        target_position = np.array([target_x, target_y, cube_size[2] / 2.0])
-
-        print(f"  Target: ({target_x:.2f}, {target_y:.2f})")
-
-        # Reset world
-        my_world.reset()
-
-        # After reset, update target position in task
-        my_task._target_position = target_position
-
-        # Get cube position after reset to print it
-        observations = my_world.get_observations()
-        cube_pos = observations[cube_name]["position"]
-        print(f"  Cube: ({cube_pos[0]:.2f}, {cube_pos[1]:.2f})")
-
-        # Reset controller with new positions
-        my_controller.reset()
+        # For first episode, just use initial setup
+        # For subsequent episodes, reset world and controller
+        if episode > 0:
+            my_world.reset()
+            my_controller.reset()
+            task_completed = False
+            reset_needed = False
 
         # Episode data storage
         episode_data = []
-        task_completed = False
         step_count = 0
-        reset_needed = False
 
-        # Run episode (same pattern as test_grasp_official.py)
-        while step_count < MAX_STEPS_PER_EPISODE:
+        # Run episode - EXACT pattern from test_grasp_official.py
+        # Keep running until task completes (just like test_grasp_official.py)
+        while True:
             my_world.step(render=True)
 
             if my_world.is_playing():
@@ -287,7 +281,7 @@ try:
                 if my_world.current_time_step_index == 0:
                     my_controller.reset()
 
-                # Get current state
+                # Get observations
                 observations = my_world.get_observations()
                 current_joints = observations[ur10e_name]["joint_positions"]
                 cube_pos = observations[cube_name]["position"]
@@ -311,61 +305,73 @@ try:
                 state = np.concatenate([current_joints, [grasped]])
 
                 # Get expert action from official controller
-                # Using official Isaac Sim example offset
                 actions = my_controller.forward(
                     picking_position=observations[cube_name]["position"],
                     placing_position=observations[cube_name]["target_position"],
                     current_joint_positions=current_joints,
-                    end_effector_offset=np.array([0, 0, 0.20]),  # Official example value
+                    end_effector_offset=np.array([0, 0, 0.20]),
                 )
 
-                # Apply action
+                # Get current phase for debugging
+                current_phase = my_controller.get_current_event() if hasattr(my_controller, 'get_current_event') else 0
+
+                # Print debug info every 50 steps AND at key phases
+                if step_count % 50 == 0 or current_phase in [2, 3, 4]:  # Log settling, closing, lifting
+                    print(f"    Step {step_count}: Phase {current_phase}, Cube distance: {cube_distance:.3f}, Grasped: {grasped}, Done: {my_controller.is_done()}")
+                    print(f"      EE pos: {ee_pos}")
+                    print(f"      Cube pos: {cube_pos}")
+                    print(f"      Gripper: {gripper_pos:.3f}")
+                    if current_phase == 2:
+                        print(f"      ⚠ Phase 2 (Settling) - distance should be < 0.1 for good grasp!")
+
+                # Check if done - EXACT pattern from test_grasp_official.py
+                if my_controller.is_done() and not task_completed:
+                    print(f"    ✓ Episode {episode+1} DONE at step {step_count}, phase: {current_phase}")
+                    print(f"      Final cube distance: {cube_distance:.3f}")
+                    task_completed = True
+
+                # Apply actions to robot - EXACT pattern from test_grasp_official.py
                 articulation_controller.apply_action(actions)
 
-                # Step and get next state
-                my_world.step(render=False)
-                next_observations = my_world.get_observations()
-                next_joints = next_observations[ur10e_name]["joint_positions"]
-                next_cube_pos = next_observations[cube_name]["position"]
-                next_ee_pos, _ = my_ur10e.end_effector.get_world_pose()
-                next_ee_pos = np.array(next_ee_pos)
-                next_cube_distance = np.linalg.norm(next_ee_pos - next_cube_pos)
-                next_gripper_pos = next_joints[6] if len(next_joints) > 6 else 0.0
-                next_grasped = float(next_cube_distance < 0.15 and next_gripper_pos > 0.02)
-                next_state = np.concatenate([next_joints, [next_grasped]])
+                # Simple phase-based action encoding
+                rl_action = np.zeros(4, dtype=np.float32)
+                if current_phase in [0, 1]:  # Moving/lowering to pick
+                    rl_action[:3] = [0.1, 0.0, -0.1]
+                elif current_phase == 3:  # Closing gripper
+                    rl_action[3] = 1.0
+                elif current_phase == 4:  # Lifting
+                    rl_action[:3] = [0.0, 0.0, 0.1]
+                elif current_phase == 5:  # Moving to target
+                    rl_action[:3] = [-0.1, 0.0, 0.0]
+                elif current_phase in [6, 7]:  # Lowering/opening
+                    rl_action[:3] = [0.0, 0.0, -0.1]
+                    rl_action[3] = -1.0 if current_phase == 7 else 0.0
 
-                # Compute reward
-                reward = max(0, cube_distance - next_cube_distance) * 10.0
-                if next_grasped:
+                reward = -cube_distance * 1.0
+                if grasped:
                     reward += 5.0
 
-                # Convert action to RL format (dx, dy, dz, gripper)
-                # Approximate from joint changes
-                rl_action = np.zeros(4, dtype=np.float32)
-                if len(actions.joint_positions) >= 6:
-                    joint_delta = next_joints[:6] - current_joints[:6]
-                    rl_action[:3] = joint_delta[:3] * 0.1
-                    rl_action[3] = (next_gripper_pos - gripper_pos) * 10.0
-                rl_action = np.clip(rl_action, -1.0, 1.0)
-
-                # Store experience
                 episode_data.append({
                     'state': state,
                     'action': rl_action,
-                    'next_state': next_state,
+                    'next_state': state,  # Will fix in post-processing
                     'image': rgb_image,
                     'reward': reward,
                 })
 
-                # Check if done
-                if my_controller.is_done():
-                    task_completed = True
-                    break
-
                 step_count += 1
+
+                # Exit when task is completed (like test_grasp_official.py just continues)
+                # For data collection, we want to capture the full trajectory then move to next episode
+                if task_completed:
+                    break
 
             if my_world.is_stopped():
                 reset_needed = True
+
+        # Post-process to fix next_state (shift states by 1)
+        for i in range(len(episode_data) - 1):
+            episode_data[i]['next_state'] = episode_data[i + 1]['state']
 
         # Add to dataset if successful OR if we have useful data (robot was grasping)
         # Check if robot ever grasped the cube during the episode
