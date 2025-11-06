@@ -796,6 +796,7 @@ print("=" * 70 + "\n")
 # Training parameters
 NUM_EPOCHS = 200
 VISUALIZATION_INTERVAL = 1  # Visualize learned policy every 1 epoch
+RECORD_VIDEO_AFTER_EPOCH = 1  # Record video from epoch 1 onwards
 save_interval = 10  # Save model every 10 epochs
 VIDEO_PATH = "/home/kenpeter/work/robot/policy_visualization.mp4"  # Overwrite same file
 
@@ -900,21 +901,20 @@ try:
             for _ in range(10):
                 my_world.step(render=False)
 
-            # Initialize video writer (use AVI with MJPEG - always works)
-            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-            video_path_avi = VIDEO_PATH.replace('.mp4', '.avi')
-            video_writer = cv2.VideoWriter(video_path_avi, fourcc, 30.0, (1280, 720))  # HD resolution
-
-            if not video_writer.isOpened():
-                print("  ⚠ WARNING: Could not open video writer!")
-                video_writer = None
-            else:
-                print(f"  📹 Recording HD video (1280x720) to: {video_path_avi}")
-
+            # Only record video after epoch RECORD_VIDEO_AFTER_EPOCH
+            video_writer = None
             frames_recorded = 0
+            video_frames_buffer = []  # Store frames in memory
+            TOTAL_VIZ_STEPS = 4800  # Match the expert dataset episode length
+            RECORD_LAST_N_STEPS = 200  # Record only last 200 steps to see final result
 
-            # Run 200 steps with learned policy (visualization only) - longer episode for better video
-            for viz_step in range(200):
+            if (epoch + 1) >= RECORD_VIDEO_AFTER_EPOCH:
+                print(f"  📹 Running {TOTAL_VIZ_STEPS} steps, recording last {RECORD_LAST_N_STEPS} to see if cube reaches target")
+            else:
+                print(f"  ⏩ Running {TOTAL_VIZ_STEPS} steps (no video recording until epoch {RECORD_VIDEO_AFTER_EPOCH})")
+
+            # Run full episode length (4800 steps like expert data)
+            for viz_step in range(TOTAL_VIZ_STEPS):
                 my_world.step(render=True)
 
                 # Get current state and image
@@ -972,8 +972,8 @@ try:
                     current_joints[6] = target_gripper
                     robot.set_joint_positions(current_joints)
 
-                # Record frame to video from side camera (HD view)
-                if video_writer is not None:
+                # Capture frame from side camera (for all steps if recording epoch)
+                if (epoch + 1) >= RECORD_VIDEO_AFTER_EPOCH:
                     side_camera.get_current_frame()
                     side_rgba = side_camera.get_rgba()
                     if side_rgba is not None and side_rgba.size > 0:
@@ -981,14 +981,27 @@ try:
                             side_rgba = side_rgba.reshape(720, 1280, 4)
                         side_rgb = side_rgba[:, :, :3].astype(np.uint8)
                         side_bgr = cv2.cvtColor(side_rgb, cv2.COLOR_RGB2BGR)
-                        video_writer.write(side_bgr)
-                        frames_recorded += 1
 
-            # Close video writer
-            if video_writer is not None:
-                video_writer.release()
-                print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}])")
-                print(f"📹 Video saved: {video_path_avi} ({frames_recorded} frames)\n")
+                        # Add to buffer, keep only last N frames
+                        video_frames_buffer.append(side_bgr)
+                        if len(video_frames_buffer) > RECORD_LAST_N_STEPS:
+                            video_frames_buffer.pop(0)  # Remove oldest frame
+
+            # Write last N steps to video file
+            if (epoch + 1) >= RECORD_VIDEO_AFTER_EPOCH and len(video_frames_buffer) > 0:
+                video_path_avi = VIDEO_PATH.replace('.mp4', f'_epoch{epoch+1}_last{RECORD_LAST_N_STEPS}steps.avi')
+                fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+                video_writer = cv2.VideoWriter(video_path_avi, fourcc, 30.0, (1280, 720))
+
+                if video_writer.isOpened():
+                    for frame in video_frames_buffer:
+                        video_writer.write(frame)
+                        frames_recorded += 1
+                    video_writer.release()
+                    print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}])")
+                    print(f"📹 Video saved: {video_path_avi} ({frames_recorded} last steps)\n")
+                else:
+                    print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}]) - Video write failed\n")
             else:
                 print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}]) - No video recorded\n")
 
