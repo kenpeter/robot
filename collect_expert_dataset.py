@@ -94,15 +94,11 @@ class PickPlaceController(manipulators_controllers.PickPlaceController):
         events_dt=None,
     ) -> None:
         if events_dt is None:
-            # Modified timing for proper release and movement
-            # [Phase 0-9]: Move above, Lower, Settle, Close, Lift, Move XY, Lower, Open, Lift, Return
-            events_dt = [0.005, 0.002, 1, 0.05, 0.001, 0.008, 0.002, 0.3, 0.003, 0.008]
-            # Key changes from official:
-            # - Phase 4 (Lift): 0.0008 -> 0.001 (slightly more time)
-            # - Phase 5 (Move XY): 0.005 -> 0.008 (more time for horizontal move)
-            # - Phase 6 (Lower): 0.0008 -> 0.002 (more time to lower)
-            # - Phase 7 (Open): 0.1 -> 0.3 (3x longer to ensure gripper fully opens before arm moves)
-            # - Phase 8 (Lift): 0.0008 -> 0.003 (more time to clear cube)
+            # Modified timing for RELIABLE grip
+            # Phase 1 (Lower): 0.002 -> 0.005 (slower lowering for better alignment)
+            # Phase 2 (Settle): 1 -> 2.0 seconds (MUCH more time for gripper to wrap around cube)
+            # Phase 3 (Close): 0.05 -> 0.15 seconds (3x longer to ensure maximum grip force)
+            events_dt = [0.005, 0.005, 2.0, 0.15, 0.0008, 0.005, 0.0008, 0.15, 0.0008, 0.008]
         manipulators_controllers.PickPlaceController.__init__(
             self,
             name=name,
@@ -156,7 +152,7 @@ class RedCubePickPlace(tasks.PickPlace):
             end_effector_prim_path="/ur/ee_link/robotiq_arg2f_base_link",
             joint_prim_names=["finger_joint"],
             joint_opened_positions=np.array([0]),
-            joint_closed_positions=np.array([40]),  # Official example value
+            joint_closed_positions=np.array([40]),  # Official value
             action_deltas=np.array([-40]),
             use_mimic_joints=True,
         )
@@ -207,7 +203,7 @@ print(f"Will save to: {SAVE_PATH}\n")
 successful_demos = 0
 
 # Create world ONCE (not per episode)
-cube_size = np.array([0.0515, 0.0515, 0.0515])
+cube_size = np.array([0.065, 0.065, 0.065])  # Increased from 0.0515 to 0.065 (26% bigger, easier to grip)
 my_world = World(stage_units_in_meters=1.0, physics_dt=1 / 200, rendering_dt=20 / 200)
 
 # Create initial task
@@ -255,13 +251,39 @@ try:
     for episode in range(NUM_EPISODES):
         print(f"\n--- Episode {episode+1}/{NUM_EPISODES} ---")
 
-        # For first episode, just use initial setup
-        # For subsequent episodes, reset world and controller
-        if episode > 0:
-            my_world.reset()
-            my_controller.reset()
-            task_completed = False
-            reset_needed = False
+        # Randomize cube and target positions for each episode
+        # RIGHT-HANDED SWING MOTION: Pick from front-right → swing 180° → place at back-right
+        # Like a right-handed person sweeping an arc, no twisting!
+
+        # Cube position: FRONT-RIGHT (positive X, positive Y)
+        cube_x = np.random.uniform(0.3, 0.4)    # Front of robot
+        cube_y = np.random.uniform(0.25, 0.35)  # Right side (positive Y)
+        cube_initial_position = np.array([cube_x, cube_y, cube_size[2] / 2.0])
+
+        # Target position: BACK-RIGHT (negative X, SAME positive Y side)
+        # 180° swing: same Y side, opposite X (front → back)
+        target_x = np.random.uniform(-0.4, -0.3)   # Behind robot (negative X)
+        target_y = np.random.uniform(0.25, 0.35)   # SAME right side (positive Y)
+        target_position = np.array([target_x, target_y, cube_size[2] / 2.0])
+
+        # Motion: Front-right → (lift) → swing 180° arc → Back-right (drop)
+        # Natural right-handed motion, no twisting or crossing over base!
+
+        print(f"  Cube: ({cube_x:.2f}, {cube_y:.2f})")
+        print(f"  Target: ({target_x:.2f}, {target_y:.2f})")
+
+        # Reset world
+        my_world.reset()
+
+        # Update cube and target positions after reset
+        my_cube.set_world_pose(position=cube_initial_position, orientation=np.array([1.0, 0.0, 0.0, 0.0]))
+        my_task._target_position = target_position
+        my_task._cube_initial_position = cube_initial_position
+
+        # Reset controller
+        my_controller.reset()
+        task_completed = False
+        reset_needed = False
 
         # Episode data storage
         episode_data = []
@@ -373,11 +395,23 @@ try:
         for i in range(len(episode_data) - 1):
             episode_data[i]['next_state'] = episode_data[i + 1]['state']
 
-        # Add to dataset if successful OR if we have useful data (robot was grasping)
-        # Check if robot ever grasped the cube during the episode
-        had_grasp = any(exp['state'][12] > 0.5 for exp in episode_data) if episode_data else False
+        # QUALITY FILTER: Only save HIGH-QUALITY successful demonstrations
+        # Check if robot successfully grasped the cube (not just touched it)
+        grasp_count = sum(1 for exp in episode_data if exp['state'][12] > 0.5)
+        grasp_percentage = grasp_count / len(episode_data) if len(episode_data) > 0 else 0
 
-        if (task_completed or had_grasp) and len(episode_data) > 0:
+        # Check if cube reached near target (within 15cm)
+        if len(episode_data) > 0:
+            final_cube_pos = episode_data[-1]['state']  # Get final state
+            # Assuming we can infer if placement was successful from task_completed
+            successful_placement = task_completed
+        else:
+            successful_placement = False
+
+        # STRICT CRITERIA: Only save if
+        # 1. Task fully completed (picked, transported, placed)
+        # 2. Robot held cube for at least 30% of the trajectory
+        if task_completed and grasp_percentage > 0.3 and len(episode_data) > 50:
             for exp in episode_data:
                 dataset['states'].append(exp['state'])
                 dataset['actions'].append(exp['action'])
@@ -385,10 +419,16 @@ try:
                 dataset['images'].append(exp['image'])
                 dataset['rewards'].append(exp['reward'])
             successful_demos += 1
-            status = "Complete" if task_completed else "Partial (grasped)"
-            print(f"  ✓ {status} ({len(episode_data)} steps)")
+            print(f"  ✓ SUCCESS! Saved {len(episode_data)} steps (grasp: {grasp_percentage*100:.1f}%)")
         else:
-            print(f"  ✗ Failed (steps: {step_count}, experiences: {len(episode_data)})")
+            failure_reason = []
+            if not task_completed:
+                failure_reason.append("incomplete")
+            if grasp_percentage <= 0.3:
+                failure_reason.append(f"weak grasp ({grasp_percentage*100:.1f}%)")
+            if len(episode_data) <= 50:
+                failure_reason.append("too short")
+            print(f"  ✗ REJECTED: {', '.join(failure_reason)} (steps: {step_count})")
 
 except KeyboardInterrupt:
     print("\n\n⚠ Collection interrupted by user")
