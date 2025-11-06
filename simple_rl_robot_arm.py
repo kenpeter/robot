@@ -661,13 +661,13 @@ overhead_camera.initialize()
 # === SIDE VIEW CAMERA - For video recording (high-res, better angle) ===
 side_camera_prim_path = "/World/SideCamera"
 create_prim(side_camera_prim_path, "Camera")
-# Position camera farther back and higher to see full robot workspace
-eye_side = Gf.Vec3d(2.0, 2.0, 1.5)  # Farther back, higher up - zoomed out view
-target_side = Gf.Vec3d(0.0, 0.0, 0.4)  # Look at center of robot workspace
+# Position camera MUCH farther back to see entire scene
+eye_side = Gf.Vec3d(3.5, 3.5, 2.5)  # Very far back and high - full scene view
+target_side = Gf.Vec3d(0.0, 0.0, 0.5)  # Look at center of robot
 set_camera_view(eye=eye_side, target=target_side, camera_prim_path=side_camera_prim_path)
 camera_prim_side = my_world.stage.GetPrimAtPath(side_camera_prim_path)
-camera_prim_side.GetAttribute("horizontalAperture").Set(35.0)  # Wider FOV to see more
-camera_prim_side.GetAttribute("verticalAperture").Set(26.25)  # 16:9 aspect ratio
+camera_prim_side.GetAttribute("horizontalAperture").Set(50.0)  # Very wide FOV
+camera_prim_side.GetAttribute("verticalAperture").Set(37.5)  # 16:9 aspect ratio
 side_camera = Camera(
     prim_path=side_camera_prim_path,
     resolution=(1280, 720),  # HD resolution for clear video
@@ -913,8 +913,8 @@ try:
 
             frames_recorded = 0
 
-            # Run 100 steps with learned policy (visualization only)
-            for viz_step in range(100):
+            # Run 200 steps with learned policy (visualization only) - longer episode for better video
+            for viz_step in range(200):
                 my_world.step(render=True)
 
                 # Get current state and image
