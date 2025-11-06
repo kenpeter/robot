@@ -661,13 +661,13 @@ overhead_camera.initialize()
 # === SIDE VIEW CAMERA - For video recording (high-res, better angle) ===
 side_camera_prim_path = "/World/SideCamera"
 create_prim(side_camera_prim_path, "Camera")
-# Position camera at an angle to see both robot and cube clearly
-eye_side = Gf.Vec3d(1.0, 1.0, 0.6)  # Side angle view
-target_side = Gf.Vec3d(0.0, 0.0, 0.3)  # Look at robot workspace
+# Position camera farther back and higher to see full robot workspace
+eye_side = Gf.Vec3d(2.0, 2.0, 1.5)  # Farther back, higher up - zoomed out view
+target_side = Gf.Vec3d(0.0, 0.0, 0.4)  # Look at center of robot workspace
 set_camera_view(eye=eye_side, target=target_side, camera_prim_path=side_camera_prim_path)
 camera_prim_side = my_world.stage.GetPrimAtPath(side_camera_prim_path)
-camera_prim_side.GetAttribute("horizontalAperture").Set(21.0)  # Standard FOV
-camera_prim_side.GetAttribute("verticalAperture").Set(15.75)  # 16:9 aspect ratio
+camera_prim_side.GetAttribute("horizontalAperture").Set(35.0)  # Wider FOV to see more
+camera_prim_side.GetAttribute("verticalAperture").Set(26.25)  # 16:9 aspect ratio
 side_camera = Camera(
     prim_path=side_camera_prim_path,
     resolution=(1280, 720),  # HD resolution for clear video
