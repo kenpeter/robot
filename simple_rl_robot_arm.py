@@ -13,7 +13,7 @@ from isaacsim import SimulationApp
 # Initialize simulation
 simulation_app = SimulationApp(
     {
-        "headless": False,
+        "headless": False,  # Keep UI visible
         "width": 1280,
         "height": 720,
         # ray trace vs path trace: ray trace -> good performance -> path trace -> more real
@@ -30,6 +30,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
 import pickle
+import threading
+import time
 from isaacsim.core.api import World
 from isaacsim.core.prims import RigidPrim
 from isaacsim.core.utils.stage import add_reference_to_stage
@@ -759,7 +761,7 @@ agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=True)
 agent.load_model(MODEL_PATH)
 
 # === LOAD EXPERT DATASET ===
-DATASET_PATH = "expert_dataset.pkl"
+DATASET_PATH = "synthetic_dataset.pkl"
 print("\n" + "=" * 70)
 print(" LOADING EXPERT DATASET FOR OFFLINE TRAINING")
 print("=" * 70)
@@ -797,15 +799,32 @@ print(f"Epochs: {NUM_EPOCHS}")
 print(f"Visualization every: {VISUALIZATION_INTERVAL} epochs")
 print(f"Model will be saved to: {MODEL_PATH}\n")
 
-try:
+# Training state for async updates
+training_active = True
+current_epoch = 0
+current_loss = 0.0
+training_lock = threading.Lock()
+do_visualization = False
+viz_epoch = 0
+
+def training_thread():
+    """Background training thread - doesn't block UI"""
+    global training_active, current_epoch, current_loss, do_visualization, viz_epoch
+
+    num_samples = len(expert_dataset['states'])
+
     for epoch in range(NUM_EPOCHS):
-        # Train on entire expert dataset
-        num_samples = len(expert_dataset['states'])
+        if not training_active:
+            break
+
         indices = np.random.permutation(num_samples)
         epoch_losses = []
 
         # Train on batches from expert dataset
         for start_idx in range(0, num_samples, agent.batch_size):
+            if not training_active:
+                break
+
             end_idx = min(start_idx + agent.batch_size, num_samples)
             batch_indices = indices[start_idx:end_idx]
 
@@ -817,23 +836,59 @@ try:
                 next_state = expert_dataset['next_states'][idx]
                 image = expert_dataset['images'][idx]
 
-                # Train on this experience (is_expert=True puts it in expert_buffer)
+                # Train on this experience
                 loss = agent.update(state, action, reward, next_state, image, is_expert=True)
                 if loss is not None:
                     epoch_losses.append(loss)
 
-        # Log progress
-        avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS} | Loss: {avg_loss:.6f} | Expert buffer: {len(agent.expert_buffer)}")
+        # Update progress
+        with training_lock:
+            current_epoch = epoch + 1
+            current_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+
+        print(f"Epoch {current_epoch}/{NUM_EPOCHS} | Loss: {current_loss:.6f} | Expert buffer: {len(agent.expert_buffer)}")
 
         # Save checkpoint
         if (epoch + 1) % save_interval == 0:
             agent.save_model(MODEL_PATH)
             print(f"  → Checkpoint saved at epoch {epoch+1}\n")
 
-        # Visualize learned policy in Isaac Sim
+        # Signal main thread to do visualization
         if (epoch + 1) % VISUALIZATION_INTERVAL == 0:
-            print(f"\n🎬 VISUALIZATION Epoch {epoch+1}: Testing learned policy...")
+            with training_lock:
+                do_visualization = True
+                viz_epoch = epoch + 1
+            # Wait for visualization to complete
+            while do_visualization and training_active:
+                time.sleep(0.1)
+
+    print("\n✓ Training thread complete!")
+    training_active = False
+
+# Start training in background thread
+train_thread = threading.Thread(target=training_thread, daemon=True)
+train_thread.start()
+
+print("=" * 70)
+print("TRAINING IN BACKGROUND - UI remains responsive")
+print("Press Ctrl+C to stop")
+print("=" * 70 + "\n")
+
+step_count = 0
+last_report = time.time()
+
+try:
+    while simulation_app.is_running() and training_active:
+        my_world.step(render=True)
+        step_count += 1
+
+        # Check if visualization is requested
+        with training_lock:
+            should_viz = do_visualization
+            epoch = viz_epoch
+
+        if should_viz:
+            print(f"\n🎬 VISUALIZATION Epoch {epoch}: Testing learned policy...")
 
             # Reset robot
             initial_pos = np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0])
@@ -851,7 +906,7 @@ try:
             for _ in range(10):
                 my_world.step(render=False)
 
-            # Run 100 steps with learned policy (visualization only)
+            # Run 100 steps with learned policy
             for viz_step in range(100):
                 my_world.step(render=True)
 
@@ -880,7 +935,7 @@ try:
                 grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
                 state = np.concatenate([joint_positions, [grasped]])
 
-                # Get action from learned policy (deterministic=True for testing)
+                # Get action from learned policy
                 action = agent.get_action(state, image=rgb_image, deterministic=True)
 
                 # Execute action with RMPflow
@@ -906,19 +961,30 @@ try:
 
             print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}])\n")
 
+            # Signal visualization done
+            with training_lock:
+                do_visualization = False
+
+        # Report progress every 5 seconds
+        if time.time() - last_report > 5.0:
+            with training_lock:
+                print(f"[UI Active] Step {step_count} | Training Epoch: {current_epoch}/{NUM_EPOCHS} | Loss: {current_loss:.6f}")
+            last_report = time.time()
+
 except KeyboardInterrupt:
-    print("\nOffline training interrupted by user")
+    print("\n\nStopping training...")
+    training_active = False
+    train_thread.join(timeout=5.0)
     agent.save_model(MODEL_PATH)
     print("Model saved before exit")
 except Exception as e:
-    print(f"Error during training: {e}")
+    print(f"Error: {e}")
     import traceback
-
     traceback.print_exc()
+    training_active = False
     agent.save_model(MODEL_PATH)
-    print("Model saved after error")
 finally:
-    print(f"\n✓ Offline training complete!")
+    print(f"\n✓ Training complete!")
     print(f"✓ Final model saved to: {MODEL_PATH}")
     agent.save_model(MODEL_PATH)
 

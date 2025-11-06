@@ -26,7 +26,7 @@ from isaacsim.core.utils.viewports import set_camera_view
 from pxr import Gf
 
 # Configuration
-NUM_EPISODES = 10
+NUM_EPISODES = 1
 SAVE_PATH = "/home/kenpeter/work/robot/synthetic_dataset.pkl"
 
 # Dataset storage
@@ -85,44 +85,25 @@ step_count = 0
 reset_needed = False
 task_completed = False
 
+# Save function
+def save_dataset():
+    """Save current dataset to file"""
+    final_dataset = {
+        'states': np.array(dataset['states'], dtype=np.float32) if dataset['states'] else np.array([]),
+        'actions': np.array(dataset['actions'], dtype=np.float32) if dataset['actions'] else np.array([]),
+        'next_states': np.array(dataset['next_states'], dtype=np.float32) if dataset['next_states'] else np.array([]),
+        'images': np.array(dataset['images'], dtype=np.uint8) if dataset['images'] else np.array([]),
+        'rewards': np.array(dataset['rewards'], dtype=np.float32) if dataset['rewards'] else np.array([]),
+    }
+    with open(SAVE_PATH, 'wb') as f:
+        pickle.dump(final_dataset, f)
+    return len(final_dataset['states'])
+
 try:
     while simulation_app.is_running() and current_episode < NUM_EPISODES:
         my_world.step(render=True)
 
         if my_world.is_playing():
-            if reset_needed:
-                # Episode just finished - process data
-                if task_completed and len(episode_data) > 0:
-                    print(f"  ✓ Episode {current_episode} completed with {len(episode_data)} steps")
-
-                    # Post-process to fix next_state
-                    for i in range(len(episode_data) - 1):
-                        episode_data[i]['next_state'] = episode_data[i + 1]['state']
-
-                    # Save episode data
-                    for exp in episode_data:
-                        dataset['states'].append(exp['state'])
-                        dataset['actions'].append(exp['action'])
-                        dataset['next_states'].append(exp['next_state'])
-                        dataset['images'].append(exp['image'])
-                        dataset['rewards'].append(exp['reward'])
-
-                    successful_demos += 1
-                else:
-                    print(f"  ✗ Episode {current_episode} failed")
-
-                # Start new episode
-                current_episode += 1
-                if current_episode < NUM_EPISODES:
-                    print(f"\n--- Episode {current_episode + 1}/{NUM_EPISODES} ---")
-                    episode_data = []
-                    step_count = 0
-
-                my_world.reset()
-                reset_needed = False
-                my_controller.reset()
-                task_completed = False
-
             if my_world.current_time_step_index == 0:
                 my_controller.reset()
                 if current_episode == 0:
@@ -167,13 +148,44 @@ try:
                 print(f"  ✓ done picking and placing at step {step_count}")
                 task_completed = True
 
+                # IMMEDIATELY save episode data when done
+                print(f"  ✓ Episode {current_episode + 1} completed with {len(episode_data)} steps")
+
+                # Post-process to fix next_state
+                for i in range(len(episode_data) - 1):
+                    episode_data[i]['next_state'] = episode_data[i + 1]['state']
+
+                # Save episode data
+                for exp in episode_data:
+                    dataset['states'].append(exp['state'])
+                    dataset['actions'].append(exp['action'])
+                    dataset['next_states'].append(exp['next_state'])
+                    dataset['images'].append(exp['image'])
+                    dataset['rewards'].append(exp['reward'])
+
+                successful_demos += 1
+
+                # Save to file NOW
+                num_transitions = save_dataset()
+                print(f"    💾 SAVED {num_transitions} total transitions to {SAVE_PATH}")
+
+                # Reset for next episode
+                episode_data = []
+                step_count = 0
+                current_episode += 1
+
+                if current_episode >= NUM_EPISODES:
+                    print(f"\n✓ All {NUM_EPISODES} episodes completed!")
+                    break
+
+                print(f"\n--- Episode {current_episode + 1}/{NUM_EPISODES} ---")
+                my_world.reset()
+                my_controller.reset()
+                task_completed = False
+                continue
+
             # Apply actions - EXACT same as pick_up_example.py
             articulation_controller.apply_action(actions)
-
-            # Stop this episode after task completion to save data
-            if task_completed:
-                my_world.stop()
-                reset_needed = True
 
             # Simple RL action encoding (direction towards target)
             target_pos = observations[cube_name]["target_position"]
@@ -204,27 +216,19 @@ try:
             if step_count % 100 == 0:
                 print(f"    Step {step_count}: Distance: {cube_distance:.3f}, Grasped: {grasped}")
 
-        if my_world.is_stopped():
-            reset_needed = True
-
 except KeyboardInterrupt:
     print("\n\n⚠ Collection interrupted by user")
+    print("💾 Saving data collected so far...")
+    num_transitions = save_dataset()
+    print(f"✓ Saved {num_transitions} transitions before exit")
 
-# Convert to numpy arrays
-dataset['states'] = np.array(dataset['states'], dtype=np.float32) if dataset['states'] else np.array([])
-dataset['actions'] = np.array(dataset['actions'], dtype=np.float32) if dataset['actions'] else np.array([])
-dataset['next_states'] = np.array(dataset['next_states'], dtype=np.float32) if dataset['next_states'] else np.array([])
-dataset['images'] = np.array(dataset['images'], dtype=np.uint8) if dataset['images'] else np.array([])
-dataset['rewards'] = np.array(dataset['rewards'], dtype=np.float32) if dataset['rewards'] else np.array([])
-
-# Save dataset
-with open(SAVE_PATH, 'wb') as f:
-    pickle.dump(dataset, f)
+# Final save
+num_transitions = save_dataset()
 
 print("\n" + "=" * 70)
 print(f"✓ Dataset collection complete!")
 print(f"  Successful demos: {successful_demos}/{NUM_EPISODES}")
-print(f"  Total transitions: {len(dataset['states'])}")
+print(f"  Total transitions: {num_transitions}")
 print(f"  Saved to: {SAVE_PATH}")
 print("=" * 70)
 
