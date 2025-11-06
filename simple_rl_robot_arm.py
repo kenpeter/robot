@@ -643,33 +643,37 @@ from isaacsim.core.utils.prims import create_prim
 from isaacsim.sensors.camera import Camera
 from pxr import Gf, UsdLux
 
-# === OVERHEAD CAMERA (Eye-to-Hand) - GitHub best practice ===
-# Fixed camera above workspace for global view (like visual-pushing-grasping)
-# Workspace bounds: X[-0.6, 0.8], Y[-0.6, 0.6], Z[0.05, 1.0]
-# Center camera over workspace center: X=0.1, Y=0.0
+# === OVERHEAD CAMERA (Eye-to-Hand) - For RL policy (small, fast) ===
 camera_prim_path = "/World/OverheadCamera"
 create_prim(camera_prim_path, "Camera")
-
-# Use set_camera_view to properly position and orient camera
-# Lower camera height to make objects larger in view (closer = bigger objects)
-eye = Gf.Vec3d(0.1, 0.0, 1.2)  # 1.2m high - closer to objects for larger view
-target = Gf.Vec3d(0.1, 0.0, 0.0)  # Look at ground at workspace center
+eye = Gf.Vec3d(0.1, 0.0, 1.2)
+target = Gf.Vec3d(0.1, 0.0, 0.0)
 set_camera_view(eye=eye, target=target, camera_prim_path=camera_prim_path)
-
-# Adjust horizontal aperture for much wider field of view
 camera_prim = my_world.stage.GetPrimAtPath(camera_prim_path)
-camera_prim.GetAttribute("horizontalAperture").Set(
-    80.0
-)  # Much wider FOV for entire workspace
-camera_prim.GetAttribute("verticalAperture").Set(
-    80.0
-)  # Match vertical for square aspect ratio
-
+camera_prim.GetAttribute("horizontalAperture").Set(80.0)
+camera_prim.GetAttribute("verticalAperture").Set(80.0)
 overhead_camera = Camera(
     prim_path=camera_prim_path,
-    resolution=(84, 84),  # Small resolution for faster processing
+    resolution=(84, 84),  # Small for fast RL training
 )
 overhead_camera.initialize()
+
+# === SIDE VIEW CAMERA - For video recording (high-res, better angle) ===
+side_camera_prim_path = "/World/SideCamera"
+create_prim(side_camera_prim_path, "Camera")
+# Position camera at an angle to see both robot and cube clearly
+eye_side = Gf.Vec3d(1.0, 1.0, 0.6)  # Side angle view
+target_side = Gf.Vec3d(0.0, 0.0, 0.3)  # Look at robot workspace
+set_camera_view(eye=eye_side, target=target_side, camera_prim_path=side_camera_prim_path)
+camera_prim_side = my_world.stage.GetPrimAtPath(side_camera_prim_path)
+camera_prim_side.GetAttribute("horizontalAperture").Set(21.0)  # Standard FOV
+camera_prim_side.GetAttribute("verticalAperture").Set(15.75)  # 16:9 aspect ratio
+side_camera = Camera(
+    prim_path=side_camera_prim_path,
+    resolution=(1280, 720),  # HD resolution for clear video
+)
+side_camera.initialize()
+print("✓ Cameras initialized: Overhead (84x84) for RL, Side (1280x720) for video")
 
 # === RED CUBE SETUP (matching test_grasp_official.py) ===
 # Add red cube with same setup as test_grasp_official.py
@@ -896,9 +900,17 @@ try:
             for _ in range(10):
                 my_world.step(render=False)
 
-            # Initialize video writer (overwrite same file each time)
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            video_writer = cv2.VideoWriter(VIDEO_PATH, fourcc, 30.0, (640, 480))
+            # Initialize video writer (use AVI with MJPEG - always works)
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            video_path_avi = VIDEO_PATH.replace('.mp4', '.avi')
+            video_writer = cv2.VideoWriter(video_path_avi, fourcc, 30.0, (1280, 720))  # HD resolution
+
+            if not video_writer.isOpened():
+                print("  ⚠ WARNING: Could not open video writer!")
+                video_writer = None
+            else:
+                print(f"  📹 Recording HD video (1280x720) to: {video_path_avi}")
+
             frames_recorded = 0
 
             # Run 100 steps with learned policy (visualization only)
@@ -960,18 +972,25 @@ try:
                     current_joints[6] = target_gripper
                     robot.set_joint_positions(current_joints)
 
-                # Record frame to video (upscale from 84x84 to 640x480 for visibility)
-                frame_large = cv2.resize(
-                    rgb_image, (640, 480), interpolation=cv2.INTER_NEAREST
-                )
-                frame_bgr = cv2.cvtColor(frame_large, cv2.COLOR_RGB2BGR)
-                video_writer.write(frame_bgr)
-                frames_recorded += 1
+                # Record frame to video from side camera (HD view)
+                if video_writer is not None:
+                    side_camera.get_current_frame()
+                    side_rgba = side_camera.get_rgba()
+                    if side_rgba is not None and side_rgba.size > 0:
+                        if len(side_rgba.shape) == 1:
+                            side_rgba = side_rgba.reshape(720, 1280, 4)
+                        side_rgb = side_rgba[:, :, :3].astype(np.uint8)
+                        side_bgr = cv2.cvtColor(side_rgb, cv2.COLOR_RGB2BGR)
+                        video_writer.write(side_bgr)
+                        frames_recorded += 1
 
             # Close video writer
-            video_writer.release()
-            print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}])")
-            print(f"📹 Video saved: {VIDEO_PATH} ({frames_recorded} frames)\n")
+            if video_writer is not None:
+                video_writer.release()
+                print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}])")
+                print(f"📹 Video saved: {video_path_avi} ({frames_recorded} frames)\n")
+            else:
+                print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}]) - No video recorded\n")
 
 except KeyboardInterrupt:
     print("\nOffline training interrupted by user")
