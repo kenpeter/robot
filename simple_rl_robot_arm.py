@@ -13,7 +13,7 @@ from isaacsim import SimulationApp
 # Initialize simulation
 simulation_app = SimulationApp(
     {
-        "headless": False,  # Keep UI visible
+        "headless": True,
         "width": 1280,
         "height": 720,
         # ray trace vs path trace: ray trace -> good performance -> path trace -> more real
@@ -28,10 +28,9 @@ import carb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import cv2  # For video recording
 from collections import deque
 import pickle
-import threading
-import time
 from isaacsim.core.api import World
 from isaacsim.core.prims import RigidPrim
 from isaacsim.core.utils.stage import add_reference_to_stage
@@ -461,7 +460,7 @@ class DiTAgent:
             expert_indices = np.random.choice(
                 len(self.expert_buffer),
                 min(num_expert_samples, len(self.expert_buffer)),
-                replace=False
+                replace=False,
             )
             batch.extend([self.expert_buffer[i] for i in expert_indices])
 
@@ -475,7 +474,9 @@ class DiTAgent:
                 return  # Not enough valid samples
             indices = np.random.choice(valid_indices, remaining_needed, replace=False)
         else:
-            indices = np.random.choice(len(self.buffer), remaining_needed, replace=False)
+            indices = np.random.choice(
+                len(self.buffer), remaining_needed, replace=False
+            )
         batch.extend([self.buffer[i] for i in indices])
 
         # Convert to tensors
@@ -559,7 +560,9 @@ class DiTAgent:
             "step_count": self.step_count,
         }
         torch.save(model_data, filepath)
-        print(f"Model saved to {filepath} (including {len(self.expert_buffer)} expert demos)")
+        print(
+            f"Model saved to {filepath} (including {len(self.expert_buffer)} expert demos)"
+        )
 
     def load_model(self, filepath):
         """Load agent state from file"""
@@ -774,7 +777,7 @@ if not os.path.exists(DATASET_PATH):
     sys.exit(1)
 
 print(f"\nLoading dataset from {DATASET_PATH}...")
-with open(DATASET_PATH, 'rb') as f:
+with open(DATASET_PATH, "rb") as f:
     expert_dataset = pickle.load(f)
 
 print(f"✓ Dataset loaded successfully!")
@@ -788,8 +791,9 @@ print("=" * 70 + "\n")
 
 # Training parameters
 NUM_EPOCHS = 200
-VISUALIZATION_INTERVAL = 20  # Visualize learned policy every 20 epochs
+VISUALIZATION_INTERVAL = 1  # Visualize learned policy every 1 epoch
 save_interval = 10  # Save model every 10 epochs
+VIDEO_PATH = "/home/kenpeter/work/robot/policy_visualization.mp4"  # Overwrite same file
 
 print("\n" + "=" * 70)
 print(" STARTING OFFLINE TRAINING")
@@ -799,96 +803,82 @@ print(f"Epochs: {NUM_EPOCHS}")
 print(f"Visualization every: {VISUALIZATION_INTERVAL} epochs")
 print(f"Model will be saved to: {MODEL_PATH}\n")
 
-# Training state for async updates
-training_active = True
-current_epoch = 0
-current_loss = 0.0
-training_lock = threading.Lock()
-do_visualization = False
-viz_epoch = 0
+# CRITICAL: Start the simulation timeline so my_world.step() doesn't block!
+print("[DEBUG] About to call my_world.play()...")
+my_world.play()
+print("[DEBUG] my_world.play() returned")
+print(f"[DEBUG] World is playing: {my_world.is_playing()}")
+print(f"[DEBUG] World is stopped: {my_world.is_stopped()}")
+print("✓ Simulation timeline started - UI will remain responsive\n")
 
-def training_thread():
-    """Background training thread - doesn't block UI"""
-    global training_active, current_epoch, current_loss, do_visualization, viz_epoch
-
-    num_samples = len(expert_dataset['states'])
-
+try:
+    batch_count = 0  # Track total batches for UI updates
     for epoch in range(NUM_EPOCHS):
-        if not training_active:
-            break
-
+        print(f"\n[DEBUG] ===== Starting Epoch {epoch+1}/{NUM_EPOCHS} =====")
+        # Train on entire expert dataset
+        num_samples = len(expert_dataset["states"])
         indices = np.random.permutation(num_samples)
         epoch_losses = []
 
         # Train on batches from expert dataset
+        batch_in_epoch = 0
         for start_idx in range(0, num_samples, agent.batch_size):
-            if not training_active:
-                break
+            batch_in_epoch += 1
+            batch_count += 1
+
+            # *** KEY FIX: Update UI FIRST (like online training) ***
+            if batch_count % 5 == 0:
+                print(f"[DEBUG] Batch {batch_count}: Updating UI BEFORE training...")
+                # Add visual feedback - wiggle the cube
+                current_pos, current_rot = ball.get_world_pose()
+                import math
+
+                wiggle = math.sin(batch_count * 0.1) * 0.02
+                ball.set_world_pose(
+                    position=np.array(
+                        [current_pos[0] + wiggle, current_pos[1], current_pos[2]]
+                    )
+                )
+
+                # Step world FIRST, before training (like online training - NO simulation_app.update!)
+                my_world.step(render=True)
+                print(f"[DEBUG] Batch {batch_count}: UI updated, starting training...")
+
+            if batch_in_epoch == 1:
+                print(f"[DEBUG] Epoch {epoch+1}: Processing first batch...")
 
             end_idx = min(start_idx + agent.batch_size, num_samples)
             batch_indices = indices[start_idx:end_idx]
 
             # Get batch from expert dataset
             for idx in batch_indices:
-                state = expert_dataset['states'][idx]
-                action = expert_dataset['actions'][idx]
-                reward = expert_dataset['rewards'][idx]
-                next_state = expert_dataset['next_states'][idx]
-                image = expert_dataset['images'][idx]
+                state = expert_dataset["states"][idx]
+                action = expert_dataset["actions"][idx]
+                reward = expert_dataset["rewards"][idx]
+                next_state = expert_dataset["next_states"][idx]
+                image = expert_dataset["images"][idx]
 
-                # Train on this experience
-                loss = agent.update(state, action, reward, next_state, image, is_expert=True)
+                # Train on this experience (happens AFTER world.step, like online training)
+                loss = agent.update(
+                    state, action, reward, next_state, image, is_expert=True
+                )
                 if loss is not None:
                     epoch_losses.append(loss)
 
-        # Update progress
-        with training_lock:
-            current_epoch = epoch + 1
-            current_loss = np.mean(epoch_losses) if epoch_losses else 0.0
-
-        print(f"Epoch {current_epoch}/{NUM_EPOCHS} | Loss: {current_loss:.6f} | Expert buffer: {len(agent.expert_buffer)}")
+        # Log progress
+        avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
+        print(
+            f"Epoch {epoch+1}/{NUM_EPOCHS} | Loss: {avg_loss:.6f} | Expert buffer: {len(agent.expert_buffer)}"
+        )
 
         # Save checkpoint
         if (epoch + 1) % save_interval == 0:
             agent.save_model(MODEL_PATH)
             print(f"  → Checkpoint saved at epoch {epoch+1}\n")
 
-        # Signal main thread to do visualization
+        # Visualize learned policy in Isaac Sim
         if (epoch + 1) % VISUALIZATION_INTERVAL == 0:
-            with training_lock:
-                do_visualization = True
-                viz_epoch = epoch + 1
-            # Wait for visualization to complete
-            while do_visualization and training_active:
-                time.sleep(0.1)
-
-    print("\n✓ Training thread complete!")
-    training_active = False
-
-# Start training in background thread
-train_thread = threading.Thread(target=training_thread, daemon=True)
-train_thread.start()
-
-print("=" * 70)
-print("TRAINING IN BACKGROUND - UI remains responsive")
-print("Press Ctrl+C to stop")
-print("=" * 70 + "\n")
-
-step_count = 0
-last_report = time.time()
-
-try:
-    while simulation_app.is_running() and training_active:
-        my_world.step(render=True)
-        step_count += 1
-
-        # Check if visualization is requested
-        with training_lock:
-            should_viz = do_visualization
-            epoch = viz_epoch
-
-        if should_viz:
-            print(f"\n🎬 VISUALIZATION Epoch {epoch}: Testing learned policy...")
+            print(f"\n🎬 VISUALIZATION Epoch {epoch+1}: Testing learned policy...")
 
             # Reset robot
             initial_pos = np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0])
@@ -906,7 +896,12 @@ try:
             for _ in range(10):
                 my_world.step(render=False)
 
-            # Run 100 steps with learned policy
+            # Initialize video writer (overwrite same file each time)
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            video_writer = cv2.VideoWriter(VIDEO_PATH, fourcc, 30.0, (640, 480))
+            frames_recorded = 0
+
+            # Run 100 steps with learned policy (visualization only)
             for viz_step in range(100):
                 my_world.step(render=True)
 
@@ -935,15 +930,19 @@ try:
                 grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
                 state = np.concatenate([joint_positions, [grasped]])
 
-                # Get action from learned policy
+                # Get action from learned policy (deterministic=True for testing)
                 action = agent.get_action(state, image=rgb_image, deterministic=True)
 
                 # Execute action with RMPflow
                 delta_pos = action[:3] * 0.05
                 target_position = ee_pos + delta_pos
-                target_position = np.clip(target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0])
-                rmp_flow.set_end_effector_target(target_position=target_position, target_orientation=None)
-                actions = motion_policy.get_next_articulation_action(1.0/60.0)
+                target_position = np.clip(
+                    target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
+                )
+                rmp_flow.set_end_effector_target(
+                    target_position=target_position, target_orientation=None
+                )
+                actions = motion_policy.get_next_articulation_action(1.0 / 60.0)
                 robot.apply_action(actions)
 
                 # Gripper control
@@ -955,36 +954,38 @@ try:
                     current_joints = current_joints_raw.copy()
                 if len(current_joints) > 6:
                     current_gripper = current_joints[6]
-                    target_gripper = np.clip(current_gripper + gripper_action * 0.01, 0.0, 0.04)
+                    target_gripper = np.clip(
+                        current_gripper + gripper_action * 0.01, 0.0, 0.04
+                    )
                     current_joints[6] = target_gripper
                     robot.set_joint_positions(current_joints)
 
-            print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}])\n")
+                # Record frame to video (upscale from 84x84 to 640x480 for visibility)
+                frame_large = cv2.resize(
+                    rgb_image, (640, 480), interpolation=cv2.INTER_NEAREST
+                )
+                frame_bgr = cv2.cvtColor(frame_large, cv2.COLOR_RGB2BGR)
+                video_writer.write(frame_bgr)
+                frames_recorded += 1
 
-            # Signal visualization done
-            with training_lock:
-                do_visualization = False
-
-        # Report progress every 5 seconds
-        if time.time() - last_report > 5.0:
-            with training_lock:
-                print(f"[UI Active] Step {step_count} | Training Epoch: {current_epoch}/{NUM_EPOCHS} | Loss: {current_loss:.6f}")
-            last_report = time.time()
+            # Close video writer
+            video_writer.release()
+            print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}])")
+            print(f"📹 Video saved: {VIDEO_PATH} ({frames_recorded} frames)\n")
 
 except KeyboardInterrupt:
-    print("\n\nStopping training...")
-    training_active = False
-    train_thread.join(timeout=5.0)
+    print("\nOffline training interrupted by user")
     agent.save_model(MODEL_PATH)
     print("Model saved before exit")
 except Exception as e:
-    print(f"Error: {e}")
+    print(f"Error during training: {e}")
     import traceback
+
     traceback.print_exc()
-    training_active = False
     agent.save_model(MODEL_PATH)
+    print("Model saved after error")
 finally:
-    print(f"\n✓ Training complete!")
+    print(f"\n✓ Offline training complete!")
     print(f"✓ Final model saved to: {MODEL_PATH}")
     agent.save_model(MODEL_PATH)
 
