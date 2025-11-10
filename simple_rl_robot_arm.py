@@ -13,7 +13,7 @@ from isaacsim import SimulationApp
 # Initialize simulation
 simulation_app = SimulationApp(
     {
-        "headless": False,  # Changed to False to enable UI visualization
+        "headless": False,  # Enable UI visualization
         "width": 1280,
         "height": 720,
         # ray trace vs path trace: ray trace -> good performance -> path trace -> more real
@@ -270,8 +270,8 @@ class DiTAgent:
         self.use_vision = use_vision
         self.device = device
 
-        # Diffusion hyperparameters
-        self.num_diffusion_steps = 5
+        # Diffusion hyperparameters (enhanced: more steps for smoother denoising)
+        self.num_diffusion_steps = 10  # Increased from 5
         self.beta_start = 0.0001
         self.beta_end = 0.02
 
@@ -308,7 +308,7 @@ class DiTAgent:
         self.episode_count = 0
         self.total_reward_history = []
         self.loss_history = []  # Track training loss
-        self.noise_scale = 0.3  # Exploration noise
+        self.noise_scale = 0.1  # Reduced starting exploration noise
         self.step_count = 0  # Total training steps
 
     def get_action(self, state, image=None, deterministic=False):
@@ -375,11 +375,11 @@ class DiTAgent:
                     noise = torch.randn_like(action) * 0.1  # Reduced noise
                     action = action + noise
 
-            # Add exploration noise during training
+            # Add exploration noise during training (reduced)
             if not deterministic:
-                action = action + self.noise_scale * 0.1 * torch.randn_like(action)
+                action = action + self.noise_scale * 0.05 * torch.randn_like(action)
 
-            action = torch.clamp(action, -1.0, 1.0)  # Keep actions normalized
+            action = torch.clamp(action, -0.5, 0.5)  # Tighter action bounds
 
             # Final NaN check
             if torch.isnan(action).any():
@@ -463,8 +463,8 @@ class DiTAgent:
         self.loss_history.append(weighted_loss.item())
         self.step_count += 1
 
-        # Decay exploration noise - floor at 0.10 for bold exploration
-        self.noise_scale = max(0.10, self.noise_scale * 0.999)
+        # Decay exploration noise faster - floor at 0.05
+        self.noise_scale = max(0.05, self.noise_scale * 0.995)
 
         # Return loss for logging
         return weighted_loss.item()
@@ -504,7 +504,7 @@ class DiTAgent:
         buffer_list = model_data.get("buffer", [])
         self.buffer = deque(buffer_list, maxlen=self.buffer_size)
 
-        self.noise_scale = model_data.get("noise_scale", 0.3)
+        self.noise_scale = model_data.get("noise_scale", 0.1)
 
         print(f"Model loaded from {filepath}")
         print(
@@ -679,7 +679,7 @@ MODEL_PATH = "rl_robot_arm_model.pth"
 # Using Cartesian control: (x, y, z, gripper) - GitHub best practice for grasping
 # Simpler 4D action space instead of 12D joint control
 # UR10e has 12 DOF: 6 arm joints + 6 gripper joints (with mimic)
-state_dim = 13  # 12 joints + 1 cube_grasped
+state_dim = 16  # 12 joints + rel_pos 3 + grasped 1
 action_dim = 4  # dx, dy, dz, gripper
 
 agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=True)
@@ -713,9 +713,10 @@ print("✓ Simulation timeline started - UI will remain responsive\n")
 
 
 def compute_reward(ee_pos, ball_pos, gripper_pos, prev_dist):
-    """Simple reward: negative distance penalty + grasp bonus + small shaping"""
+    """Simple reward: negative distance penalty + grasp bonus + small shaping + height penalty"""
     dist = np.linalg.norm(ee_pos - ball_pos)
-    reward = -dist * 0.1  # Distance penalty
+    height_penalty = max(0, ee_pos[2] - 0.3) * -0.5  # Penalize high z (>30cm)
+    reward = -dist * 0.1 + height_penalty
     if dist < 0.05 and gripper_pos > 0.02:  # Grasp success
         reward += 10.0
     # Distance shaping
@@ -756,10 +757,11 @@ try:
             f"  {'[EVAL]' if is_eval else '[TRAIN]'} Episode {episode+1}: Running {EPISODE_LENGTH} steps (deterministic={deterministic})"
         )
 
-        for step in range(EPISODE_LENGTH):
-            my_world.step(render=True)
+        # Initial step after reset for first observation
+        my_world.step(render=True)
 
-            # Get current state and image
+        for step in range(EPISODE_LENGTH):
+            # Observe current state and image (before action)
             overhead_camera.get_current_frame()
             rgba_data = overhead_camera.get_rgba()
             if rgba_data is not None and rgba_data.size > 0:
@@ -780,18 +782,19 @@ try:
             ee_pos, _ = robot.end_effector.get_world_pose()
             ee_pos = np.array(ee_pos).flatten()
             gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
+            rel_pos = ball_pos - ee_pos  # Relative position (fix 1)
             grasped = float(
                 np.linalg.norm(ee_pos - ball_pos) < 0.15 and gripper_pos > 0.02
             )
-            state = np.concatenate([joint_positions, [grasped]])
+            state = np.concatenate([joint_positions, rel_pos, [grasped]])  # 16D state
 
             # Get action from learned policy
             action = agent.get_action(
                 state, image=rgb_image, deterministic=deterministic
             )
 
-            # Execute action with RMPflow
-            delta_pos = action[:3] * 0.05
+            # Execute action with RMPflow (smaller steps - fix 2)
+            delta_pos = action[:3] * 0.03
             target_position = ee_pos + delta_pos
             target_position = np.clip(
                 target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
@@ -817,18 +820,50 @@ try:
                 current_joints[6] = target_gripper
                 robot.set_joint_positions(current_joints)
 
-            # Compute reward and next state
-            reward, curr_dist = compute_reward(ee_pos, ball_pos, gripper_pos, prev_dist)
+            # Step physics
+            my_world.step(render=True)
+
+            # Observe next state (after action - fix 3)
+            overhead_camera.get_current_frame()
+            next_rgba_data = overhead_camera.get_rgba()
+            if next_rgba_data is not None and next_rgba_data.size > 0:
+                if len(next_rgba_data.shape) == 1:
+                    next_rgba_data = next_rgba_data.reshape(84, 84, 4)
+                next_rgb_image = next_rgba_data[:, :, :3].astype(np.uint8)
+            else:
+                next_rgb_image = np.zeros((84, 84, 3), dtype=np.uint8)
+
+            next_joint_positions_raw = robot.get_joint_positions()
+            if isinstance(next_joint_positions_raw, tuple):
+                next_joint_positions = next_joint_positions_raw[0]
+            else:
+                next_joint_positions = next_joint_positions_raw
+
+            next_ball_pos, _ = ball.get_world_pose()
+            next_ball_pos = np.array(next_ball_pos).flatten()
+            next_ee_pos, _ = robot.end_effector.get_world_pose()
+            next_ee_pos = np.array(next_ee_pos).flatten()
+            next_gripper_pos = (
+                next_joint_positions[6] if len(next_joint_positions) > 6 else 0.0
+            )
+            next_rel_pos = next_ball_pos - next_ee_pos
+            next_grasped = float(
+                np.linalg.norm(next_ee_pos - next_ball_pos) < 0.15
+                and next_gripper_pos > 0.02
+            )
+            next_state = np.concatenate(
+                [next_joint_positions, next_rel_pos, [next_grasped]]
+            )
+
+            # Compute reward using post-action positions (fix 3 + enhanced shaping - fix 6)
+            reward, curr_dist = compute_reward(
+                next_ee_pos, next_ball_pos, next_gripper_pos, prev_dist
+            )
             prev_dist = curr_dist
 
-            # Get next image (for consistency, but use current for update)
-            next_image = rgb_image  # Reuse for simplicity
-
-            # Store experience and train (during training episodes)
+            # Store experience and train (during training episodes, with true next_state)
             if not is_eval:
-                loss = agent.update(
-                    state, action, reward, state, rgb_image
-                )  # next_state ≈ state after apply
+                loss = agent.update(state, action, reward, next_state, next_rgb_image)
                 if step % 100 == 0 and loss is not None:
                     print(
                         f"    Step {step}: Loss={loss:.4f}, Reward={reward:.3f}, Dist={curr_dist:.3f}"
