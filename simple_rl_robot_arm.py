@@ -1,11 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """
 SUPER SIMPLE ONLINE RL Training - Minimal version for controlled training
 No vision, short episodes, basic logging. Focus on proprioception + relative pos.
 """
-
 # sim app
 from isaacsim import SimulationApp
 
@@ -18,7 +16,6 @@ simulation_app = SimulationApp(
         "renderer": "RayTracedLighting",
     }
 )
-
 import numpy as np
 import sys
 import os
@@ -37,6 +34,8 @@ from isaacsim.robot_motion.motion_generation import (
     ArticulationMotionPolicy,
     RmpFlow,
 )
+import random
+from isaacsim.core.api.objects import DynamicCuboid
 
 print("Super simple DiT with standard attention - no vision")
 
@@ -59,7 +58,6 @@ class MultiheadAttention(nn.Module):
         q = self.Wq(x).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
         k = self.Wk(x).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
         v = self.Wv(x).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
-
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.d_k)
         attn_probs = F.softmax(attn_scores, dim=-1)
         o = torch.matmul(attn_probs, v).transpose(1, 2).contiguous().view(B, T, D)
@@ -104,7 +102,6 @@ class DiffusionTransformer(nn.Module):
         super().__init__()
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
-
         self.time_embed = nn.Sequential(
             nn.Linear(1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)
         )
@@ -146,13 +143,13 @@ class DiTAgent:
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
         self.alphas_cumprod = torch.clamp(self.alphas_cumprod, min=1e-8, max=1.0)
-
         self.model = DiffusionTransformer(state_dim, action_dim).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
         self.buffer = deque(maxlen=5000)  # Smaller buffer
         self.batch_size = 32  # Smaller batch
         self.noise_scale = 0.1
         self.step_count = 0
+        self.update_freq = 10
 
     def get_action(self, state, deterministic=False):
         self.model.eval()
@@ -188,266 +185,223 @@ class DiTAgent:
     def update(self, state, action, reward, next_state):
         experience = (state, action, reward, next_state)
         self.buffer.append(experience)
-        if len(self.buffer) < self.batch_size:
-            return None
-        indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
-        batch = [self.buffer[i] for i in indices]
-        states = torch.FloatTensor(np.array([s for s, a, r, ns in batch])).to(
-            self.device
-        )
-        actions = torch.FloatTensor(np.array([a for s, a, r, ns in batch])).to(
-            self.device
-        )
-        rewards = torch.FloatTensor(np.array([r for s, a, r, ns in batch])).to(
-            self.device
-        )
-        self.model.train()
-        t = torch.randint(
-            0, self.num_diffusion_steps, (self.batch_size,), dtype=torch.long
-        ).to(self.device)
-        noise = torch.randn_like(actions)
-        alpha_cumprod_t = self.alphas_cumprod[t].view(-1, 1)
-        noisy_actions = (
-            torch.sqrt(alpha_cumprod_t + 1e-8) * actions
-            + torch.sqrt(1.0 - alpha_cumprod_t + 1e-8) * noise
-        )
-        timesteps = (t.float() / self.num_diffusion_steps).view(-1, 1)
-        predicted_noise = self.model(noisy_actions, states, timesteps)
-        per_sample_loss = F.mse_loss(predicted_noise, noise, reduction="none").mean(
-            dim=1
-        )
-        reward_weights = torch.sigmoid(rewards / 10.0)
-        weighted_loss = (per_sample_loss * reward_weights).mean()
-        self.optimizer.zero_grad()
-        weighted_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
         self.step_count += 1
-        self.noise_scale = max(0.05, self.noise_scale * 0.995)
-        return weighted_loss.item()
+        if (
+            len(self.buffer) >= self.batch_size
+            and self.step_count % self.update_freq == 0
+        ):
+            self._train()
 
-    def save_model(self, filepath):
-        torch.save(self.model.state_dict(), filepath)
-        print(f"Model saved to {filepath}")
+    def _train(self):
+        self.model.train()
+        batch_size = min(self.batch_size, len(self.buffer))
+        batch = random.sample(self.buffer, batch_size)
+        states = torch.tensor([exp[0] for exp in batch], dtype=torch.float32).to(
+            self.device
+        )
+        actions = torch.tensor([exp[1] for exp in batch], dtype=torch.float32).to(
+            self.device
+        )
+        timesteps_int = torch.randint(0, self.num_diffusion_steps, (batch_size,)).to(
+            self.device
+        )
+        timestep = (timesteps_int.float() / self.num_diffusion_steps).unsqueeze(-1)
+        noise = torch.randn(batch_size, self.action_dim).to(self.device)
+        sqrt_alpha_cumprod_t = self.alphas_cumprod[timesteps_int].sqrt().unsqueeze(-1)
+        sqrt_one_minus_alpha_cumprod_t = (
+            (1.0 - self.alphas_cumprod[timesteps_int]).sqrt().unsqueeze(-1)
+        )
+        noisy_actions = (
+            sqrt_alpha_cumprod_t * actions + sqrt_one_minus_alpha_cumprod_t * noise
+        )
+        predicted_noise = self.model(noisy_actions, states, timestep)
+        loss = F.mse_loss(predicted_noise, noise)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
-    def load_model(self, filepath):
-        if os.path.exists(filepath):
-            self.model.load_state_dict(torch.load(filepath, map_location=self.device))
-            print(f"Model loaded from {filepath}")
-            return True
-        return False
 
+# Main simulation and training loop
+device = "cuda" if torch.cuda.is_available() else "cpu"
+state_dim = 17  # 7 joint pos + 7 joint vel + 3 relative pos to target
+action_dim = 7  # joint position targets
+agent = DiTAgent(state_dim, action_dim, device)
 
-# Setup scene (minimal)
+world = World()
+world.scene.add_default_ground_plane()
 assets_root_path = get_assets_root_path()
-if assets_root_path is None:
-    carb.log_error("Could not find Isaac Sim assets folder")
-    simulation_app.close()
-    sys.exit()
 
-my_world = World(stage_units_in_meters=1.0)
-my_world.scene.add_default_ground_plane()
-
-set_camera_view(
-    eye=[2.5, 2.5, 2.0], target=[0.0, 0.0, 0.5], camera_prim_path="/OmniverseKit_Persp"
+# Add Franka robot
+franka_asset_path = os.path.join(
+    assets_root_path, "Isaac", "Robots", "Franka", "franka.usd"
 )
+add_reference_to_stage(franka_asset_path, "/World/Franka")
 
-# UR10e setup
-asset_path = (
-    assets_root_path
-    + "/Isaac/Samples/Rigging/Manipulator/configure_manipulator/ur10e/ur/ur_gripper.usd"
+# Setup manipulator (assuming no gripper for simple reaching)
+franka = SingleManipulator(
+    prim_path="/World/Franka",
+    name="franka",
+    end_effector_prim_path="/World/Franka/panda_right_hand",  # Adjust if needed
 )
-add_reference_to_stage(usd_path=asset_path, prim_path="/World/ur")
+world.scene.add(franka)
 
-gripper = ParallelGripper(
-    end_effector_prim_path="/World/ur/ee_link/robotiq_arg2f_base_link",
-    joint_prim_names=["finger_joint"],
-    joint_opened_positions=np.array([0]),
-    joint_closed_positions=np.array([40]),
-    action_deltas=np.array([-40]),
-    use_mimic_joints=True,
+# Add target object (simple cube using DynamicCuboid) - FIXED
+target = DynamicCuboid(
+    prim_path="/World/target",
+    name="target",
+    position=np.array([0.5, 0.0, 0.5]),
+    size=0.1,  # Single float value instead of numpy array
 )
+world.scene.add(target)
 
-robot = SingleManipulator(
-    prim_path="/World/ur",
-    name="ur10_robot",
-    end_effector_prim_path="/World/ur/ee_link/robotiq_arg2f_base_link",
-    gripper=gripper,
-)
+# Set camera view
+set_camera_view(eye=np.array([1.2, 1.2, 1.0]), target=np.array([0.5, 0.0, 0.5]))
 
-from isaacsim.core.api.objects import DynamicCuboid
-from pxr import Gf, UsdLux
-import isaacsim.robot_motion.motion_generation as mg
+# Reset world
+world.reset()
 
-# Cube
-cube_size = 0.0515
-cube = DynamicCuboid(
-    name="red_cube",
-    position=np.array([0.5, 0.2, cube_size / 2.0]),
-    orientation=np.array([1, 0, 0, 0]),
-    prim_path="/World/Cube",
-    scale=np.array([cube_size, cube_size, cube_size]),
-    size=1.0,
-    color=np.array([1.0, 0.0, 0.0]),
-)
-my_world.scene.add(cube)
-ball = cube
+# Home position for Franka (example)
+home_pos = np.array(
+    [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
+)  # Standard Franka home
+franka.set_joint_positions(home_pos)
+world.step(render=True)
 
-# Lighting
-stage = my_world.stage
-dome_light = UsdLux.DomeLight.Define(stage, "/World/DomeLight")
-dome_light.CreateIntensityAttr(1000.0)
-distant_light = UsdLux.DistantLight.Define(stage, "/World/DistantLight")
-distant_light.CreateIntensityAttr(2000.0)
-distant_light_xform = distant_light.AddRotateXYZOp()
-distant_light_xform.Set(Gf.Vec3f(-45, 0, 0))
+# Training parameters
+num_episodes = 100
+max_steps = 200
+target_pos = np.array(
+    [0.5, 0.0, 0.5]
+)  # Fixed target for simplicity; randomize in future
+target_orientation = np.array([1.0, 0.0, 0.0, 0.0])
 
-my_world.reset()
-robot.initialize()
-ball.initialize()
+print("Starting training...")
+success_count = 0
+best_distance = float("inf")
 
-# RMPflow
-rmpflow_dir = os.path.join(os.path.dirname(__file__), "rmpflow")
-rmp_flow = mg.lula.motion_policies.RmpFlow(
-    robot_description_path=os.path.join(rmpflow_dir, "robot_descriptor.yaml"),
-    rmpflow_config_path=os.path.join(rmpflow_dir, "ur10e_rmpflow_common.yaml"),
-    urdf_path=os.path.join(rmpflow_dir, "ur10e.urdf"),
-    end_effector_frame_name="ee_link_robotiq_arg2f_base_link",
-    maximum_substep_size=0.00334,
-)
-physics_dt = 1.0 / 60.0
-motion_policy = ArticulationMotionPolicy(robot, rmp_flow, physics_dt)
+for episode in range(num_episodes):
+    world.reset()
+    target.set_world_pose(position=target_pos, orientation=target_orientation)
+    # Reset to home
+    franka.set_joint_positions(home_pos)
+    world.step(render=True)
 
-# Params
-MODEL_PATH = "simple_model.pth"
-state_dim = 16  # 12 joints + 3 rel_pos + 1 grasped
-action_dim = 4
-agent = DiTAgent(state_dim, action_dim)
-agent.load_model(MODEL_PATH)
+    episode_reward = 0.0
+    done = False
+    step = 0
+    episode_success = False
 
-NUM_EPISODES = 200  # Short for control
-EPISODE_LENGTH = 200  # Short episodes
+    while not done and step < max_steps:
+        # Get state: joint pos (7), joint vel (7), rel pos (3)
+        joint_pos = franka.get_joint_positions()
+        joint_vel = franka.get_joint_velocities()
+        ee_pose = franka.end_effector.get_world_pose()
+        ee_pos = ee_pose[0]
+        rel_pos = target_pos - ee_pos
+        state = np.concatenate([joint_pos, joint_vel, rel_pos])
 
-print("\n=== SIMPLE TRAINING START ===")
-print(f"Episodes: {NUM_EPISODES}, Length: {EPISODE_LENGTH}")
-my_world.play()
+        # Gradually reduce exploration noise
+        current_noise_scale = max(0.01, agent.noise_scale * (0.99**episode))
+        agent.noise_scale = current_noise_scale
 
+        action = agent.get_action(state)
 
-def compute_reward(ee_pos, ball_pos, gripper_pos, prev_dist):
-    dist = np.linalg.norm(ee_pos - ball_pos)
-    reward = -dist * 0.1
-    if dist < 0.05 and gripper_pos > 0.02:
-        reward += 10.0
-    reward += (prev_dist - dist) * 0.01 - 0.01
-    return reward, dist
+        # Apply action (joint position targets)
+        franka.set_joint_positions(action)
+        world.step(render=True)
 
+        # Get next state
+        next_joint_pos = franka.get_joint_positions()
+        next_joint_vel = franka.get_joint_velocities()
+        next_ee_pose = franka.end_effector.get_world_pose()
+        next_ee_pos = next_ee_pose[0]
+        next_rel_pos = target_pos - next_ee_pos
+        next_state = np.concatenate([next_joint_pos, next_joint_vel, next_rel_pos])
 
-try:
-    for episode in range(NUM_EPISODES):
-        # Reset
-        initial_pos = np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0])
-        gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        robot.set_joint_positions(np.concatenate([initial_pos, gripper_open]))
-        cube_x = np.random.uniform(0.45, 0.55)  # Closer spawn for control
-        cube_y = np.random.uniform(-0.1, 0.1)
-        ball.set_world_pose(position=np.array([cube_x, cube_y, cube_size / 2.0]))
-        for _ in range(10):
-            my_world.step(render=False)
+        # Improved reward function
+        dist = np.linalg.norm(next_rel_pos)
+        prev_dist = np.linalg.norm(rel_pos)
 
-        episode_reward = 0
-        prev_dist = 1.0
-        deterministic = episode % 50 == 0  # Eval every 50
+        # Distance reward + progress reward + success bonus
+        reward = -dist * 2.0  # Base distance penalty
+        reward += (prev_dist - dist) * 5.0  # Progress bonus
 
-        my_world.step(render=True)  # First step
+        if dist < 0.05:
+            reward += 20.0
+            done = True
+            episode_success = True
+            success_count += 1
+            print(f"SUCCESS! Reached target in {step} steps")
 
-        for step in range(EPISODE_LENGTH):
-            # Current obs
-            joint_positions = robot.get_joint_positions()
-            if isinstance(joint_positions, tuple):
-                joint_positions = joint_positions[0]
-            ball_pos = np.array(ball.get_world_pose()[0]).flatten()
-            ee_pos = np.array(robot.end_effector.get_world_pose()[0]).flatten()
-            gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
-            rel_pos = ball_pos - ee_pos
-            grasped = float(
-                np.linalg.norm(ee_pos - ball_pos) < 0.15 and gripper_pos > 0.02
-            )
-            state = np.concatenate([joint_positions, rel_pos, [grasped]])
+        # Penalty for large actions to encourage smooth movements
+        action_penalty = np.linalg.norm(action) * 0.01
+        reward -= action_penalty
 
-            # Act
-            action = agent.get_action(state, deterministic=deterministic)
+        agent.update(state, action, reward, next_state)
+        episode_reward += reward
 
-            # Execute
-            delta_pos = action[:3] * 0.03
-            target_position = ee_pos + delta_pos
-            target_position = np.clip(
-                target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
-            )
-            rmp_flow.set_end_effector_target(
-                target_position=target_position, target_orientation=None
-            )
-            actions = motion_policy.get_next_articulation_action(physics_dt)
-            robot.apply_action(actions)
+        # Update best distance
+        if dist < best_distance:
+            best_distance = dist
 
-            # Gripper
-            gripper_action = np.clip(action[3], -1.0, 1.0)
-            current_joints = robot.get_joint_positions()
-            if isinstance(current_joints, tuple):
-                current_joints = current_joints[0].copy()
-            else:
-                current_joints = current_joints.copy()
-            if len(current_joints) > 6:
-                current_gripper = current_joints[6]
-                target_gripper = np.clip(
-                    current_gripper + gripper_action * 0.01, 0.0, 0.04
-                )
-                current_joints[6] = target_gripper
-                robot.set_joint_positions(current_joints)
+        state = next_state
+        step += 1
 
-            # Step & next obs
-            my_world.step(render=True)
-            next_joint_positions = robot.get_joint_positions()
-            if isinstance(next_joint_positions, tuple):
-                next_joint_positions = next_joint_positions[0]
-            next_ball_pos = np.array(ball.get_world_pose()[0]).flatten()
-            next_ee_pos = np.array(robot.end_effector.get_world_pose()[0]).flatten()
-            next_gripper_pos = (
-                next_joint_positions[6] if len(next_joint_positions) > 6 else 0.0
-            )
-            next_rel_pos = next_ball_pos - next_ee_pos
-            next_grasped = float(
-                np.linalg.norm(next_ee_pos - next_ball_pos) < 0.15
-                and next_gripper_pos > 0.02
-            )
-            next_state = np.concatenate(
-                [next_joint_positions, next_rel_pos, [next_grasped]]
-            )
+        if step >= max_steps:
+            done = True
 
-            # Reward
-            reward, curr_dist = compute_reward(
-                next_ee_pos, next_ball_pos, next_gripper_pos, prev_dist
-            )
-            prev_dist = curr_dist
+    success_rate = (success_count / (episode + 1)) * 100
+    print(
+        f"Episode {episode + 1}: Reward = {episode_reward:.2f}, Final dist = {dist:.3f}, "
+        f"Success = {episode_success}, Success Rate = {success_rate:.1f}%"
+    )
 
-            # Update
-            loss = agent.update(state, action, reward, next_state)
-            if step % 50 == 0:
-                print(
-                    f"Ep {episode+1} Step {step}: R={reward:.2f} D={curr_dist:.2f} L={loss:.4f if loss else 'N/A'}"
-                )
+    # Early stopping if consistently successful
+    if success_count >= 10 and episode >= 20:
+        print("Good performance achieved! Stopping early.")
+        break
 
-            episode_reward += reward
+print(f"Training complete. Final success rate: {success_rate:.1f}%")
+print(f"Best distance achieved: {best_distance:.3f}")
+print(f"Total successes: {success_count}/{episode + 1}")
 
-        avg_reward = episode_reward / EPISODE_LENGTH
-        print(f"Episode {episode+1}: Avg R = {avg_reward:.3f}")
+# Test the trained agent
+print("\nTesting trained agent...")
+for test_episode in range(3):
+    world.reset()
+    target.set_world_pose(position=target_pos, orientation=target_orientation)
+    franka.set_joint_positions(home_pos)
+    world.step(render=True)
 
-        if (episode + 1) % 50 == 0:
-            agent.save_model(MODEL_PATH)
+    test_reward = 0.0
+    done = False
+    step = 0
 
-except KeyboardInterrupt:
-    print("\nInterrupted")
-    agent.save_model(MODEL_PATH)
-finally:
-    my_world.stop()
-    my_world.clear()
-    simulation_app.close()
+    while not done and step < max_steps:
+        joint_pos = franka.get_joint_positions()
+        joint_vel = franka.get_joint_velocities()
+        ee_pose = franka.end_effector.get_world_pose()
+        ee_pos = ee_pose[0]
+        rel_pos = target_pos - ee_pos
+        state = np.concatenate([joint_pos, joint_vel, rel_pos])
+
+        # Use deterministic actions for testing
+        action = agent.get_action(state, deterministic=True)
+        franka.set_joint_positions(action)
+        world.step(render=True)
+
+        dist = np.linalg.norm(rel_pos)
+        test_reward -= dist
+
+        if dist < 0.05:
+            print(f"Test {test_episode + 1}: SUCCESS in {step} steps!")
+            done = True
+
+        step += 1
+
+    if not done:
+        print(
+            f"Test {test_episode + 1}: Failed to reach target (final dist: {dist:.3f})"
+        )
+
+simulation_app.close()
