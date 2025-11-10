@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-OFFLINE RL Training - Train on expert_dataset.pkl
-The robot learns to grasp from pre-collected expert demonstrations.
-No online data collection - pure behavioral cloning with Diffusion Policy.
+ONLINE RL Training - Train on real-time data collection
+The robot learns to grasp from online experiences using exploration.
+Pure online RL with Diffusion Policy using standard Transformer.
 """
 
 # sim app
@@ -13,7 +13,7 @@ from isaacsim import SimulationApp
 # Initialize simulation
 simulation_app = SimulationApp(
     {
-        "headless": True,
+        "headless": False,  # Changed to False to enable UI visualization
         "width": 1280,
         "height": 720,
         # ray trace vs path trace: ray trace -> good performance -> path trace -> more real
@@ -30,7 +30,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import cv2  # For video recording
 from collections import deque
-import pickle
 from isaacsim.core.api import World
 from isaacsim.core.prims import RigidPrim
 from isaacsim.core.utils.stage import add_reference_to_stage
@@ -44,87 +43,50 @@ from isaacsim.robot_motion.motion_generation import (
     RmpFlow,
 )
 
-# Note: Using Kimi Linear Attention (RecurrentKDA) in DiTBlocks for O(n) complexity
-print("Using Kimi Linear Attention (RecurrentKDA) for efficient transformers")
+print("Using standard Multi-Head Attention for simple transformers")
 
 
-# Kimi Linear Attention (RecurrentKDA)
-class RecurrentKDA(nn.Module):
-    """Simplified recurrent KDA (Eq. 1) for causal self-attention with O(n) complexity."""
+# Standard Multi-Head Attention
+class MultiheadAttention(nn.Module):
+    """Standard multi-head self-attention with O(n^2) complexity."""
 
     def __init__(self, d_model: int, num_heads: int = 4):
         super().__init__()
+        assert d_model % num_heads == 0
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads
         self.Wq = nn.Linear(d_model, d_model, bias=False)
         self.Wk = nn.Linear(d_model, d_model, bias=False)
         self.Wv = nn.Linear(d_model, d_model, bias=False)
-        self.Wg = nn.Linear(
-            d_model, d_model, bias=False
-        )  # For alpha (sigmoid -> [0,1])
-        self.Wbeta = nn.Linear(d_model, num_heads, bias=False)  # Per-head beta
         self.Wo = nn.Linear(d_model, d_model, bias=False)
-        self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, x: torch.Tensor, state: torch.Tensor = None):
+    def forward(self, x: torch.Tensor):
         B, T, D = x.shape
-        if state is None:
-            state = torch.zeros(B, self.num_heads, self.d_k, self.d_k, device=x.device)
+        q = self.Wq(x).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
+        k = self.Wk(x).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
+        v = self.Wv(x).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
 
-        x_norm = self.norm(x)
-        q = self.Wq(x_norm).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
-        k = self.Wk(x_norm).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
-        v = self.Wv(x_norm).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
-        g = (
-            torch.sigmoid(self.Wg(x_norm))
-            .view(B, T, self.num_heads, self.d_k)
-            .transpose(1, 2)
-        )  # Diag(alpha)
-        beta_all = torch.sigmoid(self.Wbeta(x_norm))  # [B, T, num_heads]
-
-        new_states = []
-        outputs = []
-        for t in range(T):
-            # Recurrent step (causal: only up to t)
-            q_t = q[:, :, t]  # [B, H, d_k]
-            k_t = k[:, :, t]
-            v_t = v[:, :, t]
-            alpha_t = g[:, :, t]
-            beta_t = beta_all[:, t, :].unsqueeze(-1).unsqueeze(-1)  # [B, H, 1, 1]
-
-            S_t = state + beta_t * torch.einsum(
-                "b h d, b h e -> b h d e", k_t, v_t
-            )  # Simplified update
-            S_t = (
-                torch.eye(self.d_k, device=x.device)[None, None]
-                - beta_t * torch.einsum("b h d, b h e -> b h d e", k_t, k_t)
-            ) @ (alpha_t.unsqueeze(-1) * S_t)
-            o_t = torch.einsum("b h d, b h d e -> b h e", q_t, S_t)
-            outputs.append(o_t)
-            new_states.append(S_t)
-            state = S_t  # Update for next
-
-        o = (
-            torch.stack(outputs, dim=2).transpose(1, 2).contiguous().view(B, T, D)
-        )  # [B,T,D]
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.d_k)
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        o = torch.matmul(attn_probs, v).transpose(1, 2).contiguous().view(B, T, D)
         o = self.Wo(o)
-        final_state = new_states[-1]  # Last state for next sequence
-        return x + o, final_state  # Residual
+        return o
 
 
-# Diffusion Transformer for continuous action generation
+# Diffusion Transformer Block with standard attention
 class DiTBlock(nn.Module):
-    """Transformer block with adaptive layer norm and Kimi Linear Attention for diffusion timestep conditioning"""
+    """Transformer block with adaptive layer norm and standard Multi-Head Attention"""
 
     def __init__(self, hidden_dim, num_heads=4):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
 
-        # Use Kimi Linear Attention instead of quadratic attention
-        self.kimi_attn = RecurrentKDA(hidden_dim, num_heads)
+        # Standard multi-head attention
+        self.attn = MultiheadAttention(hidden_dim, num_heads)
 
+        self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
@@ -133,31 +95,30 @@ class DiTBlock(nn.Module):
         )
         # Adaptive modulation parameters
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_dim, 4 * hidden_dim)  # Reduced from 6 to 4
+            nn.SiLU(), nn.Linear(hidden_dim, 4 * hidden_dim)
         )
 
-    def forward(self, x, c, kimi_state=None):
+    def forward(self, x, c):
         """
         x: input tokens [batch, seq_len, hidden_dim]
         c: conditioning (timestep + state) [batch, hidden_dim]
-        kimi_state: recurrent state for Kimi attention
         """
         scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(
             4, dim=-1
         )
 
-        # Kimi Linear Attention with adaptive modulation
-        x_scaled = x * (1 + scale_msa.unsqueeze(1))
-        attn_out, new_kimi_state = self.kimi_attn(x_scaled, kimi_state)
-        # attn_out already has residual from kimi_attn, just apply gate
-        x = attn_out * gate_msa.unsqueeze(1)
+        # Attention with adaptive modulation
+        x_norm1 = self.norm1(x)
+        x_norm1 = x_norm1 * (1 + scale_msa.unsqueeze(1))
+        attn_out = self.attn(x_norm1)
+        x = x + attn_out * gate_msa.unsqueeze(1)
 
         # MLP with adaptive modulation
-        x_norm = self.norm2(x)
-        x_norm = x_norm * (1 + scale_mlp.unsqueeze(1))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm)
+        x_norm2 = self.norm2(x)
+        x_norm2 = x_norm2 * (1 + scale_mlp.unsqueeze(1))
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm2)
 
-        return x, new_kimi_state
+        return x
 
 
 class SimpleCNN(nn.Module):
@@ -280,10 +241,9 @@ class DiffusionTransformer(nn.Module):
         # Action as sequence (can be extended to multiple tokens)
         x = a_emb.unsqueeze(1)  # [batch, 1, hidden_dim]
 
-        # Apply transformer blocks with Kimi linear attention
-        kimi_state = None
+        # Apply transformer blocks with standard attention
         for block in self.blocks:
-            x, kimi_state = block(x, c, kimi_state)
+            x = block(x, c)
 
         # Predict noise
         x = x.squeeze(1)  # [batch, hidden_dim]
@@ -310,8 +270,8 @@ class DiTAgent:
         self.use_vision = use_vision
         self.device = device
 
-        # Diffusion hyperparameters (using KDA wrapper settings)
-        self.num_diffusion_steps = 5  # Increased for better quality with KDA
+        # Diffusion hyperparameters
+        self.num_diffusion_steps = 5
         self.beta_start = 0.0001
         self.beta_end = 0.02
 
@@ -328,7 +288,7 @@ class DiTAgent:
         # Clamp to avoid numerical issues
         self.alphas_cumprod = torch.clamp(self.alphas_cumprod, min=1e-8, max=1.0)
 
-        # Initialize KDA DiffusionTransformer with vision
+        # Initialize DiffusionTransformer with vision
         self.model = DiffusionTransformer(
             state_dim=state_dim,
             action_dim=action_dim,
@@ -343,10 +303,6 @@ class DiTAgent:
         self.buffer = deque(maxlen=10000)
         self.buffer_size = 10000
         self.batch_size = 64
-
-        # Expert demonstration tracking
-        self.expert_buffer = deque(maxlen=3000)  # Keep last 3000 expert experiences
-        self.expert_sample_ratio = 0.3  # 30% of each batch from expert demos
 
         # Training stats
         self.episode_count = 0
@@ -432,52 +388,22 @@ class DiTAgent:
 
         return action.cpu().numpy()[0]
 
-    def update(self, state, action, reward, next_state, image=None, is_expert=False):
+    def update(self, state, action, reward, next_state, image=None):
         """Store experience and train the diffusion model"""
         # Only store experiences with valid vision data
         if self.use_vision and (image is None or image.size == 0 or np.all(image == 0)):
             return  # Skip invalid vision experiences
 
         experience = (state, action, reward, next_state, image)
-
-        # Add to appropriate buffer
         self.buffer.append(experience)
-        if is_expert:
-            self.expert_buffer.append(experience)  # Also store in expert buffer
 
         # Train if enough samples
         if len(self.buffer) < self.batch_size:
             return
 
-        # === PRIORITIZED SAMPLING: Mix expert + RL experiences ===
-        # Sample 30% from expert buffer, 70% from main buffer
-        num_expert_samples = int(self.batch_size * self.expert_sample_ratio)
-
-        batch = []
-
-        # Sample from expert buffer if available
-        if len(self.expert_buffer) > 0 and num_expert_samples > 0:
-            expert_indices = np.random.choice(
-                len(self.expert_buffer),
-                min(num_expert_samples, len(self.expert_buffer)),
-                replace=False,
-            )
-            batch.extend([self.expert_buffer[i] for i in expert_indices])
-
-        # Fill remaining with RL experiences
-        remaining_needed = self.batch_size - len(batch)
-        if self.use_vision:
-            valid_indices = [
-                i for i in range(len(self.buffer)) if self.buffer[i][4] is not None
-            ]
-            if len(valid_indices) < remaining_needed:
-                return  # Not enough valid samples
-            indices = np.random.choice(valid_indices, remaining_needed, replace=False)
-        else:
-            indices = np.random.choice(
-                len(self.buffer), remaining_needed, replace=False
-            )
-        batch.extend([self.buffer[i] for i in indices])
+        # Sample batch from buffer
+        indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
+        batch = [self.buffer[i] for i in indices]
 
         # Convert to tensors
         states = torch.FloatTensor(np.array([s for s, a, r, ns, img in batch])).to(
@@ -494,7 +420,6 @@ class DiTAgent:
         images_tensor = None
         if self.use_vision:
             images = [img for s, a, r, ns, img in batch]
-            # All images should be valid now due to filtering in update()
             images_tensor = torch.FloatTensor(np.stack(images)).to(self.device) / 255.0
 
         # Diffusion training
@@ -555,14 +480,11 @@ class DiTAgent:
             "buffer": list(self.buffer)[
                 -1000:
             ],  # Convert deque to list, save last 1000
-            "expert_buffer": list(self.expert_buffer),  # Save ALL expert demos
             "noise_scale": self.noise_scale,
             "step_count": self.step_count,
         }
         torch.save(model_data, filepath)
-        print(
-            f"Model saved to {filepath} (including {len(self.expert_buffer)} expert demos)"
-        )
+        print(f"Model saved to {filepath} (buffer size: {len(self.buffer)})")
 
     def load_model(self, filepath):
         """Load agent state from file"""
@@ -582,15 +504,11 @@ class DiTAgent:
         buffer_list = model_data.get("buffer", [])
         self.buffer = deque(buffer_list, maxlen=self.buffer_size)
 
-        # Load expert buffer
-        expert_buffer_list = model_data.get("expert_buffer", [])
-        self.expert_buffer = deque(expert_buffer_list, maxlen=3000)
-
         self.noise_scale = model_data.get("noise_scale", 0.3)
 
         print(f"Model loaded from {filepath}")
         print(
-            f"Resuming from episode {self.episode_count}, step {self.step_count}, buffer size: {len(self.buffer)}, expert demos: {len(self.expert_buffer)}"
+            f"Resuming from episode {self.episode_count}, step {self.step_count}, buffer size: {len(self.buffer)}"
         )
         return True
 
@@ -664,7 +582,9 @@ create_prim(side_camera_prim_path, "Camera")
 # Position camera MUCH farther back to see entire scene
 eye_side = Gf.Vec3d(3.5, 3.5, 2.5)  # Very far back and high - full scene view
 target_side = Gf.Vec3d(0.0, 0.0, 0.5)  # Look at center of robot
-set_camera_view(eye=eye_side, target=target_side, camera_prim_path=side_camera_prim_path)
+set_camera_view(
+    eye=eye_side, target=target_side, camera_prim_path=side_camera_prim_path
+)
 camera_prim_side = my_world.stage.GetPrimAtPath(side_camera_prim_path)
 camera_prim_side.GetAttribute("horizontalAperture").Set(50.0)  # Very wide FOV
 camera_prim_side.GetAttribute("verticalAperture").Set(37.5)  # 16:9 aspect ratio
@@ -767,45 +687,20 @@ agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=True)
 # Try to load existing model
 agent.load_model(MODEL_PATH)
 
-# === LOAD EXPERT DATASET ===
-DATASET_PATH = "synthetic_dataset.pkl"
-print("\n" + "=" * 70)
-print(" LOADING EXPERT DATASET FOR OFFLINE TRAINING")
-print("=" * 70)
-
-if not os.path.exists(DATASET_PATH):
-    print(f"\n❌ ERROR: Dataset not found at {DATASET_PATH}")
-    print("Please run: python collect_expert_dataset.py")
-    print("=" * 70)
-    simulation_app.close()
-    sys.exit(1)
-
-print(f"\nLoading dataset from {DATASET_PATH}...")
-with open(DATASET_PATH, "rb") as f:
-    expert_dataset = pickle.load(f)
-
-print(f"✓ Dataset loaded successfully!")
-print(f"  Total experiences: {len(expert_dataset['states'])}")
-print(f"  State shape: {expert_dataset['states'].shape}")
-print(f"  Action shape: {expert_dataset['actions'].shape}")
-print(f"  Image shape: {expert_dataset['images'].shape}")
-print("=" * 70 + "\n")
-
-# Old expert seeding functions removed - using pre-collected dataset instead
-
-# Training parameters
-NUM_EPOCHS = 200
-VISUALIZATION_INTERVAL = 1  # Visualize learned policy every 1 epoch
-RECORD_VIDEO_AFTER_EPOCH = 1  # Record video from epoch 1 onwards
-save_interval = 10  # Save model every 10 epochs
-VIDEO_PATH = "/home/kenpeter/work/robot/policy_visualization.mp4"  # Overwrite same file
+# Online Training parameters
+NUM_EPISODES = 1000
+EPISODE_LENGTH = 500  # Steps per episode
+EVAL_INTERVAL = 50  # Evaluate and record video every N episodes
+TRAIN_EVERY = 4  # Train every N steps
+VIDEO_BASE_PATH = "/home/kenpeter/work/robot/policy_visualization"
 
 print("\n" + "=" * 70)
-print(" STARTING OFFLINE TRAINING")
+print(" STARTING ONLINE TRAINING")
 print("=" * 70)
-print(f"Training on {len(expert_dataset['states'])} expert experiences")
-print(f"Epochs: {NUM_EPOCHS}")
-print(f"Visualization every: {VISUALIZATION_INTERVAL} epochs")
+print(f"Episodes: {NUM_EPISODES}")
+print(f"Episode length: {EPISODE_LENGTH} steps")
+print(f"Train every: {TRAIN_EVERY} steps")
+print(f"Evaluate every: {EVAL_INTERVAL} episodes")
 print(f"Model will be saved to: {MODEL_PATH}\n")
 
 # CRITICAL: Start the simulation timeline so my_world.step() doesn't block!
@@ -816,197 +711,177 @@ print(f"[DEBUG] World is playing: {my_world.is_playing()}")
 print(f"[DEBUG] World is stopped: {my_world.is_stopped()}")
 print("✓ Simulation timeline started - UI will remain responsive\n")
 
+
+def compute_reward(ee_pos, ball_pos, gripper_pos, prev_dist):
+    """Simple reward: negative distance penalty + grasp bonus + small shaping"""
+    dist = np.linalg.norm(ee_pos - ball_pos)
+    reward = -dist * 0.1  # Distance penalty
+    if dist < 0.05 and gripper_pos > 0.02:  # Grasp success
+        reward += 10.0
+    # Distance shaping
+    reward += (prev_dist - dist) * 0.01
+    reward -= 0.01  # Living penalty
+    return reward, dist
+
+
 try:
-    batch_count = 0  # Track total batches for UI updates
-    for epoch in range(NUM_EPOCHS):
-        print(f"\n[DEBUG] ===== Starting Epoch {epoch+1}/{NUM_EPOCHS} =====")
-        # Train on entire expert dataset
-        num_samples = len(expert_dataset["states"])
-        indices = np.random.permutation(num_samples)
-        epoch_losses = []
+    for episode in range(NUM_EPISODES):
+        print(f"\n[DEBUG] ===== Starting Episode {episode+1}/{NUM_EPISODES} =====")
 
-        # Train on batches from expert dataset
-        batch_in_epoch = 0
-        for start_idx in range(0, num_samples, agent.batch_size):
-            batch_in_epoch += 1
-            batch_count += 1
+        # Reset robot to initial pose
+        initial_pos = np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0])
+        gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        robot.set_joint_positions(np.concatenate([initial_pos, gripper_open]))
 
-            # *** KEY FIX: Update UI FIRST (like online training) ***
-            if batch_count % 5 == 0:
-                print(f"[DEBUG] Batch {batch_count}: Updating UI BEFORE training...")
-                # Add visual feedback - wiggle the cube
-                current_pos, current_rot = ball.get_world_pose()
-                import math
+        # Reset cube to random position
+        cube_x = np.random.uniform(0.4, 0.6)
+        cube_y = np.random.uniform(-0.3, 0.3)
+        cube_z = cube_size / 2.0
+        ball.set_world_pose(position=np.array([cube_x, cube_y, cube_z]))
 
-                wiggle = math.sin(batch_count * 0.1) * 0.02
-                ball.set_world_pose(
-                    position=np.array(
-                        [current_pos[0] + wiggle, current_pos[1], current_pos[2]]
-                    )
-                )
+        # Stabilize
+        for _ in range(10):
+            my_world.step(render=False)
 
-                # Step world FIRST, before training (like online training - NO simulation_app.update!)
-                my_world.step(render=True)
-                print(f"[DEBUG] Batch {batch_count}: UI updated, starting training...")
+        episode_reward = 0
+        prev_dist = 1.0  # Initial distance
+        is_eval = (episode + 1) % EVAL_INTERVAL == 0
+        deterministic = is_eval
+        video_writer = None
+        frames_recorded = 0
+        video_frames_buffer = []  # Store frames in memory for eval
+        RECORD_LAST_N_STEPS = 100  # Record only last N steps during eval
 
-            if batch_in_epoch == 1:
-                print(f"[DEBUG] Epoch {epoch+1}: Processing first batch...")
-
-            end_idx = min(start_idx + agent.batch_size, num_samples)
-            batch_indices = indices[start_idx:end_idx]
-
-            # Get batch from expert dataset
-            for idx in batch_indices:
-                state = expert_dataset["states"][idx]
-                action = expert_dataset["actions"][idx]
-                reward = expert_dataset["rewards"][idx]
-                next_state = expert_dataset["next_states"][idx]
-                image = expert_dataset["images"][idx]
-
-                # Train on this experience (happens AFTER world.step, like online training)
-                loss = agent.update(
-                    state, action, reward, next_state, image, is_expert=True
-                )
-                if loss is not None:
-                    epoch_losses.append(loss)
-
-        # Log progress
-        avg_loss = np.mean(epoch_losses) if epoch_losses else 0.0
         print(
-            f"Epoch {epoch+1}/{NUM_EPOCHS} | Loss: {avg_loss:.6f} | Expert buffer: {len(agent.expert_buffer)}"
+            f"  {'[EVAL]' if is_eval else '[TRAIN]'} Episode {episode+1}: Running {EPISODE_LENGTH} steps (deterministic={deterministic})"
         )
 
-        # Save checkpoint
-        if (epoch + 1) % save_interval == 0:
-            agent.save_model(MODEL_PATH)
-            print(f"  → Checkpoint saved at epoch {epoch+1}\n")
+        for step in range(EPISODE_LENGTH):
+            my_world.step(render=True)
 
-        # Visualize learned policy in Isaac Sim
-        if (epoch + 1) % VISUALIZATION_INTERVAL == 0:
-            print(f"\n🎬 VISUALIZATION Epoch {epoch+1}: Testing learned policy...")
-
-            # Reset robot
-            initial_pos = np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0])
-            gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            robot.set_joint_positions(np.concatenate([initial_pos, gripper_open]))
-
-            # Reset cube to random position
-            cube_size = 0.0515
-            cube_x = np.random.uniform(0.4, 0.6)
-            cube_y = np.random.uniform(-0.3, 0.3)
-            cube_z = cube_size / 2.0
-            ball.set_world_pose(position=np.array([cube_x, cube_y, cube_z]))
-
-            # Stabilize
-            for _ in range(10):
-                my_world.step(render=False)
-
-            # Only record video after epoch RECORD_VIDEO_AFTER_EPOCH
-            video_writer = None
-            frames_recorded = 0
-            video_frames_buffer = []  # Store frames in memory
-            TOTAL_VIZ_STEPS = 4800  # Match the expert dataset episode length
-            RECORD_LAST_N_STEPS = 200  # Record only last 200 steps to see final result
-
-            if (epoch + 1) >= RECORD_VIDEO_AFTER_EPOCH:
-                print(f"  📹 Running {TOTAL_VIZ_STEPS} steps, recording last {RECORD_LAST_N_STEPS} to see if cube reaches target")
+            # Get current state and image
+            overhead_camera.get_current_frame()
+            rgba_data = overhead_camera.get_rgba()
+            if rgba_data is not None and rgba_data.size > 0:
+                if len(rgba_data.shape) == 1:
+                    rgba_data = rgba_data.reshape(84, 84, 4)
+                rgb_image = rgba_data[:, :, :3].astype(np.uint8)
             else:
-                print(f"  ⏩ Running {TOTAL_VIZ_STEPS} steps (no video recording until epoch {RECORD_VIDEO_AFTER_EPOCH})")
+                rgb_image = np.zeros((84, 84, 3), dtype=np.uint8)
 
-            # Run full episode length (4800 steps like expert data)
-            for viz_step in range(TOTAL_VIZ_STEPS):
-                my_world.step(render=True)
+            joint_positions_raw = robot.get_joint_positions()
+            if isinstance(joint_positions_raw, tuple):
+                joint_positions = joint_positions_raw[0]
+            else:
+                joint_positions = joint_positions_raw
 
-                # Get current state and image
-                overhead_camera.get_current_frame()
-                rgba_data = overhead_camera.get_rgba()
-                if rgba_data is not None and rgba_data.size > 0:
-                    if len(rgba_data.shape) == 1:
-                        rgba_data = rgba_data.reshape(84, 84, 4)
-                    rgb_image = rgba_data[:, :, :3].astype(np.uint8)
-                else:
-                    rgb_image = np.zeros((84, 84, 3), dtype=np.uint8)
+            ball_pos, _ = ball.get_world_pose()
+            ball_pos = np.array(ball_pos).flatten()
+            ee_pos, _ = robot.end_effector.get_world_pose()
+            ee_pos = np.array(ee_pos).flatten()
+            gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
+            grasped = float(
+                np.linalg.norm(ee_pos - ball_pos) < 0.15 and gripper_pos > 0.02
+            )
+            state = np.concatenate([joint_positions, [grasped]])
 
-                joint_positions_raw = robot.get_joint_positions()
-                if isinstance(joint_positions_raw, tuple):
-                    joint_positions = joint_positions_raw[0]
-                else:
-                    joint_positions = joint_positions_raw
+            # Get action from learned policy
+            action = agent.get_action(
+                state, image=rgb_image, deterministic=deterministic
+            )
 
-                ball_pos, _ = ball.get_world_pose()
-                ball_pos = np.array(ball_pos).flatten()
-                ee_pos, _ = robot.end_effector.get_world_pose()
-                ee_pos = np.array(ee_pos).flatten()
-                ball_dist = np.linalg.norm(ee_pos - ball_pos)
-                gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
-                grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
-                state = np.concatenate([joint_positions, [grasped]])
+            # Execute action with RMPflow
+            delta_pos = action[:3] * 0.05
+            target_position = ee_pos + delta_pos
+            target_position = np.clip(
+                target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
+            )
+            rmp_flow.set_end_effector_target(
+                target_position=target_position, target_orientation=None
+            )
+            actions = motion_policy.get_next_articulation_action(1.0 / 60.0)
+            robot.apply_action(actions)
 
-                # Get action from learned policy (deterministic=True for testing)
-                action = agent.get_action(state, image=rgb_image, deterministic=True)
-
-                # Execute action with RMPflow
-                delta_pos = action[:3] * 0.05
-                target_position = ee_pos + delta_pos
-                target_position = np.clip(
-                    target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
+            # Gripper control
+            gripper_action = np.clip(action[3], -1.0, 1.0)
+            current_joints_raw = robot.get_joint_positions()
+            if isinstance(current_joints_raw, tuple):
+                current_joints = current_joints_raw[0].copy()
+            else:
+                current_joints = current_joints_raw.copy()
+            if len(current_joints) > 6:
+                current_gripper = current_joints[6]
+                target_gripper = np.clip(
+                    current_gripper + gripper_action * 0.01, 0.0, 0.04
                 )
-                rmp_flow.set_end_effector_target(
-                    target_position=target_position, target_orientation=None
-                )
-                actions = motion_policy.get_next_articulation_action(1.0 / 60.0)
-                robot.apply_action(actions)
+                current_joints[6] = target_gripper
+                robot.set_joint_positions(current_joints)
 
-                # Gripper control
-                gripper_action = np.clip(action[3], -1.0, 1.0)
-                current_joints_raw = robot.get_joint_positions()
-                if isinstance(current_joints_raw, tuple):
-                    current_joints = current_joints_raw[0].copy()
-                else:
-                    current_joints = current_joints_raw.copy()
-                if len(current_joints) > 6:
-                    current_gripper = current_joints[6]
-                    target_gripper = np.clip(
-                        current_gripper + gripper_action * 0.01, 0.0, 0.04
+            # Compute reward and next state
+            reward, curr_dist = compute_reward(ee_pos, ball_pos, gripper_pos, prev_dist)
+            prev_dist = curr_dist
+
+            # Get next image (for consistency, but use current for update)
+            next_image = rgb_image  # Reuse for simplicity
+
+            # Store experience and train (during training episodes)
+            if not is_eval:
+                loss = agent.update(
+                    state, action, reward, state, rgb_image
+                )  # next_state ≈ state after apply
+                if step % 100 == 0 and loss is not None:
+                    print(
+                        f"    Step {step}: Loss={loss:.4f}, Reward={reward:.3f}, Dist={curr_dist:.3f}"
                     )
-                    current_joints[6] = target_gripper
-                    robot.set_joint_positions(current_joints)
 
-                # Capture frame from side camera (for all steps if recording epoch)
-                if (epoch + 1) >= RECORD_VIDEO_AFTER_EPOCH:
-                    side_camera.get_current_frame()
-                    side_rgba = side_camera.get_rgba()
-                    if side_rgba is not None and side_rgba.size > 0:
-                        if len(side_rgba.shape) == 1:
-                            side_rgba = side_rgba.reshape(720, 1280, 4)
-                        side_rgb = side_rgba[:, :, :3].astype(np.uint8)
-                        side_bgr = cv2.cvtColor(side_rgb, cv2.COLOR_RGB2BGR)
+            episode_reward += reward
 
-                        # Add to buffer, keep only last N frames
-                        video_frames_buffer.append(side_bgr)
-                        if len(video_frames_buffer) > RECORD_LAST_N_STEPS:
-                            video_frames_buffer.pop(0)  # Remove oldest frame
+            # Capture frame from side camera during eval
+            if is_eval:
+                side_camera.get_current_frame()
+                side_rgba = side_camera.get_rgba()
+                if side_rgba is not None and side_rgba.size > 0:
+                    if len(side_rgba.shape) == 1:
+                        side_rgba = side_rgba.reshape(720, 1280, 4)
+                    side_rgb = side_rgba[:, :, :3].astype(np.uint8)
+                    side_bgr = cv2.cvtColor(side_rgb, cv2.COLOR_RGB2BGR)
 
-            # Write last N steps to video file
-            if (epoch + 1) >= RECORD_VIDEO_AFTER_EPOCH and len(video_frames_buffer) > 0:
-                video_path_avi = VIDEO_PATH.replace('.mp4', f'_epoch{epoch+1}_last{RECORD_LAST_N_STEPS}steps.avi')
-                fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-                video_writer = cv2.VideoWriter(video_path_avi, fourcc, 30.0, (1280, 720))
+                    # Add to buffer, keep only last N frames
+                    video_frames_buffer.append(side_bgr)
+                    if len(video_frames_buffer) > RECORD_LAST_N_STEPS:
+                        video_frames_buffer.pop(0)  # Remove oldest frame
 
-                if video_writer.isOpened():
-                    for frame in video_frames_buffer:
-                        video_writer.write(frame)
-                        frames_recorded += 1
-                    video_writer.release()
-                    print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}])")
-                    print(f"📹 Video saved: {video_path_avi} ({frames_recorded} last steps)\n")
-                else:
-                    print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}]) - Video write failed\n")
+        # Log episode
+        avg_reward = episode_reward / EPISODE_LENGTH
+        agent.total_reward_history.append(avg_reward)
+        print(
+            f"Episode {episode+1} | Avg Reward: {avg_reward:.3f} | Buffer: {len(agent.buffer)}"
+        )
+
+        # Save checkpoint every 100 episodes
+        if (episode + 1) % 100 == 0:
+            agent.save_model(MODEL_PATH)
+            print(f"  → Checkpoint saved at episode {episode+1}\n")
+
+        # Record video during eval
+        if is_eval and len(video_frames_buffer) > 0:
+            video_path_avi = f"{VIDEO_BASE_PATH}_episode{episode+1}_last{RECORD_LAST_N_STEPS}steps.avi"
+            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+            video_writer = cv2.VideoWriter(video_path_avi, fourcc, 30.0, (1280, 720))
+
+            if video_writer.isOpened():
+                for frame in video_frames_buffer:
+                    video_writer.write(frame)
+                    frames_recorded += 1
+                video_writer.release()
+                print(
+                    f"📹 Eval video saved: {video_path_avi} ({frames_recorded} frames)\n"
+                )
             else:
-                print(f"✓ Visualization complete (Cube at [{cube_x:.2f}, {cube_y:.2f}]) - No video recorded\n")
+                print(f"  Video write failed\n")
 
 except KeyboardInterrupt:
-    print("\nOffline training interrupted by user")
+    print("\nOnline training interrupted by user")
     agent.save_model(MODEL_PATH)
     print("Model saved before exit")
 except Exception as e:
@@ -1017,7 +892,7 @@ except Exception as e:
     agent.save_model(MODEL_PATH)
     print("Model saved after error")
 finally:
-    print(f"\n✓ Offline training complete!")
+    print(f"\n✓ Online training complete!")
     print(f"✓ Final model saved to: {MODEL_PATH}")
     agent.save_model(MODEL_PATH)
 
