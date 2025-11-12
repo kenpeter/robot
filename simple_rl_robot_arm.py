@@ -4,7 +4,7 @@
 """
 ONLINE RL Training - Robot learns from online interactions
 The robot learns to grasp through online experience collection with reward weighting.
-Uses standard multi-head attention in Diffusion Transformer.
+Uses Conditional MLP for diffusion (no attention overhead - simple and efficient).
 """
 
 # sim app
@@ -43,103 +43,68 @@ from isaacsim.robot_motion.motion_generation import (
     RmpFlow,
 )
 
-# Using standard multi-head attention for Diffusion Transformer
-print("Using standard PyTorch multi-head attention")
+# Using Conditional MLP for Diffusion (no attention - honest and fast!)
+print("=" * 60)
+print("DIFFUSION MODEL: Conditional MLP (no transformer)")
+print("Why: Single action vector doesn't need attention")
+print("=" * 60)
 
 
-# Diffusion Transformer for continuous action generation
-class DiTBlock(nn.Module):
-    """Transformer block with adaptive layer norm and standard multi-head attention for diffusion timestep conditioning"""
-
-    def __init__(self, hidden_dim, num_heads=4):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.num_heads = num_heads
-
-        # Standard PyTorch multi-head attention
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
-
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 4),
-            nn.GELU(),
-            nn.Linear(hidden_dim * 4, hidden_dim),
-        )
-        # Adaptive modulation parameters (6 parameters: scale/shift for attn and mlp, gate for attn and mlp)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_dim, 6 * hidden_dim)
-        )
-
-    def forward(self, x, c):
-        """
-        x: input tokens [batch, seq_len, hidden_dim]
-        c: conditioning (timestep + state) [batch, hidden_dim]
-        """
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(c).chunk(6, dim=-1)
-        )
-
-        # Standard multi-head attention with adaptive modulation
-        x_norm = self.norm1(x)
-        x_norm = x_norm * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x = x + gate_msa.unsqueeze(1) * attn_out
-
-        # MLP with adaptive modulation
-        x_norm = self.norm2(x)
-        x_norm = x_norm * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm)
-
-        return x
-
-
-# CNN removed - using simple state encoding only
-
-
-class DiffusionTransformer(nn.Module):
-    """Diffusion Transformer for action generation (NO CNN - state only)"""
+# Conditional MLP for diffusion - simpler and more honest than fake transformer
+class ConditionalDiffusionMLP(nn.Module):
+    """Conditional MLP for diffusion-based action generation (no attention waste!)"""
 
     def __init__(
         self,
         state_dim,
         action_dim,
-        hidden_dim=128,
+        hidden_dim=256,
         num_layers=4,
-        num_heads=4,
         use_vision=False,  # Disabled vision
     ):
         super().__init__()
         self.action_dim = action_dim
+        self.state_dim = state_dim
         self.hidden_dim = hidden_dim
         self.use_vision = False  # Force disable vision
 
-        # Timestep embedding (for diffusion process)
-        self.time_embed = nn.Sequential(
-            nn.Linear(1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)
-        )
+        # Input: concatenate [noisy_action, state, timestep]
+        input_dim = action_dim + state_dim + 1
 
-        # State encoder (proprioception only, no ball position)
-        self.state_encoder = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim),
+        # Build MLP layers
+        layers = []
+
+        # First layer: input → hidden
+        layers.extend([
+            nn.Linear(input_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
+        ])
 
-        # Noisy action encoder
-        self.action_encoder = nn.Linear(action_dim, hidden_dim)
+        # Middle layers with residual connections
+        for _ in range(num_layers - 2):
+            layers.extend([
+                nn.Linear(hidden_dim, hidden_dim * 2),
+                nn.GELU(),
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.SiLU(),
+            ])
 
-        # Transformer blocks
-        self.blocks = nn.ModuleList(
-            [DiTBlock(hidden_dim, num_heads) for _ in range(num_layers)]
-        )
+        # Final layer: hidden → action (noise prediction)
+        layers.extend([
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, action_dim)
+        ])
 
-        # Output head to predict noise
-        self.final_layer = nn.Sequential(
-            nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, action_dim)
-        )
+        self.network = nn.Sequential(*layers)
 
-    # forward with noise
+        print(f"ConditionalDiffusionMLP initialized:")
+        print(f"  Input dim: {input_dim} (state={state_dim} + action={action_dim} + timestep=1)")
+        print(f"  Hidden dim: {hidden_dim}")
+        print(f"  Num layers: {num_layers}")
+        print(f"  Output dim: {action_dim}")
+        print(f"  Total parameters: {sum(p.numel() for p in self.parameters()):,}")
+
     def forward(self, noisy_action, state, timestep, image=None):
         """
         noisy_action: [batch, action_dim] - noisy action at timestep t
@@ -149,24 +114,11 @@ class DiffusionTransformer(nn.Module):
 
         Returns: predicted noise [batch, action_dim]
         """
-        # Encode inputs
-        t_emb = self.time_embed(timestep)  # [batch, hidden_dim]
-        s_emb = self.state_encoder(state)  # [batch, hidden_dim]
-        a_emb = self.action_encoder(noisy_action)  # [batch, hidden_dim]
+        # Simply concatenate all inputs
+        x = torch.cat([noisy_action, state, timestep], dim=-1)  # [batch, state_dim + action_dim + 1]
 
-        # Conditioning: combine timestep and state (NO VISION)
-        c = t_emb + s_emb  # [batch, hidden_dim]
-
-        # Action as sequence (can be extended to multiple tokens)
-        x = a_emb.unsqueeze(1)  # [batch, 1, hidden_dim]
-
-        # Apply transformer blocks with standard multi-head attention
-        for block in self.blocks:
-            x = block(x, c)
-
-        # Predict noise
-        x = x.squeeze(1)  # [batch, hidden_dim]
-        noise_pred = self.final_layer(x)  # [batch, action_dim]
+        # Pass through MLP
+        noise_pred = self.network(x)  # [batch, action_dim]
 
         return noise_pred
 
@@ -207,13 +159,12 @@ class DiTAgent:
         # Clamp to avoid numerical issues
         self.alphas_cumprod = torch.clamp(self.alphas_cumprod, min=1e-8, max=1.0)
 
-        # Initialize DiffusionTransformer WITHOUT vision
-        self.model = DiffusionTransformer(
+        # Initialize ConditionalDiffusionMLP (simpler than fake transformer)
+        self.model = ConditionalDiffusionMLP(
             state_dim=state_dim,
             action_dim=action_dim,
-            hidden_dim=128,
-            num_layers=3,
-            num_heads=4,
+            hidden_dim=256,  # Larger hidden dim since we removed attention overhead
+            num_layers=4,
             use_vision=False,  # No vision
         ).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
@@ -387,15 +338,16 @@ class DiTAgent:
         # Decay exploration noise - floor at 0.10 for bold exploration
         self.noise_scale = max(0.10, self.noise_scale * 0.999)
 
-        # DEBUG: Print diffusion transformer stats every 100 steps
+        # DEBUG: Print diffusion MLP stats every 100 steps
         if self.step_count % 100 == 0:
-            print(f"\n[DIFFUSION DEBUG - Step {self.step_count}]")
-            print(f"  Noise scale: {noise.abs().mean().item():.4f}")
-            print(f"  Predicted noise scale: {predicted_noise.abs().mean().item():.4f}")
-            print(f"  Noise prediction error: {(noise - predicted_noise).abs().mean().item():.4f}")
-            print(f"  Loss (weighted): {weighted_loss.item():.6f}")
+            print(f"\n[DIFFUSION MLP DEBUG - Step {self.step_count}]")
+            print(f"  Actual noise magnitude: {noise.abs().mean().item():.4f}")
+            print(f"  Predicted noise magnitude: {predicted_noise.abs().mean().item():.4f}")
+            print(f"  Noise prediction error (MAE): {(noise - predicted_noise).abs().mean().item():.4f} ← Should DECREASE")
+            print(f"  Loss (weighted): {weighted_loss.item():.6f} ← Should DECREASE")
             print(f"  Reward range: [{rewards.min().item():.2f}, {rewards.max().item():.2f}]")
             print(f"  Alpha_cumprod range: [{alpha_cumprod_t.min().item():.4f}, {alpha_cumprod_t.max().item():.4f}]")
+            print(f"  Exploration noise scale: {self.noise_scale:.3f}")
 
         # Return loss for logging
         return weighted_loss.item()
