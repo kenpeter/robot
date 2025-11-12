@@ -94,58 +94,11 @@ class DiTBlock(nn.Module):
         return x
 
 
-class SimpleCNN(nn.Module):
-    """Simple CNN for visual feature extraction"""
-
-    def __init__(self, output_dim=128, img_size=84):
-        super().__init__()
-        self.img_size = img_size
-
-        # Simple convolutional layers (using GroupNorm instead of BatchNorm for stability)
-        self.conv = nn.Sequential(
-            # 84x84x3 -> 42x42x32
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.GroupNorm(8, 32),  # 8 groups for 32 channels
-            # 42x42x32 -> 21x21x64
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.GroupNorm(8, 64),  # 8 groups for 64 channels
-            # 21x21x64 -> 10x10x128
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.GroupNorm(16, 128),  # 16 groups for 128 channels
-            # 10x10x128 -> 5x5x128
-            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.GroupNorm(16, 128),  # 16 groups for 128 channels
-        )
-
-        # Adaptive pooling to ensure consistent output size
-        self.pool = nn.AdaptiveAvgPool2d((4, 4))  # Always output 4x4
-
-        # Calculate flattened size: 4x4x128 = 2048
-        self.flatten_size = 4 * 4 * 128
-
-        # FC layers
-        self.fc = nn.Sequential(
-            nn.Linear(self.flatten_size, 256), nn.ReLU(), nn.Linear(256, output_dim)
-        )
-
-    def forward(self, x):
-        # x: [B, H, W, C] from Isaac Sim -> [B, C, H, W] for PyTorch
-        if len(x.shape) == 4 and x.shape[-1] == 3:
-            x = x.permute(0, 3, 1, 2)  # BHWC -> BCHW
-
-        x = self.conv(x)
-        x = self.pool(x)  # Ensure consistent spatial size
-        x = x.reshape(x.size(0), -1)  # Flatten
-        x = self.fc(x)
-        return x
+# CNN removed - using simple state encoding only
 
 
 class DiffusionTransformer(nn.Module):
-    """Diffusion Transformer for action generation with vision"""
+    """Diffusion Transformer for action generation (NO CNN - state only)"""
 
     def __init__(
         self,
@@ -154,16 +107,12 @@ class DiffusionTransformer(nn.Module):
         hidden_dim=128,
         num_layers=4,
         num_heads=4,
-        use_vision=True,
+        use_vision=False,  # Disabled vision
     ):
         super().__init__()
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
-        self.use_vision = use_vision
-
-        # Vision encoder (CNN)
-        if use_vision:
-            self.vision_encoder = SimpleCNN(output_dim=hidden_dim)
+        self.use_vision = False  # Force disable vision
 
         # Timestep embedding (for diffusion process)
         self.time_embed = nn.Sequential(
@@ -196,7 +145,7 @@ class DiffusionTransformer(nn.Module):
         noisy_action: [batch, action_dim] - noisy action at timestep t
         state: [batch, state_dim] - robot proprioceptive state
         timestep: [batch, 1] - diffusion timestep (0 to 1)
-        image: [batch, H, W, 3] - optional RGB image
+        image: IGNORED - no vision
 
         Returns: predicted noise [batch, action_dim]
         """
@@ -205,12 +154,8 @@ class DiffusionTransformer(nn.Module):
         s_emb = self.state_encoder(state)  # [batch, hidden_dim]
         a_emb = self.action_encoder(noisy_action)  # [batch, hidden_dim]
 
-        # Conditioning: combine timestep, state, and vision
+        # Conditioning: combine timestep and state (NO VISION)
         c = t_emb + s_emb  # [batch, hidden_dim]
-
-        if self.use_vision and image is not None:
-            v_emb = self.vision_encoder(image)  # [batch, hidden_dim]
-            c = c + v_emb
 
         # Action as sequence (can be extended to multiple tokens)
         x = a_emb.unsqueeze(1)  # [batch, 1, hidden_dim]
@@ -230,12 +175,12 @@ class DiffusionTransformer(nn.Module):
 class DiTAgent:
     """RL Agent using Diffusion Transformer for action generation"""
 
-    # self, state dim, action dim, use vision, device cuda
+    # self, state dim, action dim, NO vision, device cuda
     def __init__(
         self,
         state_dim,
         action_dim,
-        use_vision=True,
+        use_vision=False,  # Disabled
         device="cuda",
     ):
         # state + action -> new state: state -> action -> new state
@@ -262,14 +207,14 @@ class DiTAgent:
         # Clamp to avoid numerical issues
         self.alphas_cumprod = torch.clamp(self.alphas_cumprod, min=1e-8, max=1.0)
 
-        # Initialize KDA DiffusionTransformer with vision
+        # Initialize DiffusionTransformer WITHOUT vision
         self.model = DiffusionTransformer(
             state_dim=state_dim,
             action_dim=action_dim,
             hidden_dim=128,
             num_layers=3,
             num_heads=4,
-            use_vision=use_vision,
+            use_vision=False,  # No vision
         ).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
 
@@ -364,11 +309,8 @@ class DiTAgent:
 
     def update(self, state, action, reward, next_state, image=None):
         """Store experience and train the diffusion model with reward weighting"""
-        # Only store experiences with valid vision data
-        if self.use_vision and (image is None or image.size == 0 or np.all(image == 0)):
-            return  # Skip invalid vision experiences
-
-        experience = (state, action, reward, next_state, image)
+        # No vision - ignore image
+        experience = (state, action, reward, next_state, None)
 
         # Add to buffer
         self.buffer.append(experience)
@@ -378,15 +320,7 @@ class DiTAgent:
             return
 
         # Sample batch from buffer
-        if self.use_vision:
-            valid_indices = [
-                i for i in range(len(self.buffer)) if self.buffer[i][4] is not None
-            ]
-            if len(valid_indices) < self.batch_size:
-                return  # Not enough valid samples
-            indices = np.random.choice(valid_indices, self.batch_size, replace=False)
-        else:
-            indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
+        indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
         batch = [self.buffer[i] for i in indices]
 
         # Convert to tensors
@@ -400,12 +334,8 @@ class DiTAgent:
             self.device
         )
 
-        # Process images if using vision
+        # No vision - images_tensor is always None
         images_tensor = None
-        if self.use_vision:
-            images = [img for s, a, r, ns, img in batch]
-            # All images should be valid now due to filtering in update()
-            images_tensor = torch.FloatTensor(np.stack(images)).to(self.device) / 255.0
 
         # Diffusion training
         self.model.train()
@@ -456,6 +386,16 @@ class DiTAgent:
 
         # Decay exploration noise - floor at 0.10 for bold exploration
         self.noise_scale = max(0.10, self.noise_scale * 0.999)
+
+        # DEBUG: Print diffusion transformer stats every 100 steps
+        if self.step_count % 100 == 0:
+            print(f"\n[DIFFUSION DEBUG - Step {self.step_count}]")
+            print(f"  Noise scale: {noise.abs().mean().item():.4f}")
+            print(f"  Predicted noise scale: {predicted_noise.abs().mean().item():.4f}")
+            print(f"  Noise prediction error: {(noise - predicted_noise).abs().mean().item():.4f}")
+            print(f"  Loss (weighted): {weighted_loss.item():.6f}")
+            print(f"  Reward range: [{rewards.min().item():.2f}, {rewards.max().item():.2f}]")
+            print(f"  Alpha_cumprod range: [{alpha_cumprod_t.min().item():.4f}, {alpha_cumprod_t.max().item():.4f}]")
 
         # Return loss for logging
         return weighted_loss.item()
@@ -586,24 +526,24 @@ side_camera = Camera(
 side_camera.initialize()
 print("✓ Cameras initialized: Overhead (84x84) for RL, Side (1280x720) for video")
 
-# === RED CUBE SETUP (matching test_grasp_official.py) ===
-# Add red cube with same setup as test_grasp_official.py
+# === RED CUBE SETUP - FIXED POSITION ===
+# Add red cube with FIXED position for testing diffusion transformer
 from isaacsim.core.api.objects import DynamicCuboid
 
-# Use exact same cube size as test_grasp_official.py
-cube_size = 0.0515  # 5.15cm cube (same as test_grasp_official.py)
-cube_initial_x = 0.5  # Same as test_grasp_official.py
-cube_initial_y = 0.2  # Same as test_grasp_official.py
-cube_initial_z = cube_size / 2.0  # On ground plane
+# FIXED cube position
+cube_size = 0.0515  # 5.15cm cube
+FIXED_CUBE_X = 0.5  # FIXED
+FIXED_CUBE_Y = 0.2  # FIXED
+FIXED_CUBE_Z = cube_size / 2.0  # On ground plane
 
-print(f"\n=== RED CUBE SETUP (matching test_grasp_official.py) ===")
+print(f"\n=== RED CUBE SETUP - FIXED POSITION ===")
 print(
-    f"Cube initial position: [{cube_initial_x:.3f}, {cube_initial_y:.3f}, {cube_initial_z:.3f}]"
+    f"Cube FIXED position: [{FIXED_CUBE_X:.3f}, {FIXED_CUBE_Y:.3f}, {FIXED_CUBE_Z:.3f}]"
 )
 
 cube = DynamicCuboid(
     name="red_cube",
-    position=np.array([cube_initial_x, cube_initial_y, cube_initial_z]),
+    position=np.array([FIXED_CUBE_X, FIXED_CUBE_Y, FIXED_CUBE_Z]),
     orientation=np.array([1, 0, 0, 0]),
     prim_path="/World/Cube",
     scale=np.array([cube_size, cube_size, cube_size]),
@@ -673,7 +613,7 @@ MODEL_PATH = "rl_robot_arm_model.pth"
 state_dim = 13  # 12 joints + 1 cube_grasped
 action_dim = 4  # dx, dy, dz, gripper
 
-agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=True)
+agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=False)
 
 # Try to load existing model
 agent.load_model(MODEL_PATH)
@@ -691,7 +631,7 @@ MAX_EPISODES = 1000
 MAX_STEPS_PER_EPISODE = 500
 SAVE_INTERVAL = 10  # Save model every 10 episodes
 VIDEO_INTERVAL = 20  # Record video every 20 episodes
-VIDEO_PATH = "/home/kenpeter/work/robot/online_training_video.mp4"
+VIDEO_PATH = "/home/kenpeter/work/robot/training_video.avi"  # Single file, overwrite
 
 # Start simulation
 print("[DEBUG] Starting simulation timeline...")
@@ -700,26 +640,27 @@ print(f"[DEBUG] World is playing: {my_world.is_playing()}")
 print("✓ Simulation timeline started\n")
 
 
+# FIXED target position for robot end-effector
+FIXED_TARGET_X = 0.5
+FIXED_TARGET_Y = 0.2
+FIXED_TARGET_Z = 0.3  # Above the cube
+
 # Helper function to reset environment
 def reset_environment():
-    """Reset robot and cube to initial positions"""
-    # Reset robot
+    """Reset robot and cube to FIXED positions"""
+    # Reset robot to initial position
     initial_pos = np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0])
     gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     robot.set_joint_positions(np.concatenate([initial_pos, gripper_open]))
 
-    # Reset cube to random position
-    cube_size = 0.0515
-    cube_x = np.random.uniform(0.4, 0.6)
-    cube_y = np.random.uniform(-0.3, 0.3)
-    cube_z = cube_size / 2.0
-    ball.set_world_pose(position=np.array([cube_x, cube_y, cube_z]))
+    # Reset cube to FIXED position (no randomization)
+    ball.set_world_pose(position=np.array([FIXED_CUBE_X, FIXED_CUBE_Y, FIXED_CUBE_Z]))
 
     # Stabilize
     for _ in range(10):
         my_world.step(render=False)
 
-    return cube_x, cube_y
+    return FIXED_CUBE_X, FIXED_CUBE_Y
 
 
 # Helper function to compute reward
@@ -756,31 +697,7 @@ try:
         for step in range(MAX_STEPS_PER_EPISODE):
             my_world.step(render=True)
 
-            # Get current state and image
-            overhead_camera.get_current_frame()
-            rgba_data = overhead_camera.get_rgba()
-            if rgba_data is not None and rgba_data.size > 0:
-                if len(rgba_data.shape) == 1:
-                    rgba_data = rgba_data.reshape(84, 84, 4)
-                rgb_image = rgba_data[:, :, :3].astype(np.uint8)
-
-                # Save first image of first episode so human can see what robot sees
-                if episode == 0 and step == 0:
-                    cv2.imwrite("overhead_camera_view.png", cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
-                    print(f"✓ Saved overhead camera view (84x84): overhead_camera_view.png")
-
-                    # Also save side camera view for better visualization
-                    side_camera.get_current_frame()
-                    side_rgba = side_camera.get_rgba()
-                    if side_rgba is not None and side_rgba.size > 0:
-                        if len(side_rgba.shape) == 1:
-                            side_rgba = side_rgba.reshape(720, 1280, 4)
-                        side_rgb = side_rgba[:, :, :3].astype(np.uint8)
-                        cv2.imwrite("side_camera_view.png", cv2.cvtColor(side_rgb, cv2.COLOR_RGB2BGR))
-                        print(f"✓ Saved side camera view (1280x720): side_camera_view.png")
-            else:
-                rgb_image = np.zeros((84, 84, 3), dtype=np.uint8)
-
+            # Get current state (NO camera/vision)
             joint_positions_raw = robot.get_joint_positions()
             if isinstance(joint_positions_raw, tuple):
                 joint_positions = joint_positions_raw[0]
@@ -796,8 +713,8 @@ try:
             grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
             state = np.concatenate([joint_positions, [grasped]])
 
-            # Get action from policy
-            action = agent.get_action(state, image=rgb_image, deterministic=False)
+            # Get action from policy (NO image)
+            action = agent.get_action(state, image=None, deterministic=False)
 
             # Execute action with RMPflow
             delta_pos = action[:3] * 0.05
@@ -852,8 +769,8 @@ try:
             prev_dist = ball_dist
             episode_reward += reward
 
-            # Store experience and train (online training with reward weighting)
-            loss = agent.update(state, action, reward, next_state, rgb_image)
+            # Store experience and train (online training with reward weighting, NO image)
+            loss = agent.update(state, action, reward, next_state, image=None)
             if loss is not None:
                 episode_loss.append(loss)
 
@@ -870,7 +787,7 @@ try:
             agent.save_model(MODEL_PATH)
             print(f"  → Checkpoint saved at episode {episode+1}\n")
 
-        # Record video
+        # Record video (SINGLE FILE - overwrite)
         if (episode + 1) % VIDEO_INTERVAL == 0:
             print(f"\n📹 Recording video at episode {episode+1}...")
 
@@ -881,16 +798,7 @@ try:
             for step in range(200):  # Record 200 steps
                 my_world.step(render=True)
 
-                # Get state and action
-                overhead_camera.get_current_frame()
-                rgba_data = overhead_camera.get_rgba()
-                if rgba_data is not None and rgba_data.size > 0:
-                    if len(rgba_data.shape) == 1:
-                        rgba_data = rgba_data.reshape(84, 84, 4)
-                    rgb_image = rgba_data[:, :, :3].astype(np.uint8)
-                else:
-                    rgb_image = np.zeros((84, 84, 3), dtype=np.uint8)
-
+                # Get state and action (no image needed)
                 joint_positions_raw = robot.get_joint_positions()
                 if isinstance(joint_positions_raw, tuple):
                     joint_positions = joint_positions_raw[0]
@@ -906,7 +814,7 @@ try:
                 grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
                 state = np.concatenate([joint_positions, [grasped]])
 
-                action = agent.get_action(state, image=rgb_image, deterministic=True)
+                action = agent.get_action(state, image=None, deterministic=True)
 
                 # Execute action
                 delta_pos = action[:3] * 0.05
@@ -934,7 +842,7 @@ try:
                     current_joints[6] = target_gripper
                     robot.set_joint_positions(current_joints)
 
-                # Capture frame
+                # Capture frame from side camera
                 side_camera.get_current_frame()
                 side_rgba = side_camera.get_rgba()
                 if side_rgba is not None and side_rgba.size > 0:
@@ -944,16 +852,15 @@ try:
                     side_bgr = cv2.cvtColor(side_rgb, cv2.COLOR_RGB2BGR)
                     video_frames.append(side_bgr)
 
-            # Save video
+            # Save video (OVERWRITE single file)
             if len(video_frames) > 0:
-                video_path = VIDEO_PATH.replace(".mp4", f"_episode{episode+1}.avi")
                 fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-                video_writer = cv2.VideoWriter(video_path, fourcc, 30.0, (1280, 720))
+                video_writer = cv2.VideoWriter(VIDEO_PATH, fourcc, 30.0, (1280, 720))
                 if video_writer.isOpened():
                     for frame in video_frames:
                         video_writer.write(frame)
                     video_writer.release()
-                    print(f"✓ Video saved: {video_path}\n")
+                    print(f"✓ Video saved (overwritten): {VIDEO_PATH}\n")
 
 except KeyboardInterrupt:
     print("\nOnline training interrupted by user")
