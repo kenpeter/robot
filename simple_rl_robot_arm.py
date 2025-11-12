@@ -190,6 +190,7 @@ class DiffusionTransformer(nn.Module):
             nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, action_dim)
         )
 
+    # forward
     def forward(self, noisy_action, state, timestep, image=None):
         """
         noisy_action: [batch, action_dim] - noisy action at timestep t
@@ -435,8 +436,12 @@ class DiTAgent:
 
         # Reward-based weighting: high reward = more weight
         # Normalize rewards to [0, 1], then scale by 2, then apply softmax
-        reward_normalized = (rewards - rewards.min()) / (rewards.max() - rewards.min() + 1e-8)
-        reward_weights = F.softmax(reward_normalized * 2.0, dim=0) * len(rewards)  # Scale by batch size
+        reward_normalized = (rewards - rewards.min()) / (
+            rewards.max() - rewards.min() + 1e-8
+        )
+        reward_weights = F.softmax(reward_normalized * 2.0, dim=0) * len(
+            rewards
+        )  # Scale by batch size
         weighted_loss = (per_sample_loss * reward_weights).mean()
 
         # Optimize with gradient clipping

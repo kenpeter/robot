@@ -1,12 +1,33 @@
 """
 Test script to verify gradient flow in the Diffusion Transformer model.
 Checks forward pass, backward pass, and gradient magnitudes.
+Includes Isaac Sim UI for visualization.
 """
+
+# Initialize Isaac Sim first
+from isaacsim import SimulationApp
+
+simulation_app = SimulationApp(
+    {
+        "headless": False,  # Show UI
+        "width": 1280,
+        "height": 720,
+        "renderer": "RayTracedLighting",
+    }
+)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from isaacsim.core.api import World
+from isaacsim.core.utils.viewports import set_camera_view
+from isaacsim.core.utils.stage import add_reference_to_stage
+from isaacsim.storage.native import get_assets_root_path
+from isaacsim.robot.manipulators import SingleManipulator
+from isaacsim.robot.manipulators.grippers import ParallelGripper
+from isaacsim.core.api.objects import DynamicCuboid
+from pxr import Gf, UsdLux
 
 # Copy model classes from simple_rl_robot_arm.py
 class DiTBlock(nn.Module):
@@ -349,61 +370,186 @@ def test_reward_weighting():
         print(f"  Max/Min ratio: {(reward_weights.max() / reward_weights.min()).item():.2f}x")
 
 
+def setup_isaac_sim_scene():
+    """Setup Isaac Sim scene with robot and cube"""
+    print("\n" + "=" * 80)
+    print("SETTING UP ISAAC SIM SCENE")
+    print("=" * 80)
+
+    # Create world
+    my_world = World(stage_units_in_meters=1.0)
+    my_world.scene.add_default_ground_plane()
+
+    # Set camera view
+    set_camera_view(
+        eye=[2.5, 2.5, 2.0],
+        target=[0.0, 0.0, 0.5],
+        camera_prim_path="/OmniverseKit_Persp",
+    )
+
+    # Add UR10e robot
+    assets_root_path = get_assets_root_path()
+    asset_path = (
+        assets_root_path
+        + "/Isaac/Samples/Rigging/Manipulator/configure_manipulator/ur10e/ur/ur_gripper.usd"
+    )
+    add_reference_to_stage(usd_path=asset_path, prim_path="/World/ur")
+
+    # Configure gripper
+    gripper = ParallelGripper(
+        end_effector_prim_path="/World/ur/ee_link/robotiq_arg2f_base_link",
+        joint_prim_names=["finger_joint"],
+        joint_opened_positions=np.array([0]),
+        joint_closed_positions=np.array([40]),
+        action_deltas=np.array([-40]),
+        use_mimic_joints=True,
+    )
+
+    # Create robot
+    robot = SingleManipulator(
+        prim_path="/World/ur",
+        name="ur10_robot",
+        end_effector_prim_path="/World/ur/ee_link/robotiq_arg2f_base_link",
+        gripper=gripper,
+    )
+
+    # Add red cube
+    cube_size = 0.0515
+    cube = DynamicCuboid(
+        name="red_cube",
+        position=np.array([0.5, 0.2, cube_size / 2.0]),
+        orientation=np.array([1, 0, 0, 0]),
+        prim_path="/World/Cube",
+        scale=np.array([cube_size, cube_size, cube_size]),
+        size=1.0,
+        color=np.array([1.0, 0.0, 0.0]),
+    )
+    my_world.scene.add(cube)
+
+    # Add lighting
+    stage = my_world.stage
+    dome_light = UsdLux.DomeLight.Define(stage, "/World/DomeLight")
+    dome_light.CreateIntensityAttr(1000.0)
+
+    distant_light = UsdLux.DistantLight.Define(stage, "/World/DistantLight")
+    distant_light.CreateIntensityAttr(2000.0)
+    distant_light_xform = distant_light.AddRotateXYZOp()
+    distant_light_xform.Set(Gf.Vec3f(-45, 0, 0))
+
+    print("✓ Scene created with UR10e robot and red cube")
+
+    # Initialize world
+    my_world.reset()
+    robot.initialize()
+    cube.initialize()
+
+    print("✓ World initialized and ready")
+    print("=" * 80 + "\n")
+
+    return my_world, robot, cube
+
+
 def main():
     print("\n" + "=" * 80)
-    print("DIFFUSION TRANSFORMER GRADIENT FLOW TEST")
+    print("DIFFUSION TRANSFORMER GRADIENT FLOW TEST WITH ISAAC SIM")
     print("=" * 80)
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"\nDevice: {device}")
+    try:
+        # Setup Isaac Sim scene
+        my_world, robot, cube = setup_isaac_sim_scene()
 
-    # Create model
-    state_dim = 13
-    action_dim = 4
-    batch_size = 4
+        # Start simulation
+        my_world.play()
+        print("✓ Simulation started\n")
 
-    model = DiffusionTransformer(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        hidden_dim=128,
-        num_layers=3,
-        num_heads=4,
-        use_vision=True,
-    ).to(device)
+        # Step simulation a few times to stabilize
+        for _ in range(10):
+            my_world.step(render=True)
 
-    print(f"\nModel created with:")
-    print(f"  State dim: {state_dim}")
-    print(f"  Action dim: {action_dim}")
-    print(f"  Hidden dim: 128")
-    print(f"  Num layers: 3")
-    print(f"  Num heads: 4")
-    print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Device: {device}\n")
 
-    # Test forward pass
-    noise_pred = test_forward_pass(model, batch_size, device)
-    if noise_pred is None:
-        print("\n❌ FAILED: Forward pass test")
-        return
+        # Create model
+        state_dim = 13
+        action_dim = 4
+        batch_size = 4
 
-    # Test backward pass
-    success = test_backward_pass(model, noise_pred, batch_size, device)
-    if not success:
-        print("\n❌ FAILED: Backward pass test")
-        return
+        model = DiffusionTransformer(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_dim=128,
+            num_layers=3,
+            num_heads=4,
+            use_vision=True,
+        ).to(device)
 
-    # Test reward weighting
-    test_reward_weighting()
+        print(f"Model created with:")
+        print(f"  State dim: {state_dim}")
+        print(f"  Action dim: {action_dim}")
+        print(f"  Hidden dim: 128")
+        print(f"  Num layers: 3")
+        print(f"  Num heads: 4")
+        print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}\n")
 
-    print("\n" + "=" * 80)
-    print("✓ ALL TESTS PASSED!")
-    print("=" * 80)
-    print("\nSummary:")
-    print("  ✓ Forward pass working correctly")
-    print("  ✓ Backward pass working correctly")
-    print("  ✓ Gradients flowing through all layers")
-    print("  ✓ No NaN or Inf values detected")
-    print("  ✓ Reward weighting mechanism working as expected")
-    print("=" * 80 + "\n")
+        # Test forward pass
+        noise_pred = test_forward_pass(model, batch_size, device)
+        if noise_pred is None:
+            print("\n❌ FAILED: Forward pass test")
+            return
+
+        # Step simulation during testing to keep UI responsive
+        for _ in range(5):
+            my_world.step(render=True)
+
+        # Test backward pass
+        success = test_backward_pass(model, noise_pred, batch_size, device)
+        if not success:
+            print("\n❌ FAILED: Backward pass test")
+            return
+
+        # Step simulation
+        for _ in range(5):
+            my_world.step(render=True)
+
+        # Test reward weighting
+        test_reward_weighting()
+
+        # Step simulation
+        for _ in range(5):
+            my_world.step(render=True)
+
+        print("\n" + "=" * 80)
+        print("✓ ALL TESTS PASSED!")
+        print("=" * 80)
+        print("\nSummary:")
+        print("  ✓ Isaac Sim scene setup successfully")
+        print("  ✓ Forward pass working correctly")
+        print("  ✓ Backward pass working correctly")
+        print("  ✓ Gradients flowing through all layers")
+        print("  ✓ No NaN or Inf values detected")
+        print("  ✓ Reward weighting mechanism working as expected")
+        print("=" * 80 + "\n")
+
+        # Keep simulation running for a bit
+        print("Keeping simulation running for 5 seconds...")
+        for i in range(300):
+            my_world.step(render=True)
+            if i % 60 == 0:
+                print(f"  Step {i}/300")
+
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("\nCleaning up...")
+        try:
+            my_world.stop()
+            my_world.clear()
+        except:
+            pass
+        simulation_app.close()
+        print("✓ Cleanup complete")
 
 
 if __name__ == "__main__":
