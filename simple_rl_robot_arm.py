@@ -688,7 +688,7 @@ print(f"Model will be saved to: {MODEL_PATH}\n")
 
 # Training parameters
 MAX_EPISODES = 1000
-MAX_STEPS_PER_EPISODE = 1500
+MAX_STEPS_PER_EPISODE = 500
 SAVE_INTERVAL = 10  # Save model every 10 episodes
 VIDEO_INTERVAL = 20  # Record video every 20 episodes
 VIDEO_PATH = "/home/kenpeter/work/robot/online_training_video.mp4"
