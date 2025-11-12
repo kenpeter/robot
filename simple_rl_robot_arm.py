@@ -763,6 +763,21 @@ try:
                 if len(rgba_data.shape) == 1:
                     rgba_data = rgba_data.reshape(84, 84, 4)
                 rgb_image = rgba_data[:, :, :3].astype(np.uint8)
+
+                # Save first image of first episode so human can see what robot sees
+                if episode == 0 and step == 0:
+                    cv2.imwrite("overhead_camera_view.png", cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR))
+                    print(f"✓ Saved overhead camera view (84x84): overhead_camera_view.png")
+
+                    # Also save side camera view for better visualization
+                    side_camera.get_current_frame()
+                    side_rgba = side_camera.get_rgba()
+                    if side_rgba is not None and side_rgba.size > 0:
+                        if len(side_rgba.shape) == 1:
+                            side_rgba = side_rgba.reshape(720, 1280, 4)
+                        side_rgb = side_rgba[:, :, :3].astype(np.uint8)
+                        cv2.imwrite("side_camera_view.png", cv2.cvtColor(side_rgb, cv2.COLOR_RGB2BGR))
+                        print(f"✓ Saved side camera view (1280x720): side_camera_view.png")
             else:
                 rgb_image = np.zeros((84, 84, 3), dtype=np.uint8)
 
