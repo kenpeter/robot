@@ -1,21 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+
 """
-SUPER SIMPLE ONLINE RL Training - Minimal version for controlled training
-No vision, short episodes, basic logging. Focus on proprioception + relative pos.
+ONLINE RL Training - Robot learns from online interactions
+The robot learns to grasp through online experience collection with reward weighting.
+Uses standard multi-head attention in Diffusion Transformer.
 """
+
 # sim app
 from isaacsim import SimulationApp
 
 # Initialize simulation
 simulation_app = SimulationApp(
     {
-        "headless": False,  # Enable UI
+        "headless": True,
         "width": 1280,
         "height": 720,
+        # ray trace vs path trace: ray trace -> good performance -> path trace -> more real
         "renderer": "RayTracedLighting",
     }
 )
+
 import numpy as np
 import sys
 import os
@@ -23,8 +28,10 @@ import carb
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import cv2  # For video recording
 from collections import deque
 from isaacsim.core.api import World
+from isaacsim.core.prims import RigidPrim
 from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.utils.viewports import set_camera_view
 from isaacsim.storage.native import get_assets_root_path
@@ -32,376 +39,923 @@ from isaacsim.robot.manipulators import SingleManipulator
 from isaacsim.robot.manipulators.grippers import ParallelGripper
 from isaacsim.robot_motion.motion_generation import (
     ArticulationMotionPolicy,
+    interface_config_loader,
     RmpFlow,
 )
-import random
-from isaacsim.core.api.objects import DynamicCuboid
 
-print("Super simple DiT with standard attention - no vision")
-
-
-# Standard Multi-Head Attention
-class MultiheadAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int = 4):
-        super().__init__()
-        assert d_model % num_heads == 0
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads
-        self.Wq = nn.Linear(d_model, d_model, bias=False)
-        self.Wk = nn.Linear(d_model, d_model, bias=False)
-        self.Wv = nn.Linear(d_model, d_model, bias=False)
-        self.Wo = nn.Linear(d_model, d_model, bias=False)
-
-    def forward(self, x: torch.Tensor):
-        B, T, D = x.shape
-        q = self.Wq(x).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
-        k = self.Wk(x).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
-        v = self.Wv(x).view(B, T, self.num_heads, self.d_k).transpose(1, 2)
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / np.sqrt(self.d_k)
-        attn_probs = F.softmax(attn_scores, dim=-1)
-        o = torch.matmul(attn_probs, v).transpose(1, 2).contiguous().view(B, T, D)
-        o = self.Wo(o)
-        return o
+# Using standard multi-head attention for Diffusion Transformer
+print("Using standard PyTorch multi-head attention")
 
 
-# Simple DiT Block
+# Diffusion Transformer for continuous action generation
 class DiTBlock(nn.Module):
+    """Transformer block with adaptive layer norm and standard multi-head attention for diffusion timestep conditioning"""
+
     def __init__(self, hidden_dim, num_heads=4):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.attn = MultiheadAttention(hidden_dim, num_heads)
+        self.num_heads = num_heads
+
+        # Standard PyTorch multi-head attention
         self.norm1 = nn.LayerNorm(hidden_dim)
+        self.attn = nn.MultiheadAttention(hidden_dim, num_heads, batch_first=True)
+
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * 4),
             nn.GELU(),
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
+        # Adaptive modulation parameters (6 parameters: scale/shift for attn and mlp, gate for attn and mlp)
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_dim, 4 * hidden_dim)
+            nn.SiLU(), nn.Linear(hidden_dim, 6 * hidden_dim)
         )
 
     def forward(self, x, c):
-        scale_msa, gate_msa, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(
-            4, dim=-1
+        """
+        x: input tokens [batch, seq_len, hidden_dim]
+        c: conditioning (timestep + state) [batch, hidden_dim]
+        """
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=-1)
         )
-        x_norm1 = self.norm1(x) * (1 + scale_msa.unsqueeze(1))
-        attn_out = self.attn(x_norm1)
-        x = x + attn_out * gate_msa.unsqueeze(1)
-        x_norm2 = self.norm2(x) * (1 + scale_mlp.unsqueeze(1))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm2)
+
+        # Standard multi-head attention with adaptive modulation
+        x_norm = self.norm1(x)
+        x_norm = x_norm * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x = x + gate_msa.unsqueeze(1) * attn_out
+
+        # MLP with adaptive modulation
+        x_norm = self.norm2(x)
+        x_norm = x_norm * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(x_norm)
+
         return x
 
 
-# Simple Diffusion Transformer (no vision)
+class SimpleCNN(nn.Module):
+    """Simple CNN for visual feature extraction"""
+
+    def __init__(self, output_dim=128, img_size=84):
+        super().__init__()
+        self.img_size = img_size
+
+        # Simple convolutional layers (using GroupNorm instead of BatchNorm for stability)
+        self.conv = nn.Sequential(
+            # 84x84x3 -> 42x42x32
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.GroupNorm(8, 32),  # 8 groups for 32 channels
+            # 42x42x32 -> 21x21x64
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.GroupNorm(8, 64),  # 8 groups for 64 channels
+            # 21x21x64 -> 10x10x128
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.GroupNorm(16, 128),  # 16 groups for 128 channels
+            # 10x10x128 -> 5x5x128
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.GroupNorm(16, 128),  # 16 groups for 128 channels
+        )
+
+        # Adaptive pooling to ensure consistent output size
+        self.pool = nn.AdaptiveAvgPool2d((4, 4))  # Always output 4x4
+
+        # Calculate flattened size: 4x4x128 = 2048
+        self.flatten_size = 4 * 4 * 128
+
+        # FC layers
+        self.fc = nn.Sequential(
+            nn.Linear(self.flatten_size, 256), nn.ReLU(), nn.Linear(256, output_dim)
+        )
+
+    def forward(self, x):
+        # x: [B, H, W, C] from Isaac Sim -> [B, C, H, W] for PyTorch
+        if len(x.shape) == 4 and x.shape[-1] == 3:
+            x = x.permute(0, 3, 1, 2)  # BHWC -> BCHW
+
+        x = self.conv(x)
+        x = self.pool(x)  # Ensure consistent spatial size
+        x = x.reshape(x.size(0), -1)  # Flatten
+        x = self.fc(x)
+        return x
+
+
 class DiffusionTransformer(nn.Module):
+    """Diffusion Transformer for action generation with vision"""
+
     def __init__(
-        self, state_dim, action_dim, hidden_dim=128, num_layers=3, num_heads=4
+        self,
+        state_dim,
+        action_dim,
+        hidden_dim=128,
+        num_layers=4,
+        num_heads=4,
+        use_vision=True,
     ):
         super().__init__()
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
+        self.use_vision = use_vision
+
+        # Vision encoder (CNN)
+        if use_vision:
+            self.vision_encoder = SimpleCNN(output_dim=hidden_dim)
+
+        # Timestep embedding (for diffusion process)
         self.time_embed = nn.Sequential(
             nn.Linear(1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)
         )
+
+        # State encoder (proprioception only, no ball position)
         self.state_encoder = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
+
+        # Noisy action encoder
         self.action_encoder = nn.Linear(action_dim, hidden_dim)
+
+        # Transformer blocks
         self.blocks = nn.ModuleList(
             [DiTBlock(hidden_dim, num_heads) for _ in range(num_layers)]
         )
+
+        # Output head to predict noise
         self.final_layer = nn.Sequential(
             nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, action_dim)
         )
 
-    def forward(self, noisy_action, state, timestep):
-        t_emb = self.time_embed(timestep)
-        s_emb = self.state_encoder(state)
-        a_emb = self.action_encoder(noisy_action)
-        c = t_emb + s_emb
-        x = a_emb.unsqueeze(1)
+    def forward(self, noisy_action, state, timestep, image=None):
+        """
+        noisy_action: [batch, action_dim] - noisy action at timestep t
+        state: [batch, state_dim] - robot proprioceptive state
+        timestep: [batch, 1] - diffusion timestep (0 to 1)
+        image: [batch, H, W, 3] - optional RGB image
+
+        Returns: predicted noise [batch, action_dim]
+        """
+        # Encode inputs
+        t_emb = self.time_embed(timestep)  # [batch, hidden_dim]
+        s_emb = self.state_encoder(state)  # [batch, hidden_dim]
+        a_emb = self.action_encoder(noisy_action)  # [batch, hidden_dim]
+
+        # Conditioning: combine timestep, state, and vision
+        c = t_emb + s_emb  # [batch, hidden_dim]
+
+        if self.use_vision and image is not None:
+            v_emb = self.vision_encoder(image)  # [batch, hidden_dim]
+            c = c + v_emb
+
+        # Action as sequence (can be extended to multiple tokens)
+        x = a_emb.unsqueeze(1)  # [batch, 1, hidden_dim]
+
+        # Apply transformer blocks with standard multi-head attention
         for block in self.blocks:
             x = block(x, c)
-        x = x.squeeze(1)
-        return self.final_layer(x)
+
+        # Predict noise
+        x = x.squeeze(1)  # [batch, hidden_dim]
+        noise_pred = self.final_layer(x)  # [batch, action_dim]
+
+        return noise_pred
 
 
-# Simple Agent
+# rl agent using DiT
 class DiTAgent:
-    def __init__(self, state_dim, action_dim, device="cuda"):
+    """RL Agent using Diffusion Transformer for action generation"""
+
+    # self, state dim, action dim, use vision, device cuda
+    def __init__(
+        self,
+        state_dim,
+        action_dim,
+        use_vision=True,
+        device="cuda",
+    ):
+        # state + action -> new state: state -> action -> new state
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.use_vision = use_vision
         self.device = device
-        self.num_diffusion_steps = 10
+
+        # Diffusion hyperparameters (using KDA wrapper settings)
+        self.num_diffusion_steps = 5  # Increased for better quality with KDA
+        self.beta_start = 0.0001
+        self.beta_end = 0.02
+
+        # Create diffusion schedule with careful numerical stability
         self.betas = torch.linspace(
-            0.0001, 0.02, self.num_diffusion_steps, dtype=torch.float32
+            self.beta_start,
+            self.beta_end,
+            self.num_diffusion_steps,
+            dtype=torch.float32,
         ).to(device)
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-        self.alphas_cumprod = torch.clamp(self.alphas_cumprod, min=1e-8, max=1.0)
-        self.model = DiffusionTransformer(state_dim, action_dim).to(device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
-        self.buffer = deque(maxlen=5000)  # Smaller buffer
-        self.batch_size = 32  # Smaller batch
-        self.noise_scale = 0.1
-        self.step_count = 0
-        self.update_freq = 10
 
-    def get_action(self, state, deterministic=False):
+        # Clamp to avoid numerical issues
+        self.alphas_cumprod = torch.clamp(self.alphas_cumprod, min=1e-8, max=1.0)
+
+        # Initialize KDA DiffusionTransformer with vision
+        self.model = DiffusionTransformer(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            hidden_dim=128,
+            num_layers=3,
+            num_heads=4,
+            use_vision=use_vision,
+        ).to(device)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
+
+        # Experience replay buffer (using deque for O(1) append/pop)
+        self.buffer = deque(maxlen=10000)
+        self.buffer_size = 10000
+        self.batch_size = 64
+
+        # Training stats
+        self.episode_count = 0
+        self.total_reward_history = []
+        self.loss_history = []  # Track training loss
+        self.noise_scale = 0.3  # Exploration noise
+        self.step_count = 0  # Total training steps
+
+    def get_action(self, state, image=None, deterministic=False):
+        """Generate action using reverse diffusion process"""
         self.model.eval()
         with torch.no_grad():
+            # Check for NaN in state
+            if np.any(np.isnan(state)):
+                print(f"WARNING: NaN detected in state: {state}")
+                state = np.nan_to_num(state, 0.0)
+
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+
+            # Process image if provided
+            image_tensor = None
+            if image is not None and self.use_vision:
+                # Check for NaN in image
+                if np.any(np.isnan(image)):
+                    print(f"WARNING: NaN detected in image")
+                    image = np.nan_to_num(image, 0.0)
+                image_tensor = (
+                    torch.FloatTensor(image).unsqueeze(0).to(self.device) / 255.0
+                )
+
+            # Start from random noise
             action = (
                 torch.randn(1, self.action_dim, dtype=torch.float32).to(self.device)
                 * 0.5
             )
+
+            # Reverse diffusion process (DDPM sampling)
             for t in reversed(range(self.num_diffusion_steps)):
                 timestep = torch.FloatTensor([[t / self.num_diffusion_steps]]).to(
                     self.device
                 )
-                predicted_noise = self.model(action, state_tensor, timestep)
+
+                # Predict noise
+                predicted_noise = self.model(
+                    action, state_tensor, timestep, image_tensor
+                )
+
+                # Check for NaN in predicted noise
                 if torch.isnan(predicted_noise).any():
+                    print(f"WARNING: NaN in predicted_noise at step {t}")
                     predicted_noise = torch.zeros_like(predicted_noise)
+
+                # Denoise using DDPM formula with numerical stability
                 alpha_t = self.alphas[t]
                 alpha_cumprod_t = self.alphas_cumprod[t]
                 beta_t = self.betas[t]
+
+                # Compute coefficients with clamping
                 coef1 = 1.0 / torch.sqrt(alpha_t + 1e-8)
                 coef2 = beta_t / (torch.sqrt(1.0 - alpha_cumprod_t + 1e-8))
+
+                # Update action
                 action = coef1 * (action - coef2 * predicted_noise)
+
+                # Clamp intermediate values to prevent explosion
                 action = torch.clamp(action, -10.0, 10.0)
+
+                # Add noise if not final step
                 if t > 0:
-                    action = action + torch.randn_like(action) * 0.1
+                    noise = torch.randn_like(action) * 0.1  # Reduced noise
+                    action = action + noise
+
+            # Add exploration noise during training
             if not deterministic:
-                action = action + self.noise_scale * 0.05 * torch.randn_like(action)
-            action = torch.clamp(action, -0.5, 0.5)
+                action = action + self.noise_scale * 0.1 * torch.randn_like(action)
+
+            action = torch.clamp(action, -1.0, 1.0)  # Keep actions normalized
+
+            # Final NaN check
             if torch.isnan(action).any():
+                print("WARNING: NaN in action output, returning random")
                 action = torch.randn_like(action) * 0.3
+
         return action.cpu().numpy()[0]
 
-    def update(self, state, action, reward, next_state):
-        experience = (state, action, reward, next_state)
-        self.buffer.append(experience)
-        self.step_count += 1
-        if (
-            len(self.buffer) >= self.batch_size
-            and self.step_count % self.update_freq == 0
-        ):
-            self._train()
+    def update(self, state, action, reward, next_state, image=None):
+        """Store experience and train the diffusion model with reward weighting"""
+        # Only store experiences with valid vision data
+        if self.use_vision and (image is None or image.size == 0 or np.all(image == 0)):
+            return  # Skip invalid vision experiences
 
-    def _train(self):
+        experience = (state, action, reward, next_state, image)
+
+        # Add to buffer
+        self.buffer.append(experience)
+
+        # Train if enough samples
+        if len(self.buffer) < self.batch_size:
+            return
+
+        # Sample batch from buffer
+        if self.use_vision:
+            valid_indices = [
+                i for i in range(len(self.buffer)) if self.buffer[i][4] is not None
+            ]
+            if len(valid_indices) < self.batch_size:
+                return  # Not enough valid samples
+            indices = np.random.choice(valid_indices, self.batch_size, replace=False)
+        else:
+            indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
+        batch = [self.buffer[i] for i in indices]
+
+        # Convert to tensors
+        states = torch.FloatTensor(np.array([s for s, a, r, ns, img in batch])).to(
+            self.device
+        )
+        actions = torch.FloatTensor(np.array([a for s, a, r, ns, img in batch])).to(
+            self.device
+        )
+        rewards = torch.FloatTensor(np.array([r for s, a, r, ns, img in batch])).to(
+            self.device
+        )
+
+        # Process images if using vision
+        images_tensor = None
+        if self.use_vision:
+            images = [img for s, a, r, ns, img in batch]
+            # All images should be valid now due to filtering in update()
+            images_tensor = torch.FloatTensor(np.stack(images)).to(self.device) / 255.0
+
+        # Diffusion training
         self.model.train()
-        batch_size = min(self.batch_size, len(self.buffer))
-        batch = random.sample(self.buffer, batch_size)
-        states = torch.tensor([exp[0] for exp in batch], dtype=torch.float32).to(
-            self.device
-        )
-        actions = torch.tensor([exp[1] for exp in batch], dtype=torch.float32).to(
-            self.device
-        )
-        timesteps_int = torch.randint(0, self.num_diffusion_steps, (batch_size,)).to(
-            self.device
-        )
-        timestep = (timesteps_int.float() / self.num_diffusion_steps).unsqueeze(-1)
-        noise = torch.randn(batch_size, self.action_dim).to(self.device)
-        sqrt_alpha_cumprod_t = self.alphas_cumprod[timesteps_int].sqrt().unsqueeze(-1)
-        sqrt_one_minus_alpha_cumprod_t = (
-            (1.0 - self.alphas_cumprod[timesteps_int]).sqrt().unsqueeze(-1)
-        )
+
+        # Sample random timesteps
+        t = torch.randint(
+            0, self.num_diffusion_steps, (self.batch_size,), dtype=torch.long
+        ).to(self.device)
+
+        # Add noise to actions (forward diffusion process)
+        noise = torch.randn_like(actions)
+        alpha_cumprod_t = self.alphas_cumprod[t].view(-1, 1)
+
+        # x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * noise
         noisy_actions = (
-            sqrt_alpha_cumprod_t * actions + sqrt_one_minus_alpha_cumprod_t * noise
+            torch.sqrt(alpha_cumprod_t + 1e-8) * actions
+            + torch.sqrt(1.0 - alpha_cumprod_t + 1e-8) * noise
         )
-        predicted_noise = self.model(noisy_actions, states, timestep)
-        loss = F.mse_loss(predicted_noise, noise)
+
+        # Predict noise
+        timesteps = (t.float() / self.num_diffusion_steps).view(-1, 1)
+        predicted_noise = self.model(noisy_actions, states, timesteps, images_tensor)
+
+        # Compute per-sample loss (MSE between predicted and actual noise)
+        per_sample_loss = F.mse_loss(predicted_noise, noise, reduction="none").mean(
+            dim=1
+        )
+
+        # Reward-based weighting: high reward = more weight
+        # Normalize rewards to [0, 1], then scale by 2, then apply softmax
+        reward_normalized = (rewards - rewards.min()) / (rewards.max() - rewards.min() + 1e-8)
+        reward_weights = F.softmax(reward_normalized * 2.0, dim=0) * len(rewards)  # Scale by batch size
+        weighted_loss = (per_sample_loss * reward_weights).mean()
+
+        # Optimize with gradient clipping
         self.optimizer.zero_grad()
-        loss.backward()
+        weighted_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
+        # Track training metrics
+        self.loss_history.append(weighted_loss.item())
+        self.step_count += 1
 
-# Main simulation and training loop
-device = "cuda" if torch.cuda.is_available() else "cpu"
-state_dim = 17  # 7 joint pos + 7 joint vel + 3 relative pos to target
-action_dim = 7  # joint position targets
-agent = DiTAgent(state_dim, action_dim, device)
+        # Decay exploration noise - floor at 0.10 for bold exploration
+        self.noise_scale = max(0.10, self.noise_scale * 0.999)
 
-world = World()
-world.scene.add_default_ground_plane()
+        # Return loss for logging
+        return weighted_loss.item()
+
+    def save_model(self, filepath):
+        """Save agent state to file"""
+        model_data = {
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "episode_count": self.episode_count,
+            "total_reward_history": self.total_reward_history,
+            "loss_history": self.loss_history[-1000:],  # Save last 1000 losses
+            "buffer": list(self.buffer)[
+                -1000:
+            ],  # Convert deque to list, save last 1000
+            "noise_scale": self.noise_scale,
+            "step_count": self.step_count,
+        }
+        torch.save(model_data, filepath)
+        print(f"Model saved to {filepath}")
+
+    def load_model(self, filepath):
+        """Load agent state from file"""
+        if not os.path.exists(filepath):
+            print(f"Model file {filepath} not found. Starting fresh.")
+            return False
+
+        model_data = torch.load(filepath, map_location=self.device, weights_only=False)
+        self.model.load_state_dict(model_data["model_state_dict"])
+        self.optimizer.load_state_dict(model_data["optimizer_state_dict"])
+        self.episode_count = model_data["episode_count"]
+        self.total_reward_history = model_data["total_reward_history"]
+        self.loss_history = model_data.get("loss_history", [])
+        self.step_count = model_data.get("step_count", 0)
+
+        # Load buffer and convert back to deque
+        buffer_list = model_data.get("buffer", [])
+        self.buffer = deque(buffer_list, maxlen=self.buffer_size)
+
+        self.noise_scale = model_data.get("noise_scale", 0.3)
+
+        print(f"Model loaded from {filepath}")
+        print(
+            f"Resuming from episode {self.episode_count}, step {self.step_count}, buffer size: {len(self.buffer)}"
+        )
+        return True
+
+
+# Setup scene
 assets_root_path = get_assets_root_path()
+if assets_root_path is None:
+    carb.log_error("Could not find Isaac Sim assets folder")
+    simulation_app.close()
+    sys.exit()
 
-# Add Franka robot
-franka_asset_path = os.path.join(
-    assets_root_path, "Isaac", "Robots", "Franka", "franka.usd"
-)
-add_reference_to_stage(franka_asset_path, "/World/Franka")
-
-# Setup manipulator (assuming no gripper for simple reaching)
-franka = SingleManipulator(
-    prim_path="/World/Franka",
-    name="franka",
-    end_effector_prim_path="/World/Franka/panda_right_hand",  # Adjust if needed
-)
-world.scene.add(franka)
-
-# Add target object (simple cube using DynamicCuboid) - FIXED
-target = DynamicCuboid(
-    prim_path="/World/target",
-    name="target",
-    position=np.array([0.5, 0.0, 0.5]),
-    size=0.1,  # Single float value instead of numpy array
-)
-world.scene.add(target)
+my_world = World(stage_units_in_meters=1.0)
+my_world.scene.add_default_ground_plane()
 
 # Set camera view
-set_camera_view(eye=np.array([1.2, 1.2, 1.0]), target=np.array([0.5, 0.0, 0.5]))
+set_camera_view(
+    eye=[2.5, 2.5, 2.0],
+    target=[0.0, 0.0, 0.5],
+    camera_prim_path="/OmniverseKit_Persp",
+)
 
-# Reset world
-world.reset()
+# === UR10e ROBOT SETUP (from test_grasp_official.py) ===
+# Add UR10e robot arm with Robotiq gripper
+asset_path = (
+    assets_root_path
+    + "/Isaac/Samples/Rigging/Manipulator/configure_manipulator/ur10e/ur/ur_gripper.usd"
+)
+robot_prim = add_reference_to_stage(usd_path=asset_path, prim_path="/World/ur")
 
-# Home position for Franka (example)
-home_pos = np.array(
-    [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
-)  # Standard Franka home
-franka.set_joint_positions(home_pos)
-world.step(render=True)
+# Configure Robotiq 2F-140 gripper (parallel jaw)
+gripper = ParallelGripper(
+    end_effector_prim_path="/World/ur/ee_link/robotiq_arg2f_base_link",
+    joint_prim_names=["finger_joint"],
+    joint_opened_positions=np.array([0]),
+    joint_closed_positions=np.array([40]),
+    action_deltas=np.array([-40]),
+    use_mimic_joints=True,
+)
+
+# Create SingleManipulator
+robot = SingleManipulator(
+    prim_path="/World/ur",
+    name="ur10_robot",
+    end_effector_prim_path="/World/ur/ee_link/robotiq_arg2f_base_link",
+    gripper=gripper,
+)
+
+# Add wrist camera for vision
+from isaacsim.core.utils.prims import create_prim
+from isaacsim.sensors.camera import Camera
+from pxr import Gf, UsdLux
+
+# === OVERHEAD CAMERA (Eye-to-Hand) - For RL policy (small, fast) ===
+camera_prim_path = "/World/OverheadCamera"
+create_prim(camera_prim_path, "Camera")
+eye = Gf.Vec3d(0.1, 0.0, 1.2)
+target = Gf.Vec3d(0.1, 0.0, 0.0)
+set_camera_view(eye=eye, target=target, camera_prim_path=camera_prim_path)
+camera_prim = my_world.stage.GetPrimAtPath(camera_prim_path)
+camera_prim.GetAttribute("horizontalAperture").Set(80.0)
+camera_prim.GetAttribute("verticalAperture").Set(80.0)
+overhead_camera = Camera(
+    prim_path=camera_prim_path,
+    resolution=(84, 84),  # Small for fast RL training
+)
+overhead_camera.initialize()
+
+# === SIDE VIEW CAMERA - For video recording (high-res, better angle) ===
+side_camera_prim_path = "/World/SideCamera"
+create_prim(side_camera_prim_path, "Camera")
+# Position camera MUCH farther back to see entire scene
+eye_side = Gf.Vec3d(3.5, 3.5, 2.5)  # Very far back and high - full scene view
+target_side = Gf.Vec3d(0.0, 0.0, 0.5)  # Look at center of robot
+set_camera_view(
+    eye=eye_side, target=target_side, camera_prim_path=side_camera_prim_path
+)
+camera_prim_side = my_world.stage.GetPrimAtPath(side_camera_prim_path)
+camera_prim_side.GetAttribute("horizontalAperture").Set(50.0)  # Very wide FOV
+camera_prim_side.GetAttribute("verticalAperture").Set(37.5)  # 16:9 aspect ratio
+side_camera = Camera(
+    prim_path=side_camera_prim_path,
+    resolution=(1280, 720),  # HD resolution for clear video
+)
+side_camera.initialize()
+print("✓ Cameras initialized: Overhead (84x84) for RL, Side (1280x720) for video")
+
+# === RED CUBE SETUP (matching test_grasp_official.py) ===
+# Add red cube with same setup as test_grasp_official.py
+from isaacsim.core.api.objects import DynamicCuboid
+
+# Use exact same cube size as test_grasp_official.py
+cube_size = 0.0515  # 5.15cm cube (same as test_grasp_official.py)
+cube_initial_x = 0.5  # Same as test_grasp_official.py
+cube_initial_y = 0.2  # Same as test_grasp_official.py
+cube_initial_z = cube_size / 2.0  # On ground plane
+
+print(f"\n=== RED CUBE SETUP (matching test_grasp_official.py) ===")
+print(
+    f"Cube initial position: [{cube_initial_x:.3f}, {cube_initial_y:.3f}, {cube_initial_z:.3f}]"
+)
+
+cube = DynamicCuboid(
+    name="red_cube",
+    position=np.array([cube_initial_x, cube_initial_y, cube_initial_z]),
+    orientation=np.array([1, 0, 0, 0]),
+    prim_path="/World/Cube",
+    scale=np.array([cube_size, cube_size, cube_size]),
+    size=1.0,
+    color=np.array([1.0, 0.0, 0.0]),  # RED cube
+)
+my_world.scene.add(cube)
+
+stage = my_world.stage
+sphere_path = "/World/Cube"  # Keep variable name for compatibility
+sphere_translate = None  # Will be set during reset
+
+# Cube already has RED color from DynamicCuboid - no need for extra material
+
+# Create RigidPrim reference for tracking cube position
+ball = cube  # Keep variable name "ball" for code compatibility
+
+# === ADD LIGHTING (CRITICAL for camera vision) ===
+# Add bright dome light for even illumination
+dome_light_path = "/World/DomeLight"
+dome_light = UsdLux.DomeLight.Define(stage, dome_light_path)
+dome_light.CreateIntensityAttr(1000.0)  # Bright lighting
+
+# Add directional light from above
+distant_light_path = "/World/DistantLight"
+distant_light = UsdLux.DistantLight.Define(stage, distant_light_path)
+distant_light.CreateIntensityAttr(2000.0)
+distant_light_xform = distant_light.AddRotateXYZOp()
+distant_light_xform.Set(Gf.Vec3f(-45, 0, 0))  # Angle from above
+
+print("=" * 50 + "\n")
+
+# Initialize world
+my_world.reset()
+
+# Initialize robot articulation (CRITICAL - must be after world reset)
+robot.initialize()
+ball.initialize()
+# SingleManipulator has built-in end_effector property (initialized automatically)
+
+# === Initialize RMPflow for UR10e (from test_grasp_official.py approach) ===
+print("Initializing RMPflow ArticulationMotionPolicy for UR10e...")
+
+# Use custom RMPflow config for UR10e (same as test_grasp_official.py)
+import isaacsim.robot_motion.motion_generation as mg
+
+rmpflow_dir = os.path.join(os.path.dirname(__file__), "rmpflow")
+rmp_flow = mg.lula.motion_policies.RmpFlow(
+    robot_description_path=os.path.join(rmpflow_dir, "robot_descriptor.yaml"),
+    rmpflow_config_path=os.path.join(rmpflow_dir, "ur10e_rmpflow_common.yaml"),
+    urdf_path=os.path.join(rmpflow_dir, "ur10e.urdf"),
+    end_effector_frame_name="ee_link_robotiq_arg2f_base_link",
+    maximum_substep_size=0.00334,
+)
+
+# Create motion policy with physics timestep
+physics_dt = 1.0 / 60.0  # 60Hz control loop
+motion_policy = ArticulationMotionPolicy(robot, rmp_flow, physics_dt)
+print("✓ RMPflow initialized - robot can now accurately reach and grasp the cube!")
+
+# RL Training parameters
+MODEL_PATH = "rl_robot_arm_model.pth"
+
+# Using Cartesian control: (x, y, z, gripper) - GitHub best practice for grasping
+# Simpler 4D action space instead of 12D joint control
+# UR10e has 12 DOF: 6 arm joints + 6 gripper joints (with mimic)
+state_dim = 13  # 12 joints + 1 cube_grasped
+action_dim = 4  # dx, dy, dz, gripper
+
+agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=True)
+
+# Try to load existing model
+agent.load_model(MODEL_PATH)
+
+# === ONLINE TRAINING PARAMETERS ===
+print("\n" + "=" * 70)
+print(" STARTING ONLINE RL TRAINING")
+print("=" * 70)
+print("Robot will learn from online interactions")
+print("High-reward experiences will be weighted more during training")
+print(f"Model will be saved to: {MODEL_PATH}\n")
 
 # Training parameters
-num_episodes = 100
-max_steps = 200
-target_pos = np.array(
-    [0.5, 0.0, 0.5]
-)  # Fixed target for simplicity; randomize in future
-target_orientation = np.array([1.0, 0.0, 0.0, 0.0])
+MAX_EPISODES = 1000
+MAX_STEPS_PER_EPISODE = 500
+SAVE_INTERVAL = 10  # Save model every 10 episodes
+VIDEO_INTERVAL = 20  # Record video every 20 episodes
+VIDEO_PATH = "/home/kenpeter/work/robot/online_training_video.mp4"
 
-print("Starting training...")
-success_count = 0
-best_distance = float("inf")
+# Start simulation
+print("[DEBUG] Starting simulation timeline...")
+my_world.play()
+print(f"[DEBUG] World is playing: {my_world.is_playing()}")
+print("✓ Simulation timeline started\n")
 
-for episode in range(num_episodes):
-    world.reset()
-    target.set_world_pose(position=target_pos, orientation=target_orientation)
-    # Reset to home
-    franka.set_joint_positions(home_pos)
-    world.step(render=True)
 
-    episode_reward = 0.0
-    done = False
-    step = 0
-    episode_success = False
+# Helper function to reset environment
+def reset_environment():
+    """Reset robot and cube to initial positions"""
+    # Reset robot
+    initial_pos = np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0])
+    gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    robot.set_joint_positions(np.concatenate([initial_pos, gripper_open]))
 
-    while not done and step < max_steps:
-        # Get state: joint pos (7), joint vel (7), rel pos (3)
-        joint_pos = franka.get_joint_positions()
-        joint_vel = franka.get_joint_velocities()
-        ee_pose = franka.end_effector.get_world_pose()
-        ee_pos = ee_pose[0]
-        rel_pos = target_pos - ee_pos
-        state = np.concatenate([joint_pos, joint_vel, rel_pos])
+    # Reset cube to random position
+    cube_size = 0.0515
+    cube_x = np.random.uniform(0.4, 0.6)
+    cube_y = np.random.uniform(-0.3, 0.3)
+    cube_z = cube_size / 2.0
+    ball.set_world_pose(position=np.array([cube_x, cube_y, cube_z]))
 
-        # Gradually reduce exploration noise
-        current_noise_scale = max(0.01, agent.noise_scale * (0.99**episode))
-        agent.noise_scale = current_noise_scale
+    # Stabilize
+    for _ in range(10):
+        my_world.step(render=False)
 
-        action = agent.get_action(state)
+    return cube_x, cube_y
 
-        # Apply action (joint position targets)
-        franka.set_joint_positions(action)
-        world.step(render=True)
 
-        # Get next state
-        next_joint_pos = franka.get_joint_positions()
-        next_joint_vel = franka.get_joint_velocities()
-        next_ee_pose = franka.end_effector.get_world_pose()
-        next_ee_pos = next_ee_pose[0]
-        next_rel_pos = target_pos - next_ee_pos
-        next_state = np.concatenate([next_joint_pos, next_joint_vel, next_rel_pos])
+# Helper function to compute reward
+def compute_reward(ee_pos, ball_pos, grasped, prev_dist):
+    """Compute reward based on distance to cube and grasp success"""
+    ball_dist = np.linalg.norm(ee_pos - ball_pos)
 
-        # Improved reward function
-        dist = np.linalg.norm(next_rel_pos)
-        prev_dist = np.linalg.norm(rel_pos)
+    # Distance-based reward (closer is better)
+    reward = -ball_dist
 
-        # Distance reward + progress reward + success bonus
-        reward = -dist * 2.0  # Base distance penalty
-        reward += (prev_dist - dist) * 5.0  # Progress bonus
+    # Grasp bonus
+    if grasped:
+        reward += 10.0
 
-        if dist < 0.05:
-            reward += 20.0
-            done = True
-            episode_success = True
-            success_count += 1
-            print(f"SUCCESS! Reached target in {step} steps")
+    # Progress reward (getting closer)
+    if ball_dist < prev_dist:
+        reward += 0.5
 
-        # Penalty for large actions to encourage smooth movements
-        action_penalty = np.linalg.norm(action) * 0.01
-        reward -= action_penalty
+    return reward, ball_dist
 
-        agent.update(state, action, reward, next_state)
-        episode_reward += reward
 
-        # Update best distance
-        if dist < best_distance:
-            best_distance = dist
+try:
+    for episode in range(MAX_EPISODES):
+        print(f"\n===== Episode {episode+1}/{MAX_EPISODES} =====")
 
-        state = next_state
-        step += 1
+        # Reset environment
+        cube_x, cube_y = reset_environment()
 
-        if step >= max_steps:
-            done = True
+        episode_reward = 0.0
+        episode_loss = []
+        prev_dist = 999.0
 
-    success_rate = (success_count / (episode + 1)) * 100
-    print(
-        f"Episode {episode + 1}: Reward = {episode_reward:.2f}, Final dist = {dist:.3f}, "
-        f"Success = {episode_success}, Success Rate = {success_rate:.1f}%"
-    )
+        # Run episode
+        for step in range(MAX_STEPS_PER_EPISODE):
+            my_world.step(render=True)
 
-    # Early stopping if consistently successful
-    if success_count >= 10 and episode >= 20:
-        print("Good performance achieved! Stopping early.")
-        break
+            # Get current state and image
+            overhead_camera.get_current_frame()
+            rgba_data = overhead_camera.get_rgba()
+            if rgba_data is not None and rgba_data.size > 0:
+                if len(rgba_data.shape) == 1:
+                    rgba_data = rgba_data.reshape(84, 84, 4)
+                rgb_image = rgba_data[:, :, :3].astype(np.uint8)
+            else:
+                rgb_image = np.zeros((84, 84, 3), dtype=np.uint8)
 
-print(f"Training complete. Final success rate: {success_rate:.1f}%")
-print(f"Best distance achieved: {best_distance:.3f}")
-print(f"Total successes: {success_count}/{episode + 1}")
+            joint_positions_raw = robot.get_joint_positions()
+            if isinstance(joint_positions_raw, tuple):
+                joint_positions = joint_positions_raw[0]
+            else:
+                joint_positions = joint_positions_raw
 
-# Test the trained agent
-print("\nTesting trained agent...")
-for test_episode in range(3):
-    world.reset()
-    target.set_world_pose(position=target_pos, orientation=target_orientation)
-    franka.set_joint_positions(home_pos)
-    world.step(render=True)
+            ball_pos, _ = ball.get_world_pose()
+            ball_pos = np.array(ball_pos).flatten()
+            ee_pos, _ = robot.end_effector.get_world_pose()
+            ee_pos = np.array(ee_pos).flatten()
+            ball_dist = np.linalg.norm(ee_pos - ball_pos)
+            gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
+            grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
+            state = np.concatenate([joint_positions, [grasped]])
 
-    test_reward = 0.0
-    done = False
-    step = 0
+            # Get action from policy
+            action = agent.get_action(state, image=rgb_image, deterministic=False)
 
-    while not done and step < max_steps:
-        joint_pos = franka.get_joint_positions()
-        joint_vel = franka.get_joint_velocities()
-        ee_pose = franka.end_effector.get_world_pose()
-        ee_pos = ee_pose[0]
-        rel_pos = target_pos - ee_pos
-        state = np.concatenate([joint_pos, joint_vel, rel_pos])
+            # Execute action with RMPflow
+            delta_pos = action[:3] * 0.05
+            target_position = ee_pos + delta_pos
+            target_position = np.clip(
+                target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
+            )
+            rmp_flow.set_end_effector_target(
+                target_position=target_position, target_orientation=None
+            )
+            actions = motion_policy.get_next_articulation_action(1.0 / 60.0)
+            robot.apply_action(actions)
 
-        # Use deterministic actions for testing
-        action = agent.get_action(state, deterministic=True)
-        franka.set_joint_positions(action)
-        world.step(render=True)
+            # Gripper control
+            gripper_action = np.clip(action[3], -1.0, 1.0)
+            current_joints_raw = robot.get_joint_positions()
+            if isinstance(current_joints_raw, tuple):
+                current_joints = current_joints_raw[0].copy()
+            else:
+                current_joints = current_joints_raw.copy()
+            if len(current_joints) > 6:
+                current_gripper = current_joints[6]
+                target_gripper = np.clip(
+                    current_gripper + gripper_action * 0.01, 0.0, 0.04
+                )
+                current_joints[6] = target_gripper
+                robot.set_joint_positions(current_joints)
 
-        dist = np.linalg.norm(rel_pos)
-        test_reward -= dist
+            # Step simulation to get next state
+            my_world.step(render=False)
 
-        if dist < 0.05:
-            print(f"Test {test_episode + 1}: SUCCESS in {step} steps!")
-            done = True
+            # Get next state
+            joint_positions_raw_next = robot.get_joint_positions()
+            if isinstance(joint_positions_raw_next, tuple):
+                joint_positions_next = joint_positions_raw_next[0]
+            else:
+                joint_positions_next = joint_positions_raw_next
 
-        step += 1
+            ball_pos_next, _ = ball.get_world_pose()
+            ball_pos_next = np.array(ball_pos_next).flatten()
+            ee_pos_next, _ = robot.end_effector.get_world_pose()
+            ee_pos_next = np.array(ee_pos_next).flatten()
+            ball_dist_next = np.linalg.norm(ee_pos_next - ball_pos_next)
+            gripper_pos_next = (
+                joint_positions_next[6] if len(joint_positions_next) > 6 else 0.0
+            )
+            grasped_next = float(ball_dist_next < 0.15 and gripper_pos_next > 0.02)
+            next_state = np.concatenate([joint_positions_next, [grasped_next]])
 
-    if not done:
+            # Compute reward
+            reward, ball_dist = compute_reward(ee_pos, ball_pos, grasped, prev_dist)
+            prev_dist = ball_dist
+            episode_reward += reward
+
+            # Store experience and train (online training with reward weighting)
+            loss = agent.update(state, action, reward, next_state, rgb_image)
+            if loss is not None:
+                episode_loss.append(loss)
+
+        # Episode summary
+        avg_loss = np.mean(episode_loss) if episode_loss else 0.0
         print(
-            f"Test {test_episode + 1}: Failed to reach target (final dist: {dist:.3f})"
+            f"Episode {episode+1}/{MAX_EPISODES} | Reward: {episode_reward:.2f} | Loss: {avg_loss:.6f} | Buffer: {len(agent.buffer)}"
         )
+        agent.episode_count += 1
+        agent.total_reward_history.append(episode_reward)
 
-simulation_app.close()
+        # Save checkpoint
+        if (episode + 1) % SAVE_INTERVAL == 0:
+            agent.save_model(MODEL_PATH)
+            print(f"  → Checkpoint saved at episode {episode+1}\n")
+
+        # Record video
+        if (episode + 1) % VIDEO_INTERVAL == 0:
+            print(f"\n📹 Recording video at episode {episode+1}...")
+
+            # Reset for video recording
+            cube_x, cube_y = reset_environment()
+
+            video_frames = []
+            for step in range(200):  # Record 200 steps
+                my_world.step(render=True)
+
+                # Get state and action
+                overhead_camera.get_current_frame()
+                rgba_data = overhead_camera.get_rgba()
+                if rgba_data is not None and rgba_data.size > 0:
+                    if len(rgba_data.shape) == 1:
+                        rgba_data = rgba_data.reshape(84, 84, 4)
+                    rgb_image = rgba_data[:, :, :3].astype(np.uint8)
+                else:
+                    rgb_image = np.zeros((84, 84, 3), dtype=np.uint8)
+
+                joint_positions_raw = robot.get_joint_positions()
+                if isinstance(joint_positions_raw, tuple):
+                    joint_positions = joint_positions_raw[0]
+                else:
+                    joint_positions = joint_positions_raw
+
+                ball_pos, _ = ball.get_world_pose()
+                ball_pos = np.array(ball_pos).flatten()
+                ee_pos, _ = robot.end_effector.get_world_pose()
+                ee_pos = np.array(ee_pos).flatten()
+                ball_dist = np.linalg.norm(ee_pos - ball_pos)
+                gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
+                grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
+                state = np.concatenate([joint_positions, [grasped]])
+
+                action = agent.get_action(state, image=rgb_image, deterministic=True)
+
+                # Execute action
+                delta_pos = action[:3] * 0.05
+                target_position = ee_pos + delta_pos
+                target_position = np.clip(
+                    target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
+                )
+                rmp_flow.set_end_effector_target(
+                    target_position=target_position, target_orientation=None
+                )
+                actions = motion_policy.get_next_articulation_action(1.0 / 60.0)
+                robot.apply_action(actions)
+
+                gripper_action = np.clip(action[3], -1.0, 1.0)
+                current_joints_raw = robot.get_joint_positions()
+                if isinstance(current_joints_raw, tuple):
+                    current_joints = current_joints_raw[0].copy()
+                else:
+                    current_joints = current_joints_raw.copy()
+                if len(current_joints) > 6:
+                    current_gripper = current_joints[6]
+                    target_gripper = np.clip(
+                        current_gripper + gripper_action * 0.01, 0.0, 0.04
+                    )
+                    current_joints[6] = target_gripper
+                    robot.set_joint_positions(current_joints)
+
+                # Capture frame
+                side_camera.get_current_frame()
+                side_rgba = side_camera.get_rgba()
+                if side_rgba is not None and side_rgba.size > 0:
+                    if len(side_rgba.shape) == 1:
+                        side_rgba = side_rgba.reshape(720, 1280, 4)
+                    side_rgb = side_rgba[:, :, :3].astype(np.uint8)
+                    side_bgr = cv2.cvtColor(side_rgb, cv2.COLOR_RGB2BGR)
+                    video_frames.append(side_bgr)
+
+            # Save video
+            if len(video_frames) > 0:
+                video_path = VIDEO_PATH.replace(".mp4", f"_episode{episode+1}.avi")
+                fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                video_writer = cv2.VideoWriter(video_path, fourcc, 30.0, (1280, 720))
+                if video_writer.isOpened():
+                    for frame in video_frames:
+                        video_writer.write(frame)
+                    video_writer.release()
+                    print(f"✓ Video saved: {video_path}\n")
+
+except KeyboardInterrupt:
+    print("\nOnline training interrupted by user")
+    agent.save_model(MODEL_PATH)
+    print("Model saved before exit")
+except Exception as e:
+    print(f"Error during training: {e}")
+    import traceback
+
+    traceback.print_exc()
+    agent.save_model(MODEL_PATH)
+    print("Model saved after error")
+finally:
+    print(f"\n✓ Online training complete!")
+    print(f"✓ Final model saved to: {MODEL_PATH}")
+    agent.save_model(MODEL_PATH)
+
+    # Explicit cleanup to avoid shutdown crash
+    try:
+        my_world.stop()
+        my_world.clear()
+    except:
+        pass
+
+    simulation_app.close()
