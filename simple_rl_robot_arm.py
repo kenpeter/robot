@@ -190,7 +190,7 @@ class DiffusionTransformer(nn.Module):
             nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, action_dim)
         )
 
-    # forward
+    # forward with noise
     def forward(self, noisy_action, state, timestep, image=None):
         """
         noisy_action: [batch, action_dim] - noisy action at timestep t
@@ -688,7 +688,7 @@ print(f"Model will be saved to: {MODEL_PATH}\n")
 
 # Training parameters
 MAX_EPISODES = 1000
-MAX_STEPS_PER_EPISODE = 500
+MAX_STEPS_PER_EPISODE = 1500
 SAVE_INTERVAL = 10  # Save model every 10 episodes
 VIDEO_INTERVAL = 20  # Record video every 20 episodes
 VIDEO_PATH = "/home/kenpeter/work/robot/online_training_video.mp4"
