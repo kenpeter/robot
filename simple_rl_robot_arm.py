@@ -139,7 +139,7 @@ class ConditionalDiffusionMLP(nn.Module):
 
 # === VLM-BASED REWARD SHAPING ===
 class VLMRewardHelper:
-    """Uses SmolVLM-256M-Instruct to provide vision-based reward feedback"""
+    """Uses SmolVLM-500M-Instruct to provide vision-based reward feedback (2x smarter than 256M)"""
 
     def __init__(self, model_path):
         print(f"[VLM] Loading vision-language model from {model_path}...")
@@ -789,9 +789,9 @@ print("=" * 70)
 print("LOADING VISION-LANGUAGE MODEL FOR REWARD COMPUTATION")
 print("=" * 70)
 
-# Load VLM - using lightweight SmolVLM-256M-Instruct (faster than Qwen3-VL-2B)
+# Load VLM - using SmolVLM-500M-Instruct (2x larger = smarter reasoning!)
 vlm_helper = VLMRewardHelper(
-    model_path="/home/kenpeter/.cache/huggingface/hub/SmolVLM-256M-Instruct"
+    model_path="/home/kenpeter/.cache/huggingface/hub/SmolVLM-500M-Instruct"
 )
 print(f"[VLM] ✓ Model loaded successfully!")
 print(
