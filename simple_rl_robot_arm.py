@@ -13,7 +13,7 @@ from isaacsim import SimulationApp
 # Initialize simulation
 simulation_app = SimulationApp(
     {
-        "headless": False,
+        "headless": True,
         "width": 1280,
         "height": 720,
         # ray trace vs path trace: ray trace -> good performance -> path trace -> more real
