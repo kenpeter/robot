@@ -659,31 +659,31 @@ def reset_environment():
 
 # Helper function to compute reward
 def compute_reward(ee_pos, ball_pos, grasped, prev_dist):
-    """Compute reward based on distance to cube and grasp success"""
+    """Compute reward based on distance to cube and grasp success (NORMALIZED)"""
     ball_dist = np.linalg.norm(ee_pos - ball_pos)
 
-    # SHAPED REWARD: Multiple distance thresholds with bonuses
-    # Base reward still uses distance
-    reward = 10.0 - (ball_dist * 10.0)
+    # NORMALIZED SHAPED REWARD: Keep rewards in reasonable range [-1, +10]
+    # Base reward: distance-based (normalized to [-1, +1] range)
+    reward = 1.0 - (ball_dist / 2.0)  # 0m=+1.0, 1m=+0.5, 2m=0.0
 
     # Distance-based milestone bonuses (shaped rewards!)
     if ball_dist < 1.5:
-        reward += 5.0   # Within 1.5m
+        reward += 0.5   # Within 1.5m
     if ball_dist < 1.0:
-        reward += 10.0  # Within 1.0m (positive territory!)
+        reward += 1.0   # Within 1.0m
     if ball_dist < 0.5:
-        reward += 20.0  # Within 0.5m (very close!)
+        reward += 2.0   # Within 0.5m (very close!)
     if ball_dist < 0.2:
-        reward += 30.0  # Within 0.2m (almost touching!)
+        reward += 3.0   # Within 0.2m (almost touching!)
 
-    # Grasp bonus (huge!)
+    # Grasp bonus (huge but normalized!)
     if grasped:
-        reward += 100.0
+        reward += 10.0
 
     # Progress reward (scaled by how much closer)
     if ball_dist < prev_dist:
         progress = prev_dist - ball_dist
-        reward += progress * 50.0  # Big reward for moving closer!
+        reward += progress * 5.0  # Reward for moving closer
 
     return reward, ball_dist
 
