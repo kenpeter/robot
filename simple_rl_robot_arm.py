@@ -252,18 +252,24 @@ class VLMRewardHelper:
             is_yes = "yes" in answer_part
             is_no = "no" in answer_part
 
-            # Build reward based on question type and answer
+            # Build reward: HYBRID approach (distance-based + VLM bonus)
+            # Base reward from distance improvement
+            distance_reward = max(0.1, 1.0 - (distance_to_cube / 2.0))  # 0.1 to 1.0
+
+            # VLM bonus/penalty based on question type and answer
+            vlm_bonus = 0.0
             if question_key == "pointing":
-                # Far away - if pointing toward = good start
-                reward = 0.3 if is_yes else 0.1
+                # Far away - VLM confirms if pointing
+                vlm_bonus = 0.1 if is_yes else -0.05
             elif question_key == "close":
-                # Getting closer - if close = good progress
-                reward = 0.6 if is_yes else 0.3
+                # Medium distance - VLM confirms if close
+                vlm_bonus = 0.2 if is_yes else -0.1
             elif question_key == "grasping":
-                # Very close - if grasping = success!
-                reward = 1.0 if is_yes else 0.5
-            else:
-                reward = 0.1
+                # Very close - VLM confirms if grasping
+                vlm_bonus = 0.5 if is_yes else 0.0
+
+            # Final reward = distance progress + VLM confirmation
+            reward = max(0.05, distance_reward + vlm_bonus)
 
             if log_this_step:
                 answer_str = "YES" if is_yes else "NO" if is_no else "UNCLEAR"
