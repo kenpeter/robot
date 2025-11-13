@@ -562,7 +562,11 @@ MODEL_PATH = "rl_robot_arm_model.pth"
 # Using Cartesian control: (x, y, z, gripper) - GitHub best practice for grasping
 # Simpler 4D action space instead of 12D joint control
 # UR10e has 12 DOF: 6 arm joints + 6 gripper joints (with mimic)
-state_dim = 13  # 12 joints + 1 cube_grasped
+
+# FIXED STATE DIMENSION: Now includes spatial awareness!
+# Old (broken): 13D = 12 joints + 1 grasped (model was blind!)
+# New (fixed): 22D = 12 joints + 1 grasped + 3 cube_pos + 3 ee_pos + 3 target_pos
+state_dim = 22  # 12 joints + 1 grasped + 3 cube + 3 gripper + 3 target
 action_dim = 4  # dx, dy, dz, gripper
 
 agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=False)
@@ -663,7 +667,17 @@ try:
             ball_dist = np.linalg.norm(ee_pos - ball_pos)
             gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
             grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
-            state = np.concatenate([joint_positions, [grasped]])
+
+            # FIXED STATE: Include cube position, ee position, and target position
+            # This gives the model spatial awareness!
+            target_pos = np.array([FIXED_TARGET_X, FIXED_TARGET_Y, FIXED_TARGET_Z])
+            state = np.concatenate([
+                joint_positions,  # 12D: robot joint angles
+                [grasped],        # 1D: is cube grasped?
+                ball_pos,         # 3D: WHERE IS THE CUBE? (was missing!)
+                ee_pos,           # 3D: WHERE IS THE GRIPPER? (was missing!)
+                target_pos        # 3D: WHERE SHOULD WE GO? (was missing!)
+            ])  # Total: 22D (was 13D)
 
             # Get action from policy (NO image)
             action = agent.get_action(state, image=None, deterministic=False)
@@ -714,7 +728,16 @@ try:
                 joint_positions_next[6] if len(joint_positions_next) > 6 else 0.0
             )
             grasped_next = float(ball_dist_next < 0.15 and gripper_pos_next > 0.02)
-            next_state = np.concatenate([joint_positions_next, [grasped_next]])
+
+            # FIXED NEXT STATE: Include spatial information
+            target_pos_next = np.array([FIXED_TARGET_X, FIXED_TARGET_Y, FIXED_TARGET_Z])
+            next_state = np.concatenate([
+                joint_positions_next,  # 12D
+                [grasped_next],        # 1D
+                ball_pos_next,         # 3D: cube position
+                ee_pos_next,           # 3D: gripper position
+                target_pos_next        # 3D: target position
+            ])  # Total: 22D
 
             # Compute reward
             reward, ball_dist = compute_reward(ee_pos, ball_pos, grasped, prev_dist)
@@ -764,7 +787,12 @@ try:
                 ball_dist = np.linalg.norm(ee_pos - ball_pos)
                 gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
                 grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
-                state = np.concatenate([joint_positions, [grasped]])
+
+                # Fixed state for video recording
+                target_pos = np.array([FIXED_TARGET_X, FIXED_TARGET_Y, FIXED_TARGET_Z])
+                state = np.concatenate([
+                    joint_positions, [grasped], ball_pos, ee_pos, target_pos
+                ])  # 22D
 
                 action = agent.get_action(state, image=None, deterministic=True)
 
