@@ -145,29 +145,25 @@ class VLMRewardHelper:
         print(f"[VLM] Loading vision-language model from {model_path}...")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # vision: vision -> output seq
-        # from pretain
+        # load model vs processor: vision -> output seq -> load model -> auto processor
         self.model = AutoModelForVision2Seq.from_pretrained(
+            # model path, torch type, trust remote code
             model_path,
             torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
             trust_remote_code=True,
-        ).to(self.device)
+        ).to(
+            self.device
+        )  # move to device
         self.processor = AutoProcessor.from_pretrained(model_path)
 
-        self.base_prompt = """You are analyzing a robot grasping task.
-The robot gripper needs to reach the red cube and grasp it.
-
-Score the robot's approach from 0-10:
-- 0-2: Robot far from cube OR moving in wrong direction (> 1m away)
-- 3-4: Robot gripper pointing toward and approaching the cube (0.5-1m)
-- 5-6: Robot gripper close to cube and properly aligned (< 0.5m)
-- 7-8: Robot gripper touching or grasping the cube
-- 9-10: Robot successfully grasped cube with gripper closed
-
-IMPORTANT: The gripper must move TOWARD the cube, not just get closer by moving down.
-Look at the image - is the gripper reaching out toward the red cube?
-
-Return ONLY a single number 0-10."""
+        # Multiple simple prompts for better consistency
+        self.prompts = {
+            "see_robot": "Can you see a robot arm in this image? Answer yes or no.",
+            "see_cube": "Can you see a red cube in this image? Answer yes or no.",
+            "pointing": "Is the robot gripper pointing toward the red cube? Answer yes or no.",
+            "close": "Is the robot gripper very close to the red cube (touching distance)? Answer yes or no.",
+            "grasping": "Is the robot gripper grasping or holding the red cube? Answer yes or no."
+        }
 
         print(f"[VLM] Model loaded on {self.device}")
 
@@ -188,23 +184,25 @@ Return ONLY a single number 0-10."""
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(image_rgb)
 
-        # Calculate distance for contextual prompt ONLY (not used for reward calculation)
+        # Calculate distance for logging
         distance_to_cube = np.linalg.norm(ee_pos - ball_pos)
-        gripper_state = (
-            "closed"
-            if joint_positions[6] > 0.02
-            else "open" if len(joint_positions) > 6 else "unknown"
-        )
-
-        # Build contextual prompt - give VLM the state info so it can judge better
-        # The VLM will use the IMAGE to see if approach is correct
-        contextual_prompt = f"{self.base_prompt}\n\nContext: Distance to cube: {distance_to_cube:.2f}m. Gripper: {gripper_state}. Step: {step}."
 
         # LOG ONLY EVERY 50 STEPS (to reduce spam)
         log_this_step = step % 50 == 0
 
+        # Ask multiple simple yes/no questions for more reliable scoring
+        # Pick the most relevant question based on distance
+        if distance_to_cube > 1.0:
+            question_key = "pointing"  # Far away - check if pointing toward
+        elif distance_to_cube > 0.3:
+            question_key = "close"  # Getting closer - check if close
+        else:
+            question_key = "grasping"  # Very close - check if grasping
+
+        prompt_text = self.prompts[question_key]
+
         if log_this_step:
-            print(f"\n[VLM @ Step {step}] Prompt → {contextual_prompt}")
+            print(f"\n[VLM @ Step {step}] Question: {prompt_text}")
 
         # Create input messages with image placeholder
         messages = [
@@ -212,7 +210,7 @@ Return ONLY a single number 0-10."""
                 "role": "user",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": contextual_prompt},
+                    {"type": "text", "text": prompt_text},
                 ],
             },
         ]
@@ -242,39 +240,41 @@ Return ONLY a single number 0-10."""
         if log_this_step:
             print(f"[VLM RAW RESPONSE] ← {repr(response)}")
 
-        # Parse the score from response
+        # Parse yes/no response and convert to reward
         try:
-            # Extract ONLY the number after "assistant:" (the actual VLM answer)
-            # The response format is: "...user: <prompt>\nassistant: <score>."
-            # We need to get the last number after "assistant:"
-
-            # Split by "assistant:" and take the last part
+            # Extract answer after "assistant:"
             if "assistant:" in response:
-                answer_part = response.split("assistant:")[
-                    -1
-                ]  # Get text after last "assistant:"
+                answer_part = response.split("assistant:")[-1].strip()
             else:
-                answer_part = response  # Fallback to full response
+                answer_part = response
 
-            # Extract the first number from the answer part only
-            match = re.search(r"\b(\d+)\b", answer_part)
-            raw_score = int(match.group()) if match else 0
-            raw_score = max(0, min(10, raw_score))  # Clamp to 0-10
+            # Check for yes/no
+            is_yes = "yes" in answer_part
+            is_no = "no" in answer_part
 
-            # Normalize to dense reward [0, 1]
-            normalized_reward = raw_score / 10.0
+            # Build reward based on question type and answer
+            if question_key == "pointing":
+                # Far away - if pointing toward = good start
+                reward = 0.3 if is_yes else 0.1
+            elif question_key == "close":
+                # Getting closer - if close = good progress
+                reward = 0.6 if is_yes else 0.3
+            elif question_key == "grasping":
+                # Very close - if grasping = success!
+                reward = 1.0 if is_yes else 0.5
+            else:
+                reward = 0.1
 
             if log_this_step:
-                print(
-                    f"[VLM] Parsed score: {raw_score}/10 → Normalized reward: {normalized_reward:.2f} (dist: {distance_to_cube:.3f}m)"
-                )
+                answer_str = "YES" if is_yes else "NO" if is_no else "UNCLEAR"
+                print(f"[VLM] Answer: {answer_str} → Reward: {reward:.2f} (dist: {distance_to_cube:.3f}m)")
 
-            return normalized_reward
+            return reward
 
         except Exception as e:
             if log_this_step:
-                print(f"[VLM ERROR] {e} - Falling back to 0.0")
-            return 0.0
+                print(f"[VLM ERROR] {e} - Falling back to 0.1")
+            return 0.1
 
 
 # rl agent using DiT
@@ -765,7 +765,7 @@ print(f"Model will be saved to: {MODEL_PATH}\n")
 
 # Training parameters
 MAX_EPISODES = 1000
-MAX_STEPS_PER_EPISODE = 500
+MAX_STEPS_PER_EPISODE = 1000
 SAVE_INTERVAL = 1  # Save model every 10 episodes
 VIDEO_INTERVAL = 20  # Record video every 20 episodes
 VIDEO_PATH = "/home/kenpeter/work/robot/training_video.avi"  # Single file, overwrite
