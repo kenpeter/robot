@@ -145,7 +145,7 @@ class VLMRewardHelper:
         print(f"[VLM] Loading vision-language model from {model_path}...")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # load model vs processor: vision -> output seq -> load model -> auto processor
+        # load model vs processor: vision -> output seq -> auto load model -> auto processor
         self.model = AutoModelForVision2Seq.from_pretrained(
             # model path, torch type, trust remote code
             model_path,
@@ -162,7 +162,7 @@ class VLMRewardHelper:
             "see_cube": "Can you see a red cube in this image? Answer yes or no.",
             "pointing": "Is the robot gripper pointing toward the red cube? Answer yes or no.",
             "close": "Is the robot gripper very close to the red cube (touching distance)? Answer yes or no.",
-            "grasping": "Is the robot gripper grasping or holding the red cube? Answer yes or no."
+            "grasping": "Is the robot gripper grasping or holding the red cube? Answer yes or no.",
         }
 
         print(f"[VLM] Model loaded on {self.device}")
@@ -267,7 +267,9 @@ class VLMRewardHelper:
 
             if log_this_step:
                 answer_str = "YES" if is_yes else "NO" if is_no else "UNCLEAR"
-                print(f"[VLM] Answer: {answer_str} → Reward: {reward:.2f} (dist: {distance_to_cube:.3f}m)")
+                print(
+                    f"[VLM] Answer: {answer_str} → Reward: {reward:.2f} (dist: {distance_to_cube:.3f}m)"
+                )
 
             return reward
 
