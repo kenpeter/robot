@@ -662,17 +662,28 @@ def compute_reward(ee_pos, ball_pos, grasped, prev_dist):
     """Compute reward based on distance to cube and grasp success"""
     ball_dist = np.linalg.norm(ee_pos - ball_pos)
 
-    # IMPROVED REWARD: Scale so closer = positive, far = negative
-    # Distance of 0m = +10, distance of 1m = 0, distance of 2m = -10
+    # SHAPED REWARD: Multiple distance thresholds with bonuses
+    # Base reward still uses distance
     reward = 10.0 - (ball_dist * 10.0)
+
+    # Distance-based milestone bonuses (shaped rewards!)
+    if ball_dist < 1.5:
+        reward += 5.0   # Within 1.5m
+    if ball_dist < 1.0:
+        reward += 10.0  # Within 1.0m (positive territory!)
+    if ball_dist < 0.5:
+        reward += 20.0  # Within 0.5m (very close!)
+    if ball_dist < 0.2:
+        reward += 30.0  # Within 0.2m (almost touching!)
 
     # Grasp bonus (huge!)
     if grasped:
-        reward += 100.0  # Increased from 10 to 100
+        reward += 100.0
 
-    # Progress reward (meaningful)
+    # Progress reward (scaled by how much closer)
     if ball_dist < prev_dist:
-        reward += 5.0  # Increased from 0.5 to 5.0
+        progress = prev_dist - ball_dist
+        reward += progress * 50.0  # Big reward for moving closer!
 
     return reward, ball_dist
 
