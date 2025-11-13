@@ -280,8 +280,27 @@ class DiTAgent:
         if len(self.buffer) < self.batch_size:
             return
 
-        # Sample batch from buffer
-        indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
+        # FILTER: Only train on experiences with reward > 0 (positive experiences only!)
+        positive_indices = [
+            i for i in range(len(self.buffer)) if self.buffer[i][2] > 0.0
+        ]
+
+        # If not enough positive experiences, use all experiences (fall back)
+        if len(positive_indices) < self.batch_size:
+            # Print only every 100 steps to avoid spam
+            if self.step_count % 100 == 0:
+                print(
+                    f"[INFO] Only {len(positive_indices)} positive experiences, using all {len(self.buffer)} experiences"
+                )
+            indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
+        else:
+            # Print only every 1000 steps when using positive-only filter
+            if self.step_count % 1000 == 0:
+                print(
+                    f"[INFO] Training on {len(positive_indices)} positive experiences only!"
+                )
+            indices = np.random.choice(positive_indices, self.batch_size, replace=False)
+
         batch = [self.buffer[i] for i in indices]
 
         # Convert to tensors
@@ -602,7 +621,7 @@ print(f"Model will be saved to: {MODEL_PATH}\n")
 
 # Training parameters
 MAX_EPISODES = 1000
-MAX_STEPS_PER_EPISODE = 1500
+MAX_STEPS_PER_EPISODE = 1000
 SAVE_INTERVAL = 10  # Save model every 10 episodes
 VIDEO_INTERVAL = 20  # Record video every 20 episodes
 VIDEO_PATH = "/home/kenpeter/work/robot/training_video.avi"  # Single file, overwrite
@@ -643,16 +662,17 @@ def compute_reward(ee_pos, ball_pos, grasped, prev_dist):
     """Compute reward based on distance to cube and grasp success"""
     ball_dist = np.linalg.norm(ee_pos - ball_pos)
 
-    # Distance-based reward (closer is better)
-    reward = -ball_dist
+    # IMPROVED REWARD: Scale so closer = positive, far = negative
+    # Distance of 0m = +10, distance of 1m = 0, distance of 2m = -10
+    reward = 10.0 - (ball_dist * 10.0)
 
-    # Grasp bonus
+    # Grasp bonus (huge!)
     if grasped:
-        reward += 10.0
+        reward += 100.0  # Increased from 10 to 100
 
-    # Progress reward (getting closer)
+    # Progress reward (meaningful)
     if ball_dist < prev_dist:
-        reward += 0.5
+        reward += 5.0  # Increased from 0.5 to 5.0
 
     return reward, ball_dist
 
@@ -703,8 +723,8 @@ try:
             # Get action from policy (NO image)
             action = agent.get_action(state, image=None, deterministic=False)
 
-            # Execute action with RMPflow
-            delta_pos = action[:3] * 0.05
+            # Execute action with RMPflow (INCREASED from 0.05 to 0.15 for faster movement)
+            delta_pos = action[:3] * 0.15  # 15cm max movement per step
             target_position = ee_pos + delta_pos
             target_position = np.clip(
                 target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
@@ -819,8 +839,8 @@ try:
 
                 action = agent.get_action(state, image=None, deterministic=True)
 
-                # Execute action
-                delta_pos = action[:3] * 0.05
+                # Execute action (increased scaling for faster movement)
+                delta_pos = action[:3] * 0.15
                 target_position = ee_pos + delta_pos
                 target_position = np.clip(
                     target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
