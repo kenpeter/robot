@@ -174,37 +174,20 @@ Return ONLY a single number 0-10."""
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(image_rgb)
 
-        # Calculate distances
+        # Calculate distance
         distance_to_cube = np.linalg.norm(ee_pos - ball_pos)
-        distance_cube_to_target = np.linalg.norm(ball_pos - target_pos)
 
-        # Create prompt with FULL state information
-        state_info = f"""
-Task: Robot must grasp the red cube and move it to the target position.
+        # SIMPLIFIED prompt - SmolVLM can't handle long text
+        state_info = f"Distance: {distance_to_cube:.2f}m. Grasped: {'Yes' if grasped > 0.5 else 'No'}."
 
-Current state:
-- Gripper position: [{ee_pos[0]:.2f}, {ee_pos[1]:.2f}, {ee_pos[2]:.2f}]
-- Cube position: [{ball_pos[0]:.2f}, {ball_pos[1]:.2f}, {ball_pos[2]:.2f}]
-- Target position: [{target_pos[0]:.2f}, {target_pos[1]:.2f}, {target_pos[2]:.2f}]
-- Distance gripper→cube: {distance_to_cube:.3f}m
-- Distance cube→target: {distance_cube_to_target:.3f}m
-- Cube grasped: {'Yes' if grasped > 0.5 else 'No'}
+        # Simplified prompt that fits in SmolVLM's context
+        simple_prompt = f"<image>Rate robot grasping red cube (0-10). {state_info}"
 
-Robot configuration (12 joints):
-- Arm joints (6): [{joint_positions[0]:.2f}, {joint_positions[1]:.2f}, {joint_positions[2]:.2f}, {joint_positions[3]:.2f}, {joint_positions[4]:.2f}, {joint_positions[5]:.2f}]
-- Gripper joints (6): [{joint_positions[6]:.2f}, {joint_positions[7]:.2f}, {joint_positions[8]:.2f}, {joint_positions[9]:.2f}, {joint_positions[10]:.2f}, {joint_positions[11]:.2f}]
-"""
+        full_prompt = simple_prompt
 
-        # Add action information if provided
-        if action is not None:
-            action_info = f"""
-Action just taken:
-- Movement command: dx={action[0]:.3f}, dy={action[1]:.3f}, dz={action[2]:.3f}
-- Gripper command: {action[3]:.3f} ({'closing' if action[3] > 0 else 'opening'})
-"""
-            state_info += action_info
-
-        full_prompt = self.prompt + "\n" + state_info
+        # LOG THE PROMPT
+        print(f"\n[VLM PROMPT] → {full_prompt}")
+        print(f"[VLM STATE] EE: {ee_pos}, Ball: {ball_pos}, Dist: {distance_to_cube:.3f}m, Grasped: {grasped:.2f}")
 
         # SmolVLM uses simpler API - direct text and image input
         inputs = self.processor(
@@ -228,15 +211,19 @@ Action just taken:
             clean_up_tokenization_spaces=False
         )[0]
 
+        # LOG THE RAW RESPONSE
+        print(f"[VLM RAW RESPONSE] ← {repr(response)}")
+
         # Extract score (look for number 0-10)
         try:
             # Try to find a number in the response
             numbers = re.findall(r'\b([0-9]|10)\b', response)
             if numbers:
                 score = float(numbers[0])
+                print(f"[VLM REWARD] ✓ Score: {score}/10")
                 return score
             else:
-                print(f"[VLM WARNING] Could not parse score from: {response}")
+                print(f"[VLM WARNING] ✗ Could not parse score from: {response}")
                 return 0.0
         except Exception as e:
             print(f"[VLM ERROR] {e}")
