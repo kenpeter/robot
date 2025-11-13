@@ -32,7 +32,6 @@ import cv2  # For video recording
 from collections import deque
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from PIL import Image
-import re
 from isaacsim.core.api import World
 from isaacsim.core.prims import RigidPrim
 from isaacsim.core.utils.stage import add_reference_to_stage
@@ -177,20 +176,41 @@ Return ONLY a single number 0-10."""
         # Calculate distance
         distance_to_cube = np.linalg.norm(ee_pos - ball_pos)
 
-        # SIMPLIFIED prompt - SmolVLM can't handle long text
-        state_info = f"Distance: {distance_to_cube:.2f}m. Grasped: {'Yes' if grasped > 0.5 else 'No'}."
+        # ULTRA-SIMPLE prompt - ask YES/NO question instead of 0-10 rating
+        # SmolVLM struggles with complex reasoning, so ask simple observable questions
 
-        # Simplified prompt that fits in SmolVLM's context
-        simple_prompt = f"<image>Rate robot grasping red cube (0-10). {state_info}"
+        # Build reward from multiple simple yes/no observations
+        score = 0.0
 
-        full_prompt = simple_prompt
+        # Question 1: Can you see the robot arm? (baseline check)
+        prompt1 = "<image>Can you see a robot arm? Answer yes or no."
+
+        # Question 2: Is the robot arm close to the red cube?
+        if distance_to_cube < 0.5:
+            prompt2 = "<image>Is the robot gripper touching the red cube? Answer yes or no."
+        else:
+            prompt2 = "<image>Is the robot arm near the red cube? Answer yes or no."
+
+        # Use the most relevant question based on state
+        if distance_to_cube > 1.0:
+            # Far away - just give reward based on distance reduction
+            score = max(0, 2.0 - distance_to_cube)  # Closer = higher reward
+            full_prompt = prompt1  # Still run VLM for logging
+        elif distance_to_cube > 0.3:
+            # Getting close - ask if near
+            full_prompt = prompt2
+        else:
+            # Very close - ask if touching
+            full_prompt = prompt2
+            if grasped > 0.5:
+                score += 5.0  # Big bonus for grasping!
 
         # LOG ONLY EVERY 50 STEPS (to reduce spam)
         log_this_step = (step % 50 == 0)
 
         if log_this_step:
             print(f"\n[VLM PROMPT @ Step {step}] → {full_prompt}")
-            print(f"[VLM STATE] EE: {ee_pos}, Ball: {ball_pos}, Dist: {distance_to_cube:.3f}m, Grasped: {grasped:.2f}")
+            print(f"[VLM STATE] Dist: {distance_to_cube:.3f}m, Grasped: {grasped:.2f}")
 
         # SmolVLM uses simpler API - direct text and image input
         inputs = self.processor(
@@ -203,7 +223,7 @@ Return ONLY a single number 0-10."""
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=10,
+                max_new_tokens=5,
                 temperature=0.1
             )
 
@@ -212,29 +232,40 @@ Return ONLY a single number 0-10."""
             outputs,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False
-        )[0]
+        )[0].lower()
 
         # LOG RAW RESPONSE (only when logging)
         if log_this_step:
             print(f"[VLM RAW RESPONSE] ← {repr(response)}")
 
-        # Extract score (look for number 0-10)
+        # Parse yes/no response and adjust score
         try:
-            # Try to find a number in the response
-            numbers = re.findall(r'\b([0-9]|10)\b', response)
-            if numbers:
-                score = float(numbers[0])
-                if log_this_step:
-                    print(f"[VLM REWARD] ✓ Score: {score}/10")
-                return score
-            else:
-                if log_this_step:
-                    print(f"[VLM WARNING] ✗ Could not parse score from: {response}")
-                return 0.0
+            # Check if VLM said "yes" for proximity/touching
+            if distance_to_cube <= 1.0:  # Only use VLM answer when close
+                if "yes" in response or "touching" in response or "near" in response:
+                    # VLM confirms proximity/contact
+                    if distance_to_cube < 0.3:
+                        score += 3.0  # Big reward for close proximity confirmed by vision
+                    elif distance_to_cube < 0.7:
+                        score += 1.5  # Medium reward for being near
+                    else:
+                        score += 0.5  # Small reward for approaching
+
+                    if log_this_step:
+                        print(f"[VLM] ✓ Vision confirms: {'touching' if distance_to_cube < 0.3 else 'near'}")
+
+            # Final score
+            score = min(score, 10.0)  # Cap at 10
+
+            if log_this_step:
+                print(f"[VLM REWARD] Score: {score:.1f}/10 (dist: {distance_to_cube:.3f}m)")
+
+            return score
+
         except Exception as e:
             if log_this_step:
                 print(f"[VLM ERROR] {e}")
-            return 0.0
+            return max(0, score)  # Return distance-based score as fallback
 
 
 # rl agent using DiT
