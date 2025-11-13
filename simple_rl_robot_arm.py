@@ -75,31 +75,39 @@ class ConditionalDiffusionMLP(nn.Module):
         layers = []
 
         # First layer: input → hidden
-        layers.extend([
-            nn.Linear(input_dim, hidden_dim),
-            nn.SiLU(),
-        ])
+        layers.extend(
+            [
+                nn.Linear(input_dim, hidden_dim),
+                nn.SiLU(),
+            ]
+        )
 
         # Middle layers with residual connections
         for _ in range(num_layers - 2):
-            layers.extend([
-                nn.Linear(hidden_dim, hidden_dim * 2),
-                nn.GELU(),
-                nn.Linear(hidden_dim * 2, hidden_dim),
-                nn.SiLU(),
-            ])
+            layers.extend(
+                [
+                    nn.Linear(hidden_dim, hidden_dim * 2),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim * 2, hidden_dim),
+                    nn.SiLU(),
+                ]
+            )
 
         # Final layer: hidden → action (noise prediction)
-        layers.extend([
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, action_dim)
-        ])
+        layers.extend(
+            [
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.SiLU(),
+                nn.Linear(hidden_dim // 2, action_dim),
+            ]
+        )
 
         self.network = nn.Sequential(*layers)
 
         print(f"ConditionalDiffusionMLP initialized:")
-        print(f"  Input dim: {input_dim} (state={state_dim} + action={action_dim} + timestep=1)")
+        print(
+            f"  Input dim: {input_dim} (state={state_dim} + action={action_dim} + timestep=1)"
+        )
         print(f"  Hidden dim: {hidden_dim}")
         print(f"  Num layers: {num_layers}")
         print(f"  Output dim: {action_dim}")
@@ -115,7 +123,9 @@ class ConditionalDiffusionMLP(nn.Module):
         Returns: predicted noise [batch, action_dim]
         """
         # Simply concatenate all inputs
-        x = torch.cat([noisy_action, state, timestep], dim=-1)  # [batch, state_dim + action_dim + 1]
+        x = torch.cat(
+            [noisy_action, state, timestep], dim=-1
+        )  # [batch, state_dim + action_dim + 1]
 
         # Pass through MLP
         noise_pred = self.network(x)  # [batch, action_dim]
@@ -342,11 +352,19 @@ class DiTAgent:
         if self.step_count % 100 == 0:
             print(f"\n[DIFFUSION MLP DEBUG - Step {self.step_count}]")
             print(f"  Actual noise magnitude: {noise.abs().mean().item():.4f}")
-            print(f"  Predicted noise magnitude: {predicted_noise.abs().mean().item():.4f}")
-            print(f"  Noise prediction error (MAE): {(noise - predicted_noise).abs().mean().item():.4f} ← Should DECREASE")
+            print(
+                f"  Predicted noise magnitude: {predicted_noise.abs().mean().item():.4f}"
+            )
+            print(
+                f"  Noise prediction error (MAE): {(noise - predicted_noise).abs().mean().item():.4f} ← Should DECREASE"
+            )
             print(f"  Loss (weighted): {weighted_loss.item():.6f} ← Should DECREASE")
-            print(f"  Reward range: [{rewards.min().item():.2f}, {rewards.max().item():.2f}]")
-            print(f"  Alpha_cumprod range: [{alpha_cumprod_t.min().item():.4f}, {alpha_cumprod_t.max().item():.4f}]")
+            print(
+                f"  Reward range: [{rewards.min().item():.2f}, {rewards.max().item():.2f}]"
+            )
+            print(
+                f"  Alpha_cumprod range: [{alpha_cumprod_t.min().item():.4f}, {alpha_cumprod_t.max().item():.4f}]"
+            )
             print(f"  Exploration noise scale: {self.noise_scale:.3f}")
 
         # Return loss for logging
@@ -584,7 +602,7 @@ print(f"Model will be saved to: {MODEL_PATH}\n")
 
 # Training parameters
 MAX_EPISODES = 1000
-MAX_STEPS_PER_EPISODE = 500
+MAX_STEPS_PER_EPISODE = 1500
 SAVE_INTERVAL = 10  # Save model every 10 episodes
 VIDEO_INTERVAL = 20  # Record video every 20 episodes
 VIDEO_PATH = "/home/kenpeter/work/robot/training_video.avi"  # Single file, overwrite
@@ -600,6 +618,7 @@ print("✓ Simulation timeline started\n")
 FIXED_TARGET_X = 0.5
 FIXED_TARGET_Y = 0.2
 FIXED_TARGET_Z = 0.3  # Above the cube
+
 
 # Helper function to reset environment
 def reset_environment():
@@ -671,13 +690,15 @@ try:
             # FIXED STATE: Include cube position, ee position, and target position
             # This gives the model spatial awareness!
             target_pos = np.array([FIXED_TARGET_X, FIXED_TARGET_Y, FIXED_TARGET_Z])
-            state = np.concatenate([
-                joint_positions,  # 12D: robot joint angles
-                [grasped],        # 1D: is cube grasped?
-                ball_pos,         # 3D: WHERE IS THE CUBE? (was missing!)
-                ee_pos,           # 3D: WHERE IS THE GRIPPER? (was missing!)
-                target_pos        # 3D: WHERE SHOULD WE GO? (was missing!)
-            ])  # Total: 22D (was 13D)
+            state = np.concatenate(
+                [
+                    joint_positions,  # 12D: robot joint angles
+                    [grasped],  # 1D: is cube grasped?
+                    ball_pos,  # 3D: WHERE IS THE CUBE? (was missing!)
+                    ee_pos,  # 3D: WHERE IS THE GRIPPER? (was missing!)
+                    target_pos,  # 3D: WHERE SHOULD WE GO? (was missing!)
+                ]
+            )  # Total: 22D (was 13D)
 
             # Get action from policy (NO image)
             action = agent.get_action(state, image=None, deterministic=False)
@@ -731,13 +752,15 @@ try:
 
             # FIXED NEXT STATE: Include spatial information
             target_pos_next = np.array([FIXED_TARGET_X, FIXED_TARGET_Y, FIXED_TARGET_Z])
-            next_state = np.concatenate([
-                joint_positions_next,  # 12D
-                [grasped_next],        # 1D
-                ball_pos_next,         # 3D: cube position
-                ee_pos_next,           # 3D: gripper position
-                target_pos_next        # 3D: target position
-            ])  # Total: 22D
+            next_state = np.concatenate(
+                [
+                    joint_positions_next,  # 12D
+                    [grasped_next],  # 1D
+                    ball_pos_next,  # 3D: cube position
+                    ee_pos_next,  # 3D: gripper position
+                    target_pos_next,  # 3D: target position
+                ]
+            )  # Total: 22D
 
             # Compute reward
             reward, ball_dist = compute_reward(ee_pos, ball_pos, grasped, prev_dist)
@@ -790,9 +813,9 @@ try:
 
                 # Fixed state for video recording
                 target_pos = np.array([FIXED_TARGET_X, FIXED_TARGET_Y, FIXED_TARGET_Z])
-                state = np.concatenate([
-                    joint_positions, [grasped], ball_pos, ee_pos, target_pos
-                ])  # 22D
+                state = np.concatenate(
+                    [joint_positions, [grasped], ball_pos, ee_pos, target_pos]
+                )  # 22D
 
                 action = agent.get_action(state, image=None, deterministic=True)
 
