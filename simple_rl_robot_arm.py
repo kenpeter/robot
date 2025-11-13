@@ -13,7 +13,7 @@ from isaacsim import SimulationApp
 # Initialize simulation
 simulation_app = SimulationApp(
     {
-        "headless": True,
+        "headless": False,
         "width": 1280,
         "height": 720,
         # ray trace vs path trace: ray trace -> good performance -> path trace -> more real
@@ -746,7 +746,7 @@ print(f"Model will be saved to: {MODEL_PATH}\n")
 
 # Training parameters
 MAX_EPISODES = 1000
-MAX_STEPS_PER_EPISODE = 1000
+MAX_STEPS_PER_EPISODE = 500
 SAVE_INTERVAL = 10  # Save model every 10 episodes
 VIDEO_INTERVAL = 20  # Record video every 20 episodes
 VIDEO_PATH = "/home/kenpeter/work/robot/training_video.avi"  # Single file, overwrite
@@ -764,7 +764,7 @@ FIXED_TARGET_Y = 0.2
 FIXED_TARGET_Z = 0.3  # Above the cube
 
 # === INITIALIZE VLM REWARD HELPER (REQUIRED) ===
-VLM_REWARD_INTERVAL = 1  # Get VLM reward EVERY step for maximum learning signal (dense)
+VLM_REWARD_INTERVAL = 10  # Get VLM reward every 10 steps (dense with interpolation)
 
 print("=" * 70)
 print("LOADING VISION-LANGUAGE MODEL FOR REWARD COMPUTATION")
@@ -780,6 +780,10 @@ print(
 )
 print(f"[VLM] NO HAND-CRAFTED RULES - VLM decides everything!")
 print("=" * 70)
+
+# Interpolation trackers (globals for simplicity; can move to agent if preferred)
+last_vlm_reward = 0.0  # Track last VLM value
+steps_since_vlm = 0  # Count gaps since last VLM
 
 
 # Helper function to reset environment
@@ -802,13 +806,24 @@ def reset_environment():
 
 # Helper function to compute reward (PURE VLM - dense and normalized)
 def compute_reward(ee_pos, ball_pos, grasped, vlm_reward=None):
-    """Compute PURE VLM reward (dense 0-1, no shaping or fallback to 0)"""
-    # VLM provides dense signal every step (interval=1)
-    # If VLM fails (rare), use 0.0 (but expect consistent calls)
+    """Compute reward: Prioritize VLM, else interpolate last VLM forward (no shaping bias)"""
     if vlm_reward is not None:
-        return vlm_reward  # Already normalized to [0, 1]
+        # Fresh VLM: Use it directly [0,1]
+        return vlm_reward
     else:
-        return 0.0  # Fallback (should not happen with interval=1)
+        # Interpolate: Decay last VLM reward linearly over the interval
+        # Assumes short gaps (e.g., 9 steps) and linear progress
+        if steps_since_vlm < VLM_REWARD_INTERVAL:
+            decay_factor = (
+                steps_since_vlm / VLM_REWARD_INTERVAL
+            )  # 0 (just got VLM) to ~1 (end of gap)
+            # Gentle linear decay: Fade by 50% max to preserve signal without over-damping
+            interpolated = last_vlm_reward * (1.0 - decay_factor * 0.5)
+            # Small floor to avoid pure zero (minimal bias, ensures signal)
+            return max(0.05, interpolated)
+        else:
+            # Rare: Gap longer than interval (e.g., episode end/start) → minimal holdover
+            return max(0.05, last_vlm_reward * 0.3)  # Heavily decayed
 
 
 try:
@@ -817,6 +832,10 @@ try:
 
         # Reset environment
         cube_x, cube_y = reset_environment()
+
+        # Reset interpolation trackers at episode start
+        last_vlm_reward = 0.1  # Mild initial bias ("far but starting")
+        steps_since_vlm = 0
 
         episode_reward = 0.0
         episode_loss = []
@@ -915,14 +934,12 @@ try:
                 ]
             )  # Total: 22D
 
-            # Compute VLM reward (EVERY step for density)
+            # Compute VLM reward (every VLM_REWARD_INTERVAL steps for efficiency)
             vlm_reward_value = None
             if vlm_helper is not None and step % VLM_REWARD_INTERVAL == 0:
                 # Capture image from side camera for VLM (BGR)
                 side_camera.get_current_frame()
-                image_side = side_camera.get_rgba()[
-                    :, :, :3
-                ]  # Get RGBA, take RGB, but for BGR input
+                image_side = side_camera.get_rgba()[:, :, :3]  # Get RGBA, take RGB
                 image_side_bgr = cv2.cvtColor(image_side, cv2.COLOR_RGB2BGR)
                 # Pass FULL context: image, complete state, action, AND step number for logging
                 vlm_reward_value = vlm_helper.get_reward(
@@ -940,7 +957,15 @@ try:
                         f"  [VLM Step {step}] Reward: {vlm_reward_value:.3f} | Dist to cube: {ball_dist:.3f}m"
                     )
 
-            # Compute pure VLM reward (dense, normalized)
+                # UPDATE TRACKERS: If VLM succeeded, reset counters and store value
+                if vlm_reward_value is not None:
+                    last_vlm_reward = vlm_reward_value  # Echo the true signal
+                    steps_since_vlm = 0
+            else:
+                # Increment gap counter for interpolation
+                steps_since_vlm += 1
+
+            # Compute pure VLM reward (dense, normalized) with interpolation
             reward = compute_reward(
                 ee_pos, ball_pos, grasped, vlm_reward=vlm_reward_value
             )
