@@ -168,7 +168,7 @@ Return ONLY a single number 0-10."""
 
         print(f"[VLM] Model loaded on {self.device}")
 
-    def get_reward(self, image_bgr, ee_pos, ball_pos, grasped, target_pos, joint_positions, action=None):
+    def get_reward(self, image_bgr, ee_pos, ball_pos, grasped, target_pos, joint_positions, action=None, step=0):
         """Get VLM-based reward from camera image + full state info + action"""
         # Convert BGR to RGB
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
@@ -185,9 +185,12 @@ Return ONLY a single number 0-10."""
 
         full_prompt = simple_prompt
 
-        # LOG THE PROMPT
-        print(f"\n[VLM PROMPT] → {full_prompt}")
-        print(f"[VLM STATE] EE: {ee_pos}, Ball: {ball_pos}, Dist: {distance_to_cube:.3f}m, Grasped: {grasped:.2f}")
+        # LOG ONLY EVERY 50 STEPS (to reduce spam)
+        log_this_step = (step % 50 == 0)
+
+        if log_this_step:
+            print(f"\n[VLM PROMPT @ Step {step}] → {full_prompt}")
+            print(f"[VLM STATE] EE: {ee_pos}, Ball: {ball_pos}, Dist: {distance_to_cube:.3f}m, Grasped: {grasped:.2f}")
 
         # SmolVLM uses simpler API - direct text and image input
         inputs = self.processor(
@@ -211,8 +214,9 @@ Return ONLY a single number 0-10."""
             clean_up_tokenization_spaces=False
         )[0]
 
-        # LOG THE RAW RESPONSE
-        print(f"[VLM RAW RESPONSE] ← {repr(response)}")
+        # LOG RAW RESPONSE (only when logging)
+        if log_this_step:
+            print(f"[VLM RAW RESPONSE] ← {repr(response)}")
 
         # Extract score (look for number 0-10)
         try:
@@ -220,13 +224,16 @@ Return ONLY a single number 0-10."""
             numbers = re.findall(r'\b([0-9]|10)\b', response)
             if numbers:
                 score = float(numbers[0])
-                print(f"[VLM REWARD] ✓ Score: {score}/10")
+                if log_this_step:
+                    print(f"[VLM REWARD] ✓ Score: {score}/10")
                 return score
             else:
-                print(f"[VLM WARNING] ✗ Could not parse score from: {response}")
+                if log_this_step:
+                    print(f"[VLM WARNING] ✗ Could not parse score from: {response}")
                 return 0.0
         except Exception as e:
-            print(f"[VLM ERROR] {e}")
+            if log_this_step:
+                print(f"[VLM ERROR] {e}")
             return 0.0
 
 
@@ -736,7 +743,7 @@ FIXED_TARGET_Y = 0.2
 FIXED_TARGET_Z = 0.3  # Above the cube
 
 # === INITIALIZE VLM REWARD HELPER (REQUIRED) ===
-VLM_REWARD_INTERVAL = 10  # Get VLM reward every N steps (to save compute)
+VLM_REWARD_INTERVAL = 1  # Get VLM reward EVERY step for maximum learning signal
 
 print("=" * 70)
 print("LOADING VISION-LANGUAGE MODEL FOR REWARD COMPUTATION")
@@ -890,12 +897,12 @@ try:
                 ]
             )  # Total: 22D
 
-            # Compute VLM reward (every VLM_REWARD_INTERVAL steps to save compute)
+            # Compute VLM reward (EVERY step now, but log only occasionally)
             vlm_reward_value = None
             if vlm_helper is not None and step % VLM_REWARD_INTERVAL == 0:
                 # Capture image from side camera for VLM
                 image_side = side_camera.get_rgba()[:, :, :3]  # RGB only
-                # Pass FULL context: image, complete state, and action taken
+                # Pass FULL context: image, complete state, action, AND step number for logging
                 vlm_reward_value = vlm_helper.get_reward(
                     image_side,
                     ee_pos,
@@ -903,7 +910,8 @@ try:
                     grasped,
                     target_pos,
                     joint_positions,
-                    action=action
+                    action=action,
+                    step=step
                 )
                 if step % 100 == 0:  # Print occasionally
                     print(f"  [VLM Step {step}] Score: {vlm_reward_value}/10 | Dist to cube: {ball_dist:.3f}m")
