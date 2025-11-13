@@ -29,8 +29,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import cv2  # For video recording
+import re  # For parsing VLM output
 from collections import deque
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoModelForVision2Seq, AutoProcessor
 from PIL import Image
 from isaacsim.core.api import World
 from isaacsim.core.prims import RigidPrim
@@ -137,23 +138,21 @@ class ConditionalDiffusionMLP(nn.Module):
 
 # === VLM-BASED REWARD SHAPING ===
 class VLMRewardHelper:
-    """Uses Qwen3-VL to provide vision-based reward feedback"""
+    """Uses SmolVLM-256M-Instruct to provide vision-based reward feedback"""
 
     def __init__(self, model_path):
         print(f"[VLM] Loading vision-language model from {model_path}...")
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        # Load model and processor (auto-detect Qwen3-VL model type)
-        # Load directly to device to avoid meta tensor issues
-        self.model = AutoModelForImageTextToText.from_pretrained(
+        # Load model and processor for SmolVLM (Vision2Seq)
+        self.model = AutoModelForVision2Seq.from_pretrained(
             model_path,
-            dtype=torch.float16 if self.device == "cuda" else torch.float32,
+            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
             trust_remote_code=True,
-            device_map=self.device  # Load directly to device
-        )
+        ).to(self.device)
         self.processor = AutoProcessor.from_pretrained(model_path)
 
-        self.prompt = """You are analyzing a robot grasping task.
+        self.base_prompt = """You are analyzing a robot grasping task.
 The robot (UR10 arm) needs to reach and grasp the red cube.
 
 Score the robot's performance from 0-10:
@@ -167,105 +166,96 @@ Return ONLY a single number 0-10."""
 
         print(f"[VLM] Model loaded on {self.device}")
 
-    def get_reward(self, image_bgr, ee_pos, ball_pos, grasped, target_pos, joint_positions, action=None, step=0):
-        """Get VLM-based reward from camera image + full state info + action"""
+    def get_reward(
+        self,
+        image_bgr,
+        ee_pos,
+        ball_pos,
+        grasped,
+        target_pos,
+        joint_positions,
+        action=None,
+        step=0,
+    ):
+        """Get PURE VLM-based reward from camera image (dense, normalized to 0-1)"""
         # Convert BGR to RGB
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(image_rgb)
 
-        # Calculate distance
+        # Calculate distance for contextual prompt
         distance_to_cube = np.linalg.norm(ee_pos - ball_pos)
+        gripper_state = (
+            "closed"
+            if joint_positions[6] > 0.02
+            else "open" if len(joint_positions) > 6 else "unknown"
+        )
 
-        # ULTRA-SIMPLE prompt - ask YES/NO question instead of 0-10 rating
-        # SmolVLM struggles with complex reasoning, so ask simple observable questions
-
-        # Build reward from multiple simple yes/no observations
-        score = 0.0
-
-        # Question 1: Can you see the robot arm? (baseline check)
-        prompt1 = "<image>Can you see a robot arm? Answer yes or no."
-
-        # Question 2: Is the robot arm close to the red cube?
-        if distance_to_cube < 0.5:
-            prompt2 = "<image>Is the robot gripper touching the red cube? Answer yes or no."
-        else:
-            prompt2 = "<image>Is the robot arm near the red cube? Answer yes or no."
-
-        # Use the most relevant question based on state
-        if distance_to_cube > 1.0:
-            # Far away - just give reward based on distance reduction
-            score = max(0, 2.0 - distance_to_cube)  # Closer = higher reward
-            full_prompt = prompt1  # Still run VLM for logging
-        elif distance_to_cube > 0.3:
-            # Getting close - ask if near
-            full_prompt = prompt2
-        else:
-            # Very close - ask if touching
-            full_prompt = prompt2
-            if grasped > 0.5:
-                score += 5.0  # Big bonus for grasping!
+        # Build contextual prompt for density
+        contextual_prompt = f"{self.base_prompt}\n\nContext: Distance to cube: {distance_to_cube:.2f}m. Gripper: {gripper_state}. Step: {step}."
 
         # LOG ONLY EVERY 50 STEPS (to reduce spam)
-        log_this_step = (step % 50 == 0)
+        log_this_step = step % 50 == 0
 
         if log_this_step:
-            print(f"\n[VLM PROMPT @ Step {step}] → {full_prompt}")
-            print(f"[VLM STATE] Dist: {distance_to_cube:.3f}m, Grasped: {grasped:.2f}")
+            print(f"\n[VLM @ Step {step}] Prompt → {contextual_prompt}")
 
-        # SmolVLM uses simpler API - direct text and image input
+        # Create input messages with image placeholder
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": contextual_prompt},
+                ],
+            },
+        ]
+
+        # Apply chat template
+        prompt = self.processor.apply_chat_template(
+            messages, add_generation_prompt=True
+        )
+
+        # Prepare inputs with images as list
         inputs = self.processor(
-            text=full_prompt,
-            images=pil_image,
-            return_tensors="pt"
+            text=prompt, images=[pil_image], return_tensors="pt"
         ).to(self.device)
 
         # Generate response
         with torch.no_grad():
             outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=5,
-                temperature=0.1
+                **inputs, max_new_tokens=5, do_sample=True, temperature=0.1
             )
 
         # Decode response
         response = self.processor.batch_decode(
-            outputs,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False
+            outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0].lower()
 
         # LOG RAW RESPONSE (only when logging)
         if log_this_step:
             print(f"[VLM RAW RESPONSE] ← {repr(response)}")
 
-        # Parse yes/no response and adjust score
+        # Parse the score from response
         try:
-            # Check if VLM said "yes" for proximity/touching
-            if distance_to_cube <= 1.0:  # Only use VLM answer when close
-                if "yes" in response or "touching" in response or "near" in response:
-                    # VLM confirms proximity/contact
-                    if distance_to_cube < 0.3:
-                        score += 3.0  # Big reward for close proximity confirmed by vision
-                    elif distance_to_cube < 0.7:
-                        score += 1.5  # Medium reward for being near
-                    else:
-                        score += 0.5  # Small reward for approaching
+            # Extract number using regex
+            match = re.search(r"\d+", response)
+            raw_score = int(match.group()) if match else 0
+            raw_score = max(0, min(10, raw_score))  # Clamp to 0-10
 
-                    if log_this_step:
-                        print(f"[VLM] ✓ Vision confirms: {'touching' if distance_to_cube < 0.3 else 'near'}")
-
-            # Final score
-            score = min(score, 10.0)  # Cap at 10
+            # Normalize to dense reward [0, 1]
+            normalized_reward = raw_score / 10.0
 
             if log_this_step:
-                print(f"[VLM REWARD] Score: {score:.1f}/10 (dist: {distance_to_cube:.3f}m)")
+                print(
+                    f"[VLM] Parsed score: {raw_score}/10 → Normalized reward: {normalized_reward:.2f} (dist: {distance_to_cube:.3f}m)"
+                )
 
-            return score
+            return normalized_reward
 
         except Exception as e:
             if log_this_step:
-                print(f"[VLM ERROR] {e}")
-            return max(0, score)  # Return distance-based score as fallback
+                print(f"[VLM ERROR] {e} - Falling back to 0.0")
+            return 0.0
 
 
 # rl agent using DiT
@@ -774,19 +764,21 @@ FIXED_TARGET_Y = 0.2
 FIXED_TARGET_Z = 0.3  # Above the cube
 
 # === INITIALIZE VLM REWARD HELPER (REQUIRED) ===
-VLM_REWARD_INTERVAL = 1  # Get VLM reward EVERY step for maximum learning signal
+VLM_REWARD_INTERVAL = 1  # Get VLM reward EVERY step for maximum learning signal (dense)
 
 print("=" * 70)
 print("LOADING VISION-LANGUAGE MODEL FOR REWARD COMPUTATION")
 print("=" * 70)
 
-# Load VLM - using lightweight SmolVLM-256M (faster than Qwen3-VL-2B)
+# Load VLM - using lightweight SmolVLM-256M-Instruct (faster than Qwen3-VL-2B)
 vlm_helper = VLMRewardHelper(
     model_path="/home/kenpeter/.cache/huggingface/hub/SmolVLM-256M-Instruct"
 )
 print(f"[VLM] ✓ Model loaded successfully!")
-print(f"[VLM] Will compute VLM reward every {VLM_REWARD_INTERVAL} steps")
-print(f"[VLM] PURE VISION-BASED REWARDS - NO HAND-CRAFTED RULES!")
+print(
+    f"[VLM] Will compute PURE VLM reward every {VLM_REWARD_INTERVAL} steps (dense, normalized 0-1)"
+)
+print(f"[VLM] NO HAND-CRAFTED RULES - VLM decides everything!")
 print("=" * 70)
 
 
@@ -808,19 +800,15 @@ def reset_environment():
     return FIXED_CUBE_X, FIXED_CUBE_Y
 
 
-# Helper function to compute reward (PURE VLM - NO FALLBACK)
-def compute_reward(ee_pos, ball_pos, grasped, prev_dist, vlm_reward=None):
-    """Compute reward using VLM ONLY - no hand-crafted rules!"""
-    ball_dist = np.linalg.norm(ee_pos - ball_pos)
-
-    # VLM reward is REQUIRED - will be None only on non-VLM steps
+# Helper function to compute reward (PURE VLM - dense and normalized)
+def compute_reward(ee_pos, ball_pos, grasped, vlm_reward=None):
+    """Compute PURE VLM reward (dense 0-1, no shaping or fallback to 0)"""
+    # VLM provides dense signal every step (interval=1)
+    # If VLM fails (rare), use 0.0 (but expect consistent calls)
     if vlm_reward is not None:
-        reward = vlm_reward  # Pure vision-based reward (0-10 scale)
+        return vlm_reward  # Already normalized to [0, 1]
     else:
-        # On non-VLM steps, use 0 reward (only train on VLM-scored steps)
-        reward = 0.0
-
-    return reward, ball_dist
+        return 0.0  # Fallback (should not happen with interval=1)
 
 
 try:
@@ -832,7 +820,6 @@ try:
 
         episode_reward = 0.0
         episode_loss = []
-        prev_dist = 999.0
 
         # Run episode
         for step in range(MAX_STEPS_PER_EPISODE):
@@ -928,28 +915,35 @@ try:
                 ]
             )  # Total: 22D
 
-            # Compute VLM reward (EVERY step now, but log only occasionally)
+            # Compute VLM reward (EVERY step for density)
             vlm_reward_value = None
             if vlm_helper is not None and step % VLM_REWARD_INTERVAL == 0:
-                # Capture image from side camera for VLM
-                image_side = side_camera.get_rgba()[:, :, :3]  # RGB only
+                # Capture image from side camera for VLM (BGR)
+                side_camera.get_current_frame()
+                image_side = side_camera.get_rgba()[
+                    :, :, :3
+                ]  # Get RGBA, take RGB, but for BGR input
+                image_side_bgr = cv2.cvtColor(image_side, cv2.COLOR_RGB2BGR)
                 # Pass FULL context: image, complete state, action, AND step number for logging
                 vlm_reward_value = vlm_helper.get_reward(
-                    image_side,
+                    image_side_bgr,
                     ee_pos,
                     ball_pos,
                     grasped,
                     target_pos,
                     joint_positions,
                     action=action,
-                    step=step
+                    step=step,
                 )
                 if step % 100 == 0:  # Print occasionally
-                    print(f"  [VLM Step {step}] Score: {vlm_reward_value}/10 | Dist to cube: {ball_dist:.3f}m")
+                    print(
+                        f"  [VLM Step {step}] Reward: {vlm_reward_value:.3f} | Dist to cube: {ball_dist:.3f}m"
+                    )
 
-            # Compute reward using VLM
-            reward, ball_dist = compute_reward(ee_pos, ball_pos, grasped, prev_dist, vlm_reward=vlm_reward_value)
-            prev_dist = ball_dist
+            # Compute pure VLM reward (dense, normalized)
+            reward = compute_reward(
+                ee_pos, ball_pos, grasped, vlm_reward=vlm_reward_value
+            )
             episode_reward += reward
 
             # Store experience and train (online training with reward weighting, NO image)
