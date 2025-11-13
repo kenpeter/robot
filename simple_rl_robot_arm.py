@@ -166,6 +166,7 @@ Return ONLY a single number 0-10."""
 
         print(f"[VLM] Model loaded on {self.device}")
 
+    # get reward
     def get_reward(
         self,
         image_bgr,
@@ -178,7 +179,7 @@ Return ONLY a single number 0-10."""
         step=0,
     ):
         """Get PURE VLM-based reward from camera image (dense, normalized to 0-1)"""
-        # Convert BGR to RGB
+        # rgb image
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(image_rgb)
 
@@ -237,8 +238,18 @@ Return ONLY a single number 0-10."""
 
         # Parse the score from response
         try:
-            # Extract number using regex
-            match = re.search(r"\d+", response)
+            # Extract ONLY the number after "assistant:" (the actual VLM answer)
+            # The response format is: "...user: <prompt>\nassistant: <score>."
+            # We need to get the last number after "assistant:"
+
+            # Split by "assistant:" and take the last part
+            if "assistant:" in response:
+                answer_part = response.split("assistant:")[-1]  # Get text after last "assistant:"
+            else:
+                answer_part = response  # Fallback to full response
+
+            # Extract the first number from the answer part only
+            match = re.search(r"\b(\d+)\b", answer_part)
             raw_score = int(match.group()) if match else 0
             raw_score = max(0, min(10, raw_score))  # Clamp to 0-10
 
