@@ -29,10 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import cv2  # For video recording
-import re  # For parsing VLM output
 from collections import deque
-from transformers import AutoModelForVision2Seq, AutoProcessor
-from PIL import Image
 from isaacsim.core.api import World
 from isaacsim.core.prims import RigidPrim
 from isaacsim.core.utils.stage import add_reference_to_stage
@@ -135,154 +132,6 @@ class ConditionalDiffusionMLP(nn.Module):
         noise_pred = self.network(x)  # [batch, action_dim]
 
         return noise_pred
-
-
-# === VLM-BASED REWARD SHAPING ===
-class VLMRewardHelper:
-    """Uses SmolVLM-500M-Instruct to provide vision-based reward feedback (2x smarter than 256M)"""
-
-    def __init__(self, model_path):
-        print(f"[VLM] Loading vision-language model from {model_path}...")
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        # load model vs processor: vision -> output seq -> auto load model -> auto processor
-        self.model = AutoModelForVision2Seq.from_pretrained(
-            # model path, torch type, trust remote code
-            model_path,
-            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-            trust_remote_code=True,
-        ).to(
-            self.device
-        )  # move to device
-        self.processor = AutoProcessor.from_pretrained(model_path)
-
-        # Multiple simple prompts for better consistency
-        self.prompts = {
-            "see_robot": "Can you see a robot arm in this image? Answer yes or no.",
-            "see_cube": "Can you see a red cube in this image? Answer yes or no.",
-            "pointing": "Is the robot gripper pointing toward the red cube? Answer yes or no.",
-            "close": "Is the robot gripper very close to the red cube (touching distance)? Answer yes or no.",
-            "grasping": "Is the robot gripper grasping or holding the red cube? Answer yes or no.",
-        }
-
-        print(f"[VLM] Model loaded on {self.device}")
-
-    # get reward
-    def get_reward(
-        self,
-        image_bgr,
-        ee_pos,
-        ball_pos,
-        grasped,
-        target_pos,
-        joint_positions,
-        action=None,
-        step=0,
-    ):
-        """Get PURE VLM-based reward from camera image (dense, normalized to 0-1)"""
-        # rgb image
-        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(image_rgb)
-
-        # Calculate distance for logging
-        distance_to_cube = np.linalg.norm(ee_pos - ball_pos)
-
-        # LOG ONLY EVERY 50 STEPS (to reduce spam)
-        log_this_step = step % 50 == 0
-
-        # Ask multiple simple yes/no questions for more reliable scoring
-        # Pick the most relevant question based on distance
-        if distance_to_cube > 1.0:
-            question_key = "pointing"  # Far away - check if pointing toward
-        elif distance_to_cube > 0.3:
-            question_key = "close"  # Getting closer - check if close
-        else:
-            question_key = "grasping"  # Very close - check if grasping
-
-        prompt_text = self.prompts[question_key]
-
-        if log_this_step:
-            print(f"\n[VLM @ Step {step}] Question: {prompt_text}")
-
-        # Create input messages with image placeholder
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": prompt_text},
-                ],
-            },
-        ]
-
-        # Apply chat template
-        prompt = self.processor.apply_chat_template(
-            messages, add_generation_prompt=True
-        )
-
-        # Prepare inputs with images as list
-        inputs = self.processor(
-            text=prompt, images=[pil_image], return_tensors="pt"
-        ).to(self.device)
-
-        # Generate response
-        with torch.no_grad():
-            outputs = self.model.generate(
-                **inputs, max_new_tokens=5, do_sample=True, temperature=0.1
-            )
-
-        # Decode response
-        response = self.processor.batch_decode(
-            outputs, skip_special_tokens=True, clean_up_tokenization_spaces=False
-        )[0].lower()
-
-        # LOG RAW RESPONSE (only when logging)
-        if log_this_step:
-            print(f"[VLM RAW RESPONSE] ← {repr(response)}")
-
-        # Parse yes/no response and convert to reward
-        try:
-            # Extract answer after "assistant:"
-            if "assistant:" in response:
-                answer_part = response.split("assistant:")[-1].strip()
-            else:
-                answer_part = response
-
-            # Check for yes/no
-            is_yes = "yes" in answer_part
-            is_no = "no" in answer_part
-
-            # Build reward: HYBRID approach (distance-based + VLM bonus)
-            # Base reward from distance improvement
-            distance_reward = max(0.1, 1.0 - (distance_to_cube / 2.0))  # 0.1 to 1.0
-
-            # VLM bonus/penalty based on question type and answer
-            vlm_bonus = 0.0
-            if question_key == "pointing":
-                # Far away - VLM confirms if pointing
-                vlm_bonus = 0.1 if is_yes else -0.05
-            elif question_key == "close":
-                # Medium distance - VLM confirms if close
-                vlm_bonus = 0.2 if is_yes else -0.1
-            elif question_key == "grasping":
-                # Very close - VLM confirms if grasping
-                vlm_bonus = 0.5 if is_yes else 0.0
-
-            # Final reward = distance progress + VLM confirmation
-            reward = max(0.05, distance_reward + vlm_bonus)
-
-            if log_this_step:
-                answer_str = "YES" if is_yes else "NO" if is_no else "UNCLEAR"
-                print(
-                    f"[VLM] Answer: {answer_str} → Reward: {reward:.2f} (dist: {distance_to_cube:.3f}m)"
-                )
-
-            return reward
-
-        except Exception as e:
-            if log_this_step:
-                print(f"[VLM ERROR] {e} - Falling back to 0.1")
-            return 0.1
 
 
 # rl agent using DiT
@@ -790,27 +639,12 @@ FIXED_TARGET_X = 0.5
 FIXED_TARGET_Y = 0.2
 FIXED_TARGET_Z = 0.3  # Above the cube
 
-# === INITIALIZE VLM REWARD HELPER (REQUIRED) ===
-VLM_REWARD_INTERVAL = 10  # Get VLM reward every 10 steps (dense with interpolation)
-
+# === DISTANCE-BASED REWARD ===
 print("=" * 70)
-print("LOADING VISION-LANGUAGE MODEL FOR REWARD COMPUTATION")
+print("USING DISTANCE-BASED REWARD")
 print("=" * 70)
-
-# Load VLM - using SmolVLM-500M-Instruct (2x larger = smarter reasoning!)
-vlm_helper = VLMRewardHelper(
-    model_path="/home/kenpeter/.cache/huggingface/hub/SmolVLM-500M-Instruct"
-)
-print(f"[VLM] ✓ Model loaded successfully!")
-print(
-    f"[VLM] Will compute PURE VLM reward every {VLM_REWARD_INTERVAL} steps (dense, normalized 0-1)"
-)
-print(f"[VLM] NO HAND-CRAFTED RULES - VLM decides everything!")
+print("Reward: Closer to cube = higher reward")
 print("=" * 70)
-
-# Interpolation trackers (globals for simplicity; can move to agent if preferred)
-last_vlm_reward = 0.0  # Track last VLM value
-steps_since_vlm = 0  # Count gaps since last VLM
 
 
 # Helper function to reset environment
@@ -831,26 +665,41 @@ def reset_environment():
     return FIXED_CUBE_X, FIXED_CUBE_Y
 
 
-# Helper function to compute reward (PURE VLM - dense and normalized)
-def compute_reward(ee_pos, ball_pos, grasped, vlm_reward=None):
-    """Compute reward: Prioritize VLM, else interpolate last VLM forward (no shaping bias)"""
-    if vlm_reward is not None:
-        # Fresh VLM: Use it directly [0,1]
-        return vlm_reward
+# Helper function to compute reward (Distance-based with direction awareness)
+def compute_reward(ee_pos, ball_pos, grasped, prev_distance=None):
+    """
+    Compute reward based on distance to cube with directional constraint.
+    The closer the end effector to the cube, the higher the reward.
+    """
+    # Calculate current distance
+    distance = np.linalg.norm(ee_pos - ball_pos)
+
+    # Base reward: inverse of distance (closer = higher reward)
+    # Normalize to reasonable range (0 to 1)
+    max_distance = 2.0  # Maximum expected distance
+    distance_reward = max(0.0, 1.0 - (distance / max_distance))
+
+    # Bonus for getting very close
+    if distance < 0.1:
+        proximity_bonus = 0.5
+    elif distance < 0.2:
+        proximity_bonus = 0.2
     else:
-        # Interpolate: Decay last VLM reward linearly over the interval
-        # Assumes short gaps (e.g., 9 steps) and linear progress
-        if steps_since_vlm < VLM_REWARD_INTERVAL:
-            decay_factor = (
-                steps_since_vlm / VLM_REWARD_INTERVAL
-            )  # 0 (just got VLM) to ~1 (end of gap)
-            # Gentle linear decay: Fade by 50% max to preserve signal without over-damping
-            interpolated = last_vlm_reward * (1.0 - decay_factor * 0.5)
-            # Small floor to avoid pure zero (minimal bias, ensures signal)
-            return max(0.05, interpolated)
-        else:
-            # Rare: Gap longer than interval (e.g., episode end/start) → minimal holdover
-            return max(0.05, last_vlm_reward * 0.3)  # Heavily decayed
+        proximity_bonus = 0.0
+
+    # Bonus for successful grasp
+    grasp_bonus = 1.0 if grasped else 0.0
+
+    # Progress reward: if getting closer than before
+    progress_bonus = 0.0
+    if prev_distance is not None:
+        improvement = prev_distance - distance
+        if improvement > 0:
+            progress_bonus = improvement * 2.0  # Scale up progress
+
+    total_reward = distance_reward + proximity_bonus + grasp_bonus + progress_bonus
+
+    return max(0.0, total_reward), distance
 
 
 try:
@@ -860,12 +709,9 @@ try:
         # Reset environment
         cube_x, cube_y = reset_environment()
 
-        # Reset interpolation trackers at episode start
-        last_vlm_reward = 0.1  # Mild initial bias ("far but starting")
-        steps_since_vlm = 0
-
         episode_reward = 0.0
         episode_loss = []
+        prev_distance = None  # Track previous distance for progress reward
 
         # Run episode
         for step in range(MAX_STEPS_PER_EPISODE):
@@ -902,8 +748,33 @@ try:
             # Get action from policy (NO image)
             action = agent.get_action(state, image=None, deterministic=False)
 
-            # Execute action with RMPflow (INCREASED from 0.05 to 0.15 for faster movement)
-            delta_pos = action[:3] * 0.15  # 15cm max movement per step
+            # DIRECTIONAL CONSTRAINT: Ensure end effector moves toward cube, not opposite direction
+            # Calculate direction vector from end effector to cube
+            direction_to_cube = ball_pos - ee_pos
+            direction_to_cube_norm = np.linalg.norm(direction_to_cube)
+
+            if direction_to_cube_norm > 0.01:  # Avoid division by zero
+                direction_to_cube_unit = direction_to_cube / direction_to_cube_norm
+
+                # Project action onto direction towards cube
+                delta_pos = action[:3] * 0.15  # 15cm max movement per step
+
+                # Calculate dot product to check if moving in right direction
+                dot_product = np.dot(delta_pos, direction_to_cube_unit)
+
+                # If moving away from cube (negative dot product), penalize or redirect
+                if dot_product < 0:
+                    # Redirect action towards cube with reduced magnitude
+                    delta_pos = direction_to_cube_unit * 0.05  # Small step towards cube
+                else:
+                    # Scale action to favor movement towards cube
+                    # Keep original action but encourage alignment with cube direction
+                    alignment_factor = max(0.3, dot_product / np.linalg.norm(delta_pos + 1e-8))
+                    delta_pos = delta_pos * alignment_factor + direction_to_cube_unit * 0.02
+            else:
+                # Very close to cube, use original action
+                delta_pos = action[:3] * 0.15
+
             target_position = ee_pos + delta_pos
             target_position = np.clip(
                 target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
@@ -961,41 +832,17 @@ try:
                 ]
             )  # Total: 22D
 
-            # Compute VLM reward (every VLM_REWARD_INTERVAL steps for efficiency)
-            vlm_reward_value = None
-            if vlm_helper is not None and step % VLM_REWARD_INTERVAL == 0:
-                # Capture image from side camera for VLM (BGR)
-                side_camera.get_current_frame()
-                image_side = side_camera.get_rgba()[:, :, :3]  # Get RGBA, take RGB
-                image_side_bgr = cv2.cvtColor(image_side, cv2.COLOR_RGB2BGR)
-                # Pass FULL context: image, complete state, action, AND step number for logging
-                vlm_reward_value = vlm_helper.get_reward(
-                    image_side_bgr,
-                    ee_pos,
-                    ball_pos,
-                    grasped,
-                    target_pos,
-                    joint_positions,
-                    action=action,
-                    step=step,
-                )
-                if step % 100 == 0:  # Print occasionally
-                    print(
-                        f"  [VLM Step {step}] Reward: {vlm_reward_value:.3f} | Dist to cube: {ball_dist:.3f}m"
-                    )
-
-                # UPDATE TRACKERS: If VLM succeeded, reset counters and store value
-                if vlm_reward_value is not None:
-                    last_vlm_reward = vlm_reward_value  # Echo the true signal
-                    steps_since_vlm = 0
-            else:
-                # Increment gap counter for interpolation
-                steps_since_vlm += 1
-
-            # Compute pure VLM reward (dense, normalized) with interpolation
-            reward = compute_reward(
-                ee_pos, ball_pos, grasped, vlm_reward=vlm_reward_value
+            # Compute distance-based reward with directional awareness
+            reward, current_distance = compute_reward(
+                ee_pos, ball_pos, grasped, prev_distance=prev_distance
             )
+            prev_distance = current_distance  # Update for next iteration
+
+            # Log progress every 100 steps
+            if step % 100 == 0:
+                print(
+                    f"  [Step {step}] Reward: {reward:.3f} | Dist to cube: {ball_dist:.3f}m"
+                )
             episode_reward += reward
 
             # Store experience and train (online training with reward weighting, NO image)
@@ -1050,8 +897,23 @@ try:
 
                 action = agent.get_action(state, image=None, deterministic=True)
 
-                # Execute action (increased scaling for faster movement)
-                delta_pos = action[:3] * 0.15
+                # DIRECTIONAL CONSTRAINT: Ensure end effector moves toward cube
+                direction_to_cube = ball_pos - ee_pos
+                direction_to_cube_norm = np.linalg.norm(direction_to_cube)
+
+                if direction_to_cube_norm > 0.01:
+                    direction_to_cube_unit = direction_to_cube / direction_to_cube_norm
+                    delta_pos = action[:3] * 0.15
+                    dot_product = np.dot(delta_pos, direction_to_cube_unit)
+
+                    if dot_product < 0:
+                        delta_pos = direction_to_cube_unit * 0.05
+                    else:
+                        alignment_factor = max(0.3, dot_product / np.linalg.norm(delta_pos + 1e-8))
+                        delta_pos = delta_pos * alignment_factor + direction_to_cube_unit * 0.02
+                else:
+                    delta_pos = action[:3] * 0.15
+
                 target_position = ee_pos + delta_pos
                 target_position = np.clip(
                     target_position, [-0.6, -0.6, 0.05], [0.8, 0.6, 1.0]
