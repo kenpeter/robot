@@ -170,12 +170,12 @@ class DiTAgent:
         # Clamp to avoid numerical issues
         self.alphas_cumprod = torch.clamp(self.alphas_cumprod, min=1e-8, max=1.0)
 
-        # Initialize ConditionalDiffusionMLP (4x larger capacity)
+        # Initialize ConditionalDiffusionMLP (increased capacity)
         self.model = ConditionalDiffusionMLP(
             state_dim=state_dim,
             action_dim=action_dim,
-            hidden_dim=1024,  # Increased from 256 → 1024 (4x wider)
-            num_layers=8,     # Increased from 4 → 8 (2x deeper)
+            hidden_dim=512,  # Increased from 256 → 512 for better capacity
+            num_layers=6,    # Increased from 4 → 6 for deeper network
             use_vision=False,  # No vision
         ).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
