@@ -152,8 +152,8 @@ class DiTAgent:
         self.use_vision = use_vision
         self.device = device
 
-        # Diffusion hyperparameters (using KDA wrapper settings)
-        self.num_diffusion_steps = 5  # Increased for better quality with KDA
+        # Diffusion hyperparameters (fixed for proper denoising)
+        self.num_diffusion_steps = 1000  # Increased from 5 → 1000 for proper denoising
         self.beta_start = 0.0001
         self.beta_end = 0.02
 
@@ -170,12 +170,12 @@ class DiTAgent:
         # Clamp to avoid numerical issues
         self.alphas_cumprod = torch.clamp(self.alphas_cumprod, min=1e-8, max=1.0)
 
-        # Initialize ConditionalDiffusionMLP (simpler than fake transformer)
+        # Initialize ConditionalDiffusionMLP (4x larger capacity)
         self.model = ConditionalDiffusionMLP(
             state_dim=state_dim,
             action_dim=action_dim,
-            hidden_dim=256,  # Larger hidden dim since we removed attention overhead
-            num_layers=4,
+            hidden_dim=1024,  # Increased from 256 → 1024 (4x wider)
+            num_layers=8,     # Increased from 4 → 8 (2x deeper)
             use_vision=False,  # No vision
         ).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
@@ -281,29 +281,9 @@ class DiTAgent:
         if len(self.buffer) < self.batch_size:
             return
 
-        # FILTER: Only train on experiences with reward > 0.1 (meaningful experiences only!)
-        # Since rewards are normalized 0-1, filter for above-baseline performance
-        meaningful_indices = [
-            i for i in range(len(self.buffer)) if self.buffer[i][2] > 0.1
-        ]
-
-        # If not enough meaningful experiences, use all experiences (fall back)
-        if len(meaningful_indices) < self.batch_size:
-            # Print only every 100 steps to avoid spam
-            if self.step_count % 100 == 0:
-                print(
-                    f"[INFO] Only {len(meaningful_indices)} meaningful experiences (>0.1), using all {len(self.buffer)} experiences"
-                )
-            indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
-        else:
-            # Print only every 1000 steps when using meaningful-only filter
-            if self.step_count % 1000 == 0:
-                print(
-                    f"[INFO] Training on {len(meaningful_indices)} meaningful experiences (>0.1) only!"
-                )
-            indices = np.random.choice(
-                meaningful_indices, self.batch_size, replace=False
-            )
+        # REMOVED FILTERING: Train on ALL experiences for unbiased gradients
+        # Diffusion models need to learn from the full distribution (including failures)
+        indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
 
         batch = [self.buffer[i] for i in indices]
 
@@ -343,29 +323,19 @@ class DiTAgent:
         timesteps = (t.float() / self.num_diffusion_steps).view(-1, 1)
         predicted_noise = self.model(noisy_actions, states, timesteps, images_tensor)
 
-        # Compute per-sample loss (MSE between predicted and actual noise)
-        per_sample_loss = F.mse_loss(predicted_noise, noise, reduction="none").mean(
-            dim=1
-        )
-
-        # Reward-based weighting: high reward = more weight
-        # Normalize rewards to [0, 1], then scale by 2, then apply softmax
-        reward_normalized = (rewards - rewards.min()) / (
-            rewards.max() - rewards.min() + 1e-8
-        )
-        reward_weights = F.softmax(reward_normalized * 2.0, dim=0) * len(
-            rewards
-        )  # Scale by batch size
-        weighted_loss = (per_sample_loss * reward_weights).mean()
+        # Compute loss (MSE between predicted and actual noise)
+        # REMOVED REWARD WEIGHTING: Use uniform loss for stable gradients
+        # Let the RL reward signal guide exploration, not the diffusion loss
+        loss = F.mse_loss(predicted_noise, noise)
 
         # Optimize with gradient clipping
         self.optimizer.zero_grad()
-        weighted_loss.backward()
+        loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
 
         # Track training metrics
-        self.loss_history.append(weighted_loss.item())
+        self.loss_history.append(loss.item())
         self.step_count += 1
 
         # Decay exploration noise - floor at 0.10 for bold exploration
@@ -381,7 +351,7 @@ class DiTAgent:
             print(
                 f"  Noise prediction error (MAE): {(noise - predicted_noise).abs().mean().item():.4f} ← Should DECREASE"
             )
-            print(f"  Loss (weighted): {weighted_loss.item():.6f} ← Should DECREASE")
+            print(f"  Loss (unweighted MSE): {loss.item():.6f} ← Should DECREASE")
             print(
                 f"  Reward range: [{rewards.min().item():.2f}, {rewards.max().item():.2f}]"
             )
@@ -391,7 +361,7 @@ class DiTAgent:
             print(f"  Exploration noise scale: {self.noise_scale:.3f}")
 
         # Return loss for logging
-        return weighted_loss.item()
+        return loss.item()
 
     def save_model(self, filepath):
         """Save agent state to file"""

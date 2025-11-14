@@ -1,897 +1,604 @@
-# Offline RL Training Pipeline
-
-**Train robot grasping ONLY on expert demonstrations - no online data collection.**
-
-This is a **behavioral cloning / offline RL** approach that is:
-- ✅ More data-efficient (learn from perfect demos)
-- ✅ More stable (no exploration noise)
-- ✅ Faster convergence (supervised learning on expert data)
-- ✅ Safer (no random exploration in real world)
-
----
-
-## 📋 Workflow
-
-```
-┌────────────────────────────────────────┐
-│ Step 1: Collect Expert Dataset         │
-│ python collect_expert_dataset.py       │
-│                                         │
-│ • Uses test_grasp_official.py controller│
-│ • Collects 100 demonstrations           │
-│ • Randomizes cube/target positions      │
-│ • Saves: expert_dataset.pkl (~50-100MB)│
-└────────────────────────────────────────┘
-               ↓
-┌────────────────────────────────────────┐
-│ Step 2: Train Offline                  │
-│ python train_offline.py                │
-│                                         │
-│ • Loads expert_dataset.pkl              │
-│ • Pure supervised learning (no sim)     │
-│ • 200 epochs (~30 min)                 │
-│ • Saves: offline_model.pth             │
-└────────────────────────────────────────┘
-               ↓
-┌────────────────────────────────────────┐
-│ Step 3: Deploy (TODO)                  │
-│ • Load offline_model.pth                │
-│ • Test in Isaac Sim or real robot       │
-│ • No further training needed            │
-└────────────────────────────────────────┘
-```
-
----
-
-## 🚀 Quick Start
-
-### 1. Collect Expert Data (Once)
-```bash
-# Collect 100 expert demonstrations (takes ~30-60 minutes)
-python collect_expert_dataset.py
-
-# Output: expert_dataset.pkl containing ~5000-15000 experiences
-```
-
-**What it does:**
-- Runs UR10e with official RMPFlow controller
-- Randomizes cube positions (X: 0.3-0.6, Y: -0.3-0.3)
-- Randomizes target positions (X: -0.6--0.3, Y: -0.3-0.3)
-- Captures (state, action, next_state, image) at each step
-- Saves only successful demonstrations
-
-### 2. Train Offline
-```bash
-# Train purely on expert data (no simulation needed!)
-python train_offline.py
-
-# Output: offline_model.pth
-```
-
-**Training details:**
-- Batch size: 64
-- Epochs: 200
-- Loss: MSE between predicted noise and actual noise (diffusion training)
-- Saves checkpoint every 10 epochs
-- Can resume training if interrupted
-
-### 3. Collect More Data (Optional)
-```bash
-# Already have expert_dataset.pkl? Collect more and merge:
-python collect_expert_dataset.py  # Creates expert_dataset_new.pkl
-
-# Then manually merge datasets in Python:
-# dataset_old = pickle.load(open('expert_dataset.pkl', 'rb'))
-# dataset_new = pickle.load(open('expert_dataset_new.pkl', 'rb'))
-# dataset_merged = {k: np.concatenate([dataset_old[k], dataset_new[k]]) for k in dataset_old}
-# pickle.dump(dataset_merged, open('expert_dataset.pkl', 'wb'))
-```
-
----
-
-## 📊 Dataset Format
-
-**`expert_dataset.pkl`** contains:
-```python
-{
-    'states': np.ndarray,       # Shape: (N, 13) - 12 joints + 1 grasped flag
-    'actions': np.ndarray,      # Shape: (N, 4)  - dx, dy, dz, gripper
-    'next_states': np.ndarray,  # Shape: (N, 13)
-    'images': np.ndarray,       # Shape: (N, 84, 84, 3) - RGB overhead camera
-    'rewards': np.ndarray,      # Shape: (N,) - distance improvement rewards
-}
-```
-
-where `N = total number of timesteps across all demonstrations`
-
----
-
-## 🔧 Configuration
-
-### Collect More/Fewer Demos
-Edit `collect_expert_dataset.py`:
-```python
-NUM_EPISODES = 100  # Change to 50, 200, etc.
-```
-
-### Change Training Hyperparameters
-Edit `train_offline.py`:
-```python
-NUM_EPOCHS = 200      # More epochs = better fit
-BATCH_SIZE = 64       # Larger = faster but more memory
-LEARNING_RATE = 1e-4  # Default: 1e-4
-```
-
----
-
-## 🆚 Comparison: Offline vs Online RL
-
-| Aspect | **Offline RL (New)** | Online RL (Old) |
-|--------|---------------------|----------------|
-| Data source | Pre-collected expert demos | Live environment interaction |
-| Training speed | Fast (no sim needed) | Slow (runs Isaac Sim) |
-| Convergence | 200 epochs (~30 min) | 500+ episodes (~hours) |
-| Stability | High (supervised learning) | Medium (exploration noise) |
-| Sample efficiency | Very high | Low (needs exploration) |
-| Forgetting | None | Possible |
-| Sim dependency | Only for data collection | Always |
-
----
-
-## 🎯 Why Offline RL?
-
-1. **Expert as Teacher**: Learn directly from perfect demonstrations
-2. **No Exploration Risk**: No random actions that could fail
-3. **Reproducible**: Same dataset = same results
-4. **Scalable**: Collect data once, train many times
-5. **Fast Iteration**: Tweak model architecture without re-collecting data
-
-This is the **standard approach for real-world robot learning** where exploration is expensive/dangerous.
-
----
-
-## 📝 Next Steps
-
-1. ✅ Collect dataset: `python collect_expert_dataset.py`
-2. ✅ Train offline: `python train_offline.py`
-3. ⏳ TODO: Create deployment script to test trained model in Isaac Sim
-4. ⏳ TODO: Add data augmentation (random crops, color jitter) for robustness
-5. ⏳ TODO: Compare offline model vs online RL model performance
-
----
-
-## 🐛 Troubleshooting
-
-**Q: "expert_dataset.pkl not found"**
-- Run `collect_expert_dataset.py` first
-
-**Q: "CUDA out of memory"**
-- Reduce batch size in `train_offline.py`: `BATCH_SIZE = 32`
-
-**Q: "All demos failed during collection"**
-- Check robot can reach cube positions
-- Try easier ranges: `cube_x = np.random.uniform(0.4, 0.5)`
-
-**Q: "Loss not decreasing"**
-- Increase epochs: `NUM_EPOCHS = 500`
-- Check dataset quality (inspect saved images)
-- Verify expert controller works: `python test_grasp_official.py`
-
----
-
-## 📚 References
-
-- Behavioral Cloning: Pomerleau (1988)
-- Offline RL: https://arxiv.org/abs/2005.01643
-- Diffusion Policies: https://diffusion-policy.cs.columbia.edu/
-
-
-
-
-
-  Noise prediction error (MAE): 0.6762 ← Should DECREASE
-  Loss (weighted): 0.797834 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+  Loss (weighted): 0.751909 ← Should DECREASE
+  Reward range: [0.10, 0.44]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 1300] Reward: 0.421 | Dist to cube: 0.653m
 
-[VLM @ Step 900] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.664m)
-  [VLM Step 900] Reward: 0.300 | Dist to cube: 1.664m
-
-[VLM @ Step 950] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.664m)
-
-[DIFFUSION MLP DEBUG - Step 421900]
-  Actual noise magnitude: 0.7507
-  Predicted noise magnitude: 0.1978
-  Noise prediction error (MAE): 0.7254 ← Should DECREASE
-  Loss (weighted): 0.883009 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1073800]
+  Actual noise magnitude: 0.8178
+  Predicted noise magnitude: 0.1791
+  Noise prediction error (MAE): 0.7686 ← Should DECREASE
+  Loss (weighted): 1.086210 ← Should DECREASE
+  Reward range: [0.11, 0.47]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
-Episode 422/1000 | Reward: 199.95 | Loss: 0.896811 | Buffer: 10000
-Model saved to rl_robot_arm_model.pth
-  → Checkpoint saved at episode 422
+  [Step 1400] Reward: 0.212 | Dist to cube: 0.586m
 
-
-===== Episode 423/1000 =====
-
-[VLM @ Step 0] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.546m)
-  [VLM Step 0] Reward: 0.300 | Dist to cube: 1.546m
-
-[VLM @ Step 50] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.590m)
-
-[DIFFUSION MLP DEBUG - Step 422000]
-  Actual noise magnitude: 0.8192
-  Predicted noise magnitude: 0.1820
-  Noise prediction error (MAE): 0.8009 ← Should DECREASE
-  Loss (weighted): 1.049892 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-[INFO] Training on 10000 positive experiences only!
-
-[VLM @ Step 100] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.632m)
-  [VLM Step 100] Reward: 0.300 | Dist to cube: 1.632m
-
-[VLM @ Step 150] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.649m)
-
-[DIFFUSION MLP DEBUG - Step 422100]
-  Actual noise magnitude: 0.8275
-  Predicted noise magnitude: 0.2081
-  Noise prediction error (MAE): 0.8000 ← Should DECREASE
-  Loss (weighted): 0.903928 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 200] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.638m)
-  [VLM Step 200] Reward: 0.100 | Dist to cube: 1.638m
-
-[VLM @ Step 250] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.624m)
-
-[DIFFUSION MLP DEBUG - Step 422200]
-  Actual noise magnitude: 0.8496
-  Predicted noise magnitude: 0.2126
-  Noise prediction error (MAE): 0.7980 ← Should DECREASE
-  Loss (weighted): 1.111037 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 300] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.654m)
-  [VLM Step 300] Reward: 0.300 | Dist to cube: 1.654m
-
-[VLM @ Step 350] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.662m)
-
-[DIFFUSION MLP DEBUG - Step 422300]
-  Actual noise magnitude: 0.7342
-  Predicted noise magnitude: 0.1863
-  Noise prediction error (MAE): 0.7127 ← Should DECREASE
-  Loss (weighted): 0.778898 ← Should DECREASE
-  Reward range: [0.05, 0.28]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 400] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.650m)
-  [VLM Step 400] Reward: 0.300 | Dist to cube: 1.650m
-
-[VLM @ Step 450] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.650m)
-
-[DIFFUSION MLP DEBUG - Step 422400]
-  Actual noise magnitude: 0.7814
-  Predicted noise magnitude: 0.1641
-  Noise prediction error (MAE): 0.7437 ← Should DECREASE
-  Loss (weighted): 0.854917 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 500] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.668m)
-  [VLM Step 500] Reward: 0.300 | Dist to cube: 1.668m
-
-[VLM @ Step 550] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.676m)
-
-[DIFFUSION MLP DEBUG - Step 422500]
-  Actual noise magnitude: 0.7653
-  Predicted noise magnitude: 0.1783
-  Noise prediction error (MAE): 0.7294 ← Should DECREASE
-  Loss (weighted): 0.779839 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 600] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.662m)
-  [VLM Step 600] Reward: 0.300 | Dist to cube: 1.662m
-
-[VLM @ Step 650] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.658m)
-
-[DIFFUSION MLP DEBUG - Step 422600]
-  Actual noise magnitude: 0.7881
-  Predicted noise magnitude: 0.1666
-  Noise prediction error (MAE): 0.7590 ← Should DECREASE
-  Loss (weighted): 0.977990 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 700] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.646m)
-  [VLM Step 700] Reward: 0.300 | Dist to cube: 1.646m
-
-[VLM @ Step 750] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.648m)
-
-[DIFFUSION MLP DEBUG - Step 422700]
-  Actual noise magnitude: 0.7921
-  Predicted noise magnitude: 0.2173
-  Noise prediction error (MAE): 0.7494 ← Should DECREASE
-  Loss (weighted): 0.883260 ← Should DECREASE
-  Reward range: [0.06, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 800] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.633m)
-  [VLM Step 800] Reward: 0.300 | Dist to cube: 1.633m
-
-[VLM @ Step 850] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.644m)
-
-[DIFFUSION MLP DEBUG - Step 422800]
-  Actual noise magnitude: 0.8405
-  Predicted noise magnitude: 0.1879
-  Noise prediction error (MAE): 0.8118 ← Should DECREASE
-  Loss (weighted): 1.082603 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 900] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.632m)
-  [VLM Step 900] Reward: 0.300 | Dist to cube: 1.632m
-
-[VLM @ Step 950] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.633m)
-
-[DIFFUSION MLP DEBUG - Step 422900]
-  Actual noise magnitude: 0.8654
-  Predicted noise magnitude: 0.2055
-  Noise prediction error (MAE): 0.8128 ← Should DECREASE
-  Loss (weighted): 1.220239 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-Episode 423/1000 | Reward: 207.70 | Loss: 0.902026 | Buffer: 10000
-Model saved to rl_robot_arm_model.pth
-  → Checkpoint saved at episode 423
-
-
-===== Episode 424/1000 =====
-
-[VLM @ Step 0] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.566m)
-  [VLM Step 0] Reward: 0.300 | Dist to cube: 1.566m
-
-[VLM @ Step 50] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.611m)
-
-[DIFFUSION MLP DEBUG - Step 423000]
-  Actual noise magnitude: 0.7433
-  Predicted noise magnitude: 0.2101
-  Noise prediction error (MAE): 0.6973 ← Should DECREASE
-  Loss (weighted): 0.749419 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-[INFO] Training on 10000 positive experiences only!
-
-[VLM @ Step 100] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.645m)
-  [VLM Step 100] Reward: 0.100 | Dist to cube: 1.645m
-
-[VLM @ Step 150] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.664m)
-
-[DIFFUSION MLP DEBUG - Step 423100]
-  Actual noise magnitude: 0.8139
-  Predicted noise magnitude: 0.2442
-  Noise prediction error (MAE): 0.7424 ← Should DECREASE
-  Loss (weighted): 0.895614 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 200] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.660m)
-  [VLM Step 200] Reward: 0.300 | Dist to cube: 1.660m
-
-[VLM @ Step 250] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.656m)
-
-[DIFFUSION MLP DEBUG - Step 423200]
-  Actual noise magnitude: 0.8057
-  Predicted noise magnitude: 0.1734
-  Noise prediction error (MAE): 0.7743 ← Should DECREASE
-  Loss (weighted): 0.969373 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 300] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.647m)
-  [VLM Step 300] Reward: 0.300 | Dist to cube: 1.647m
-
-[VLM @ Step 350] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.649m)
-
-[DIFFUSION MLP DEBUG - Step 423300]
-  Actual noise magnitude: 0.8044
-  Predicted noise magnitude: 0.1790
-  Noise prediction error (MAE): 0.7723 ← Should DECREASE
-  Loss (weighted): 0.925418 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 400] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.690m)
-  [VLM Step 400] Reward: 0.300 | Dist to cube: 1.690m
-
-[VLM @ Step 450] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.718m)
-
-[DIFFUSION MLP DEBUG - Step 423400]
-  Actual noise magnitude: 0.7268
-  Predicted noise magnitude: 0.1798
-  Noise prediction error (MAE): 0.7100 ← Should DECREASE
-  Loss (weighted): 0.900656 ← Should DECREASE
-  Reward range: [0.07, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 500] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.718m)
-  [VLM Step 500] Reward: 0.300 | Dist to cube: 1.718m
-
-[VLM @ Step 550] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.719m)
-
-[DIFFUSION MLP DEBUG - Step 423500]
-  Actual noise magnitude: 0.8427
-  Predicted noise magnitude: 0.2364
-  Noise prediction error (MAE): 0.7607 ← Should DECREASE
-  Loss (weighted): 0.840167 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 600] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.713m)
-  [VLM Step 600] Reward: 0.300 | Dist to cube: 1.713m
-
-[VLM @ Step 650] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.695m)
-
-[DIFFUSION MLP DEBUG - Step 423600]
-  Actual noise magnitude: 0.8105
-  Predicted noise magnitude: 0.1808
-  Noise prediction error (MAE): 0.7759 ← Should DECREASE
-  Loss (weighted): 0.958200 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 700] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.690m)
-  [VLM Step 700] Reward: 0.300 | Dist to cube: 1.690m
-
-[VLM @ Step 750] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.628m)
-
-[DIFFUSION MLP DEBUG - Step 423700]
+[DIFFUSION MLP DEBUG - Step 1073900]
   Actual noise magnitude: 0.7918
-  Predicted noise magnitude: 0.1615
-  Noise prediction error (MAE): 0.7638 ← Should DECREASE
-  Loss (weighted): 0.959496 ← Should DECREASE
-  Reward range: [0.06, 0.30]
+  Predicted noise magnitude: 0.1759
+  Noise prediction error (MAE): 0.7670 ← Should DECREASE
+  Loss (weighted): 0.902907 ← Should DECREASE
+  Reward range: [0.10, 0.45]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
-
-[VLM @ Step 800] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.624m)
-  [VLM Step 800] Reward: 0.100 | Dist to cube: 1.624m
-
-[VLM @ Step 850] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.608m)
-
-[DIFFUSION MLP DEBUG - Step 423800]
-  Actual noise magnitude: 0.7123
-  Predicted noise magnitude: 0.2082
-  Noise prediction error (MAE): 0.6841 ← Should DECREASE
-  Loss (weighted): 0.724978 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-
-[VLM @ Step 900] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.618m)
-  [VLM Step 900] Reward: 0.300 | Dist to cube: 1.618m
-
-[VLM @ Step 950] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.605m)
-
-[DIFFUSION MLP DEBUG - Step 423900]
-  Actual noise magnitude: 0.8212
-  Predicted noise magnitude: 0.1876
-  Noise prediction error (MAE): 0.7676 ← Should DECREASE
-  Loss (weighted): 0.951209 ← Should DECREASE
-  Reward range: [0.05, 0.30]
-  Alpha_cumprod range: [0.9506, 0.9999]
-  Exploration noise scale: 0.100
-Episode 424/1000 | Reward: 189.10 | Loss: 0.903907 | Buffer: 10000
+Episode 716/1000 | Reward: 292.27 | Loss: 0.854542 | Buffer: 10000
 Model saved to rl_robot_arm_model.pth
-  → Checkpoint saved at episode 424
+  → Checkpoint saved at episode 716
 
 
-===== Episode 425/1000 =====
+===== Episode 717/1000 =====
+  [Step 0] Reward: 0.006 | Dist to cube: 1.961m
 
-[VLM @ Step 0] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.550m)
-  [VLM Step 0] Reward: 0.300 | Dist to cube: 1.550m
-
-[VLM @ Step 50] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.609m)
-
-[DIFFUSION MLP DEBUG - Step 424000]
-  Actual noise magnitude: 0.8176
-  Predicted noise magnitude: 0.1641
-  Noise prediction error (MAE): 0.7969 ← Should DECREASE
-  Loss (weighted): 0.989214 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1074000]
+  Actual noise magnitude: 0.7727
+  Predicted noise magnitude: 0.2546
+  Noise prediction error (MAE): 0.7044 ← Should DECREASE
+  Loss (weighted): 0.706594 ← Should DECREASE
+  Reward range: [0.11, 0.43]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
-[INFO] Training on 10000 positive experiences only!
+[INFO] Training on 6939 meaningful experiences (>0.1) only!
+  [Step 100] Reward: 0.097 | Dist to cube: 1.934m
 
-[VLM @ Step 100] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.656m)
-  [VLM Step 100] Reward: 0.100 | Dist to cube: 1.656m
-
-[VLM @ Step 150] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.676m)
-
-[DIFFUSION MLP DEBUG - Step 424100]
-  Actual noise magnitude: 0.8243
-  Predicted noise magnitude: 0.1957
-  Noise prediction error (MAE): 0.7929 ← Should DECREASE
-  Loss (weighted): 1.091900 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1074100]
+  Actual noise magnitude: 0.7945
+  Predicted noise magnitude: 0.2634
+  Noise prediction error (MAE): 0.7509 ← Should DECREASE
+  Loss (weighted): 0.898844 ← Should DECREASE
+  Reward range: [0.11, 0.41]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 200] Reward: 0.166 | Dist to cube: 1.884m
 
-[VLM @ Step 200] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.668m)
-  [VLM Step 200] Reward: 0.300 | Dist to cube: 1.668m
+[DIFFUSION MLP DEBUG - Step 1074200]
+  Actual noise magnitude: 0.7409
+  Predicted noise magnitude: 0.2269
+  Noise prediction error (MAE): 0.6764 ← Should DECREASE
+  Loss (weighted): 0.732963 ← Should DECREASE
+  Reward range: [0.10, 0.46]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 300] Reward: 0.196 | Dist to cube: 1.734m
 
-[VLM @ Step 250] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.659m)
+[DIFFUSION MLP DEBUG - Step 1074300]
+  Actual noise magnitude: 0.7653
+  Predicted noise magnitude: 0.2377
+  Noise prediction error (MAE): 0.6966 ← Should DECREASE
+  Loss (weighted): 0.722750 ← Should DECREASE
+  Reward range: [0.11, 0.43]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 400] Reward: 0.261 | Dist to cube: 1.452m
 
-[DIFFUSION MLP DEBUG - Step 424200]
+[DIFFUSION MLP DEBUG - Step 1074400]
+  Actual noise magnitude: 0.8112
+  Predicted noise magnitude: 0.2766
+  Noise prediction error (MAE): 0.6993 ← Should DECREASE
+  Loss (weighted): 0.755472 ← Should DECREASE
+  Reward range: [0.11, 0.50]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 500] Reward: 0.107 | Dist to cube: 1.467m
+
+[DIFFUSION MLP DEBUG - Step 1074500]
+  Actual noise magnitude: 0.8112
+  Predicted noise magnitude: 0.2092
+  Noise prediction error (MAE): 0.7796 ← Should DECREASE
+  Loss (weighted): 0.986302 ← Should DECREASE
+  Reward range: [0.11, 0.53]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 600] Reward: 0.098 | Dist to cube: 1.648m
+
+[DIFFUSION MLP DEBUG - Step 1074600]
+  Actual noise magnitude: 0.7593
+  Predicted noise magnitude: 0.2285
+  Noise prediction error (MAE): 0.6963 ← Should DECREASE
+  Loss (weighted): 0.744503 ← Should DECREASE
+  Reward range: [0.10, 0.47]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 700] Reward: 0.079 | Dist to cube: 1.787m
+
+[DIFFUSION MLP DEBUG - Step 1074700]
+  Actual noise magnitude: 0.7792
+  Predicted noise magnitude: 0.2155
+  Noise prediction error (MAE): 0.7290 ← Should DECREASE
+  Loss (weighted): 0.831946 ← Should DECREASE
+  Reward range: [0.10, 0.44]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 800] Reward: 0.066 | Dist to cube: 1.892m
+
+[DIFFUSION MLP DEBUG - Step 1074800]
+  Actual noise magnitude: 0.8251
+  Predicted noise magnitude: 0.2680
+  Noise prediction error (MAE): 0.7418 ← Should DECREASE
+  Loss (weighted): 0.816253 ← Should DECREASE
+  Reward range: [0.10, 0.49]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 900] Reward: 0.108 | Dist to cube: 1.989m
+
+[DIFFUSION MLP DEBUG - Step 1074900]
+  Actual noise magnitude: 0.7458
+  Predicted noise magnitude: 0.2457
+  Noise prediction error (MAE): 0.6767 ← Should DECREASE
+  Loss (weighted): 0.730494 ← Should DECREASE
+  Reward range: [0.10, 0.53]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 1000] Reward: 0.177 | Dist to cube: 1.932m
+
+[DIFFUSION MLP DEBUG - Step 1075000]
+  Actual noise magnitude: 0.7712
+  Predicted noise magnitude: 0.2080
+  Noise prediction error (MAE): 0.7262 ← Should DECREASE
+  Loss (weighted): 0.769620 ← Should DECREASE
+  Reward range: [0.11, 0.44]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+[INFO] Training on 6527 meaningful experiences (>0.1) only!
+  [Step 1100] Reward: 0.096 | Dist to cube: 2.021m
+
+[DIFFUSION MLP DEBUG - Step 1075100]
+  Actual noise magnitude: 0.8105
+  Predicted noise magnitude: 0.2234
+  Noise prediction error (MAE): 0.7363 ← Should DECREASE
+  Loss (weighted): 0.852898 ← Should DECREASE
+  Reward range: [0.11, 0.47]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 1200] Reward: 0.090 | Dist to cube: 2.048m
+
+[DIFFUSION MLP DEBUG - Step 1075200]
+  Actual noise magnitude: 0.7946
+  Predicted noise magnitude: 0.2183
+  Noise prediction error (MAE): 0.7491 ← Should DECREASE
+  Loss (weighted): 0.947191 ← Should DECREASE
+  Reward range: [0.10, 0.50]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 1300] Reward: 0.134 | Dist to cube: 2.031m
+
+[DIFFUSION MLP DEBUG - Step 1075300]
+  Actual noise magnitude: 0.8217
+  Predicted noise magnitude: 0.2585
+  Noise prediction error (MAE): 0.7609 ← Should DECREASE
+  Loss (weighted): 0.931013 ← Should DECREASE
+  Reward range: [0.10, 0.46]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 1400] Reward: 0.070 | Dist to cube: 2.016m
+
+[DIFFUSION MLP DEBUG - Step 1075400]
+  Actual noise magnitude: 0.8463
+  Predicted noise magnitude: 0.2259
+  Noise prediction error (MAE): 0.7895 ← Should DECREASE
+  Loss (weighted): 1.029041 ← Should DECREASE
+  Reward range: [0.11, 0.48]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+Episode 717/1000 | Reward: 165.95 | Loss: 0.851055 | Buffer: 10000
+Model saved to rl_robot_arm_model.pth
+  → Checkpoint saved at episode 717
+
+
+===== Episode 718/1000 =====
+  [Step 0] Reward: 0.006 | Dist to cube: 1.962m
+
+[DIFFUSION MLP DEBUG - Step 1075500]
+  Actual noise magnitude: 0.7826
+  Predicted noise magnitude: 0.2196
+  Noise prediction error (MAE): 0.7368 ← Should DECREASE
+  Loss (weighted): 0.748408 ← Should DECREASE
+  Reward range: [0.10, 0.44]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 100] Reward: 0.013 | Dist to cube: 1.922m
+
+[DIFFUSION MLP DEBUG - Step 1075600]
+  Actual noise magnitude: 0.8075
+  Predicted noise magnitude: 0.2444
+  Noise prediction error (MAE): 0.7633 ← Should DECREASE
+  Loss (weighted): 0.883434 ← Should DECREASE
+  Reward range: [0.13, 0.44]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 200] Reward: 0.008 | Dist to cube: 1.949m
+
+[DIFFUSION MLP DEBUG - Step 1075700]
+  Actual noise magnitude: 0.8520
+  Predicted noise magnitude: 0.2377
+  Noise prediction error (MAE): 0.8185 ← Should DECREASE
+  Loss (weighted): 1.072962 ← Should DECREASE
+  Reward range: [0.10, 0.42]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 300] Reward: 0.146 | Dist to cube: 1.924m
+
+[DIFFUSION MLP DEBUG - Step 1075800]
+  Actual noise magnitude: 0.8780
+  Predicted noise magnitude: 0.2297
+  Noise prediction error (MAE): 0.8194 ← Should DECREASE
+  Loss (weighted): 1.020076 ← Should DECREASE
+  Reward range: [0.11, 0.43]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 400] Reward: 0.180 | Dist to cube: 1.801m
+
+[DIFFUSION MLP DEBUG - Step 1075900]
+  Actual noise magnitude: 0.8074
+  Predicted noise magnitude: 0.2192
+  Noise prediction error (MAE): 0.7456 ← Should DECREASE
+  Loss (weighted): 0.832869 ← Should DECREASE
+  Reward range: [0.10, 0.41]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 500] Reward: 0.234 | Dist to cube: 1.607m
+
+[DIFFUSION MLP DEBUG - Step 1076000]
   Actual noise magnitude: 0.7794
-  Predicted noise magnitude: 0.1994
-  Noise prediction error (MAE): 0.7453 ← Should DECREASE
-  Loss (weighted): 0.846953 ← Should DECREASE
-  Reward range: [0.05, 0.28]
+  Predicted noise magnitude: 0.2354
+  Noise prediction error (MAE): 0.7014 ← Should DECREASE
+  Loss (weighted): 0.757002 ← Should DECREASE
+  Reward range: [0.10, 0.45]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+[INFO] Training on 6660 meaningful experiences (>0.1) only!
+  [Step 600] Reward: 0.277 | Dist to cube: 1.345m
 
-[VLM @ Step 300] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.593m)
-  [VLM Step 300] Reward: 0.100 | Dist to cube: 1.593m
-
-[VLM @ Step 350] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.501m)
-
-[DIFFUSION MLP DEBUG - Step 424300]
-  Actual noise magnitude: 0.7895
-  Predicted noise magnitude: 0.1993
-  Noise prediction error (MAE): 0.7276 ← Should DECREASE
-  Loss (weighted): 0.832848 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1076100]
+  Actual noise magnitude: 0.7928
+  Predicted noise magnitude: 0.2441
+  Noise prediction error (MAE): 0.7294 ← Should DECREASE
+  Loss (weighted): 0.793444 ← Should DECREASE
+  Reward range: [0.10, 0.44]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 700] Reward: 0.314 | Dist to cube: 1.248m
 
-[VLM @ Step 400] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.372m)
-  [VLM Step 400] Reward: 0.300 | Dist to cube: 1.372m
-
-[VLM @ Step 450] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.284m)
-
-[DIFFUSION MLP DEBUG - Step 424400]
-  Actual noise magnitude: 0.8179
-  Predicted noise magnitude: 0.2065
-  Noise prediction error (MAE): 0.7668 ← Should DECREASE
-  Loss (weighted): 0.941171 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1076200]
+  Actual noise magnitude: 0.7880
+  Predicted noise magnitude: 0.2537
+  Noise prediction error (MAE): 0.7261 ← Should DECREASE
+  Loss (weighted): 0.820537 ← Should DECREASE
+  Reward range: [0.10, 0.43]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 800] Reward: 0.364 | Dist to cube: 0.986m
 
-[VLM @ Step 500] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.303m)
-  [VLM Step 500] Reward: 0.300 | Dist to cube: 1.303m
-
-[VLM @ Step 550] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.249m)
-
-[DIFFUSION MLP DEBUG - Step 424500]
-  Actual noise magnitude: 0.8354
-  Predicted noise magnitude: 0.1767
-  Noise prediction error (MAE): 0.8031 ← Should DECREASE
-  Loss (weighted): 1.068157 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1076300]
+  Actual noise magnitude: 0.8243
+  Predicted noise magnitude: 0.2340
+  Noise prediction error (MAE): 0.7505 ← Should DECREASE
+  Loss (weighted): 0.799579 ← Should DECREASE
+  Reward range: [0.10, 0.41]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 900] Reward: 0.259 | Dist to cube: 0.901m
 
-[VLM @ Step 600] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.357m)
-  [VLM Step 600] Reward: 0.300 | Dist to cube: 1.357m
-
-[VLM @ Step 650] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.323m)
-
-[DIFFUSION MLP DEBUG - Step 424600]
-  Actual noise magnitude: 0.7601
-  Predicted noise magnitude: 0.1932
-  Noise prediction error (MAE): 0.7232 ← Should DECREASE
-  Loss (weighted): 0.859768 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1076400]
+  Actual noise magnitude: 0.8350
+  Predicted noise magnitude: 0.2435
+  Noise prediction error (MAE): 0.7944 ← Should DECREASE
+  Loss (weighted): 0.955876 ← Should DECREASE
+  Reward range: [0.10, 0.46]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 1000] Reward: 0.170 | Dist to cube: 0.877m
 
-[VLM @ Step 700] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.188m)
-  [VLM Step 700] Reward: 0.100 | Dist to cube: 1.188m
-
-[VLM @ Step 750] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.070m)
-
-[DIFFUSION MLP DEBUG - Step 424700]
-  Actual noise magnitude: 0.7682
-  Predicted noise magnitude: 0.2003
-  Noise prediction error (MAE): 0.7451 ← Should DECREASE
-  Loss (weighted): 0.803733 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1076500]
+  Actual noise magnitude: 0.7809
+  Predicted noise magnitude: 0.1720
+  Noise prediction error (MAE): 0.7446 ← Should DECREASE
+  Loss (weighted): 0.853675 ← Should DECREASE
+  Reward range: [0.10, 0.44]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 1100] Reward: 0.173 | Dist to cube: 0.845m
 
-[VLM @ Step 800] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.047m)
-  [VLM Step 800] Reward: 0.100 | Dist to cube: 1.047m
-
-[VLM @ Step 850] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.097m)
-
-[DIFFUSION MLP DEBUG - Step 424800]
-  Actual noise magnitude: 0.7488
-  Predicted noise magnitude: 0.2224
-  Noise prediction error (MAE): 0.7298 ← Should DECREASE
-  Loss (weighted): 0.759734 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1076600]
+  Actual noise magnitude: 0.7806
+  Predicted noise magnitude: 0.2415
+  Noise prediction error (MAE): 0.7184 ← Should DECREASE
+  Loss (weighted): 0.758683 ← Should DECREASE
+  Reward range: [0.10, 0.46]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 1200] Reward: 0.203 | Dist to cube: 0.807m
 
-[VLM @ Step 900] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.178m)
-  [VLM Step 900] Reward: 0.100 | Dist to cube: 1.178m
-
-[VLM @ Step 950] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.236m)
-
-[DIFFUSION MLP DEBUG - Step 424900]
-  Actual noise magnitude: 0.8283
-  Predicted noise magnitude: 0.1873
-  Noise prediction error (MAE): 0.7745 ← Should DECREASE
-  Loss (weighted): 0.993706 ← Should DECREASE
-  Reward range: [0.06, 0.30]
+[DIFFUSION MLP DEBUG - Step 1076700]
+  Actual noise magnitude: 0.8090
+  Predicted noise magnitude: 0.2140
+  Noise prediction error (MAE): 0.7612 ← Should DECREASE
+  Loss (weighted): 0.847241 ← Should DECREASE
+  Reward range: [0.10, 0.47]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
-Episode 425/1000 | Reward: 170.50 | Loss: 0.906104 | Buffer: 10000
+  [Step 1300] Reward: 0.372 | Dist to cube: 0.753m
+
+[DIFFUSION MLP DEBUG - Step 1076800]
+  Actual noise magnitude: 0.7750
+  Predicted noise magnitude: 0.2524
+  Noise prediction error (MAE): 0.6794 ← Should DECREASE
+  Loss (weighted): 0.820070 ← Should DECREASE
+  Reward range: [0.10, 0.51]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 1400] Reward: 0.418 | Dist to cube: 0.687m
+
+[DIFFUSION MLP DEBUG - Step 1076900]
+  Actual noise magnitude: 0.8029
+  Predicted noise magnitude: 0.2215
+  Noise prediction error (MAE): 0.7477 ← Should DECREASE
+  Loss (weighted): 0.849065 ← Should DECREASE
+  Reward range: [0.11, 0.46]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+Episode 718/1000 | Reward: 307.38 | Loss: 0.854086 | Buffer: 10000
 Model saved to rl_robot_arm_model.pth
-  → Checkpoint saved at episode 425
+  → Checkpoint saved at episode 718
 
 
-===== Episode 426/1000 =====
+===== Episode 719/1000 =====
+  [Step 0] Reward: 0.006 | Dist to cube: 1.961m
 
-[VLM @ Step 0] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: yes.'
-[VLM] Answer: YES → Reward: 0.30 (dist: 1.563m)
-  [VLM Step 0] Reward: 0.300 | Dist to cube: 1.563m
-
-[VLM @ Step 50] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.591m)
-
-[DIFFUSION MLP DEBUG - Step 425000]
-  Actual noise magnitude: 0.8148
-  Predicted noise magnitude: 0.2165
-  Noise prediction error (MAE): 0.7486 ← Should DECREASE
-  Loss (weighted): 0.888903 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1077000]
+  Actual noise magnitude: 0.7930
+  Predicted noise magnitude: 0.2485
+  Noise prediction error (MAE): 0.7248 ← Should DECREASE
+  Loss (weighted): 0.738373 ← Should DECREASE
+  Reward range: [0.10, 0.42]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
-[INFO] Training on 10000 positive experiences only!
+[INFO] Training on 7282 meaningful experiences (>0.1) only!
+  [Step 100] Reward: 0.004 | Dist to cube: 1.971m
 
-[VLM @ Step 100] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.609m)
-  [VLM Step 100] Reward: 0.100 | Dist to cube: 1.609m
-
-[VLM @ Step 150] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.623m)
-
-[DIFFUSION MLP DEBUG - Step 425100]
-  Actual noise magnitude: 0.7855
-  Predicted noise magnitude: 0.1802
-  Noise prediction error (MAE): 0.7624 ← Should DECREASE
-  Loss (weighted): 0.817640 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1077100]
+  Actual noise magnitude: 0.8290
+  Predicted noise magnitude: 0.2411
+  Noise prediction error (MAE): 0.7545 ← Should DECREASE
+  Loss (weighted): 0.827819 ← Should DECREASE
+  Reward range: [0.10, 0.44]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 200] Reward: 0.112 | Dist to cube: 1.968m
 
-[VLM @ Step 200] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.611m)
-  [VLM Step 200] Reward: 0.100 | Dist to cube: 1.611m
-
-[VLM @ Step 250] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.602m)
-
-[DIFFUSION MLP DEBUG - Step 425200]
-  Actual noise magnitude: 0.7903
-  Predicted noise magnitude: 0.1902
-  Noise prediction error (MAE): 0.7524 ← Should DECREASE
-  Loss (weighted): 0.881584 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1077200]
+  Actual noise magnitude: 0.7795
+  Predicted noise magnitude: 0.2096
+  Noise prediction error (MAE): 0.7525 ← Should DECREASE
+  Loss (weighted): 0.889433 ← Should DECREASE
+  Reward range: [0.10, 0.42]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 300] Reward: 0.010 | Dist to cube: 1.947m
 
-[VLM @ Step 300] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.590m)
-  [VLM Step 300] Reward: 0.100 | Dist to cube: 1.590m
-
-[VLM @ Step 350] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.599m)
-
-[DIFFUSION MLP DEBUG - Step 425300]
-  Actual noise magnitude: 0.8242
-  Predicted noise magnitude: 0.2025
-  Noise prediction error (MAE): 0.7696 ← Should DECREASE
-  Loss (weighted): 0.921321 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1077300]
+  Actual noise magnitude: 0.7963
+  Predicted noise magnitude: 0.1954
+  Noise prediction error (MAE): 0.7398 ← Should DECREASE
+  Loss (weighted): 0.720954 ← Should DECREASE
+  Reward range: [0.10, 0.44]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 400] Reward: 0.154 | Dist to cube: 1.943m
 
-[VLM @ Step 400] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.621m)
-  [VLM Step 400] Reward: 0.100 | Dist to cube: 1.621m
-
-[VLM @ Step 450] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.626m)
-
-[DIFFUSION MLP DEBUG - Step 425400]
-  Actual noise magnitude: 0.8019
-  Predicted noise magnitude: 0.2503
-  Noise prediction error (MAE): 0.7626 ← Should DECREASE
-  Loss (weighted): 0.910102 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1077400]
+  Actual noise magnitude: 0.7487
+  Predicted noise magnitude: 0.2760
+  Noise prediction error (MAE): 0.6749 ← Should DECREASE
+  Loss (weighted): 0.696473 ← Should DECREASE
+  Reward range: [0.11, 0.42]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 500] Reward: 0.011 | Dist to cube: 1.924m
 
-[VLM @ Step 500] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.627m)
-  [VLM Step 500] Reward: 0.100 | Dist to cube: 1.627m
-
-[VLM @ Step 550] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.614m)
-
-[DIFFUSION MLP DEBUG - Step 425500]
-  Actual noise magnitude: 0.7173
-  Predicted noise magnitude: 0.1873
-  Noise prediction error (MAE): 0.6716 ← Should DECREASE
-  Loss (weighted): 0.708021 ← Should DECREASE
-  Reward range: [0.05, 0.30]
+[DIFFUSION MLP DEBUG - Step 1077500]
+  Actual noise magnitude: 0.7933
+  Predicted noise magnitude: 0.2259
+  Noise prediction error (MAE): 0.7253 ← Should DECREASE
+  Loss (weighted): 0.812986 ← Should DECREASE
+  Reward range: [0.10, 0.41]
   Alpha_cumprod range: [0.9506, 0.9999]
   Exploration noise scale: 0.100
+  [Step 600] Reward: 0.099 | Dist to cube: 1.918m
 
-[VLM @ Step 600] Question: Is the robot gripper pointing toward the red cube? Answer yes or no.
-[VLM RAW RESPONSE] ← 'user:\n\n\n\nis the robot gripper pointing toward the red cube? answer yes or no.\nassistant: no.'
-[VLM] Answer: NO → Reward: 0.10 (dist: 1.628m)
-  [VLM Step 600] Reward: 0.100 | Dist to cube: 1.628m
-^C(base) kenpeter@kenpeter-ubuntu:~/work/robot$ 
+[DIFFUSION MLP DEBUG - Step 1077600]
+  Actual noise magnitude: 0.8731
+  Predicted noise magnitude: 0.2124
+  Noise prediction error (MAE): 0.8211 ← Should DECREASE
+  Loss (weighted): 1.112660 ← Should DECREASE
+  Reward range: [0.10, 0.43]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 700] Reward: 0.085 | Dist to cube: 1.921m
 
+[DIFFUSION MLP DEBUG - Step 1077700]
+  Actual noise magnitude: 0.6698
+  Predicted noise magnitude: 0.2668
+  Noise prediction error (MAE): 0.6406 ← Should DECREASE
+  Loss (weighted): 0.684587 ← Should DECREASE
+  Reward range: [0.10, 0.46]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 800] Reward: 0.155 | Dist to cube: 1.916m
+
+[DIFFUSION MLP DEBUG - Step 1077800]
+  Actual noise magnitude: 0.8207
+  Predicted noise magnitude: 0.2145
+  Noise prediction error (MAE): 0.7873 ← Should DECREASE
+  Loss (weighted): 0.932254 ← Should DECREASE
+  Reward range: [0.10, 0.44]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 900] Reward: 0.015 | Dist to cube: 1.897m
+
+[DIFFUSION MLP DEBUG - Step 1077900]
+  Actual noise magnitude: 0.8201
+  Predicted noise magnitude: 0.2780
+  Noise prediction error (MAE): 0.7465 ← Should DECREASE
+  Loss (weighted): 0.760776 ← Should DECREASE
+  Reward range: [0.11, 0.44]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 1000] Reward: 0.018 | Dist to cube: 1.893m
+
+[DIFFUSION MLP DEBUG - Step 1078000]
+  Actual noise magnitude: 0.8815
+  Predicted noise magnitude: 0.2206
+  Noise prediction error (MAE): 0.8347 ← Should DECREASE
+  Loss (weighted): 1.096188 ← Should DECREASE
+  Reward range: [0.10, 0.46]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+[INFO] Training on 7086 meaningful experiences (>0.1) only!
+  [Step 1100] Reward: 0.081 | Dist to cube: 1.880m
+
+[DIFFUSION MLP DEBUG - Step 1078100]
+  Actual noise magnitude: 0.7816
+  Predicted noise magnitude: 0.2592
+  Noise prediction error (MAE): 0.6764 ← Should DECREASE
+  Loss (weighted): 0.769310 ← Should DECREASE
+  Reward range: [0.10, 0.48]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 1200] Reward: 0.159 | Dist to cube: 1.882m
+
+[DIFFUSION MLP DEBUG - Step 1078200]
+  Actual noise magnitude: 0.7559
+  Predicted noise magnitude: 0.2422
+  Noise prediction error (MAE): 0.7007 ← Should DECREASE
+  Loss (weighted): 0.832266 ← Should DECREASE
+  Reward range: [0.10, 0.43]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 1300] Reward: 0.188 | Dist to cube: 1.852m
+
+[DIFFUSION MLP DEBUG - Step 1078300]
+  Actual noise magnitude: 0.8367
+  Predicted noise magnitude: 0.2442
+  Noise prediction error (MAE): 0.7732 ← Should DECREASE
+  Loss (weighted): 0.924820 ← Should DECREASE
+  Reward range: [0.10, 0.46]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 1400] Reward: 0.016 | Dist to cube: 1.895m
+
+[DIFFUSION MLP DEBUG - Step 1078400]
+  Actual noise magnitude: 0.7917
+  Predicted noise magnitude: 0.2449
+  Noise prediction error (MAE): 0.7465 ← Should DECREASE
+  Loss (weighted): 0.776082 ← Should DECREASE
+  Reward range: [0.10, 0.42]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+Episode 719/1000 | Reward: 101.56 | Loss: 0.852403 | Buffer: 10000
+Model saved to rl_robot_arm_model.pth
+  → Checkpoint saved at episode 719
+
+
+===== Episode 720/1000 =====
+  [Step 0] Reward: 0.006 | Dist to cube: 1.961m
+
+[DIFFUSION MLP DEBUG - Step 1078500]
+  Actual noise magnitude: 0.7337
+  Predicted noise magnitude: 0.2301
+  Noise prediction error (MAE): 0.6886 ← Should DECREASE
+  Loss (weighted): 0.697481 ← Should DECREASE
+  Reward range: [0.10, 0.43]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 100] Reward: 0.008 | Dist to cube: 1.944m
+
+[DIFFUSION MLP DEBUG - Step 1078600]
+  Actual noise magnitude: 0.8387
+  Predicted noise magnitude: 0.2349
+  Noise prediction error (MAE): 0.7879 ← Should DECREASE
+  Loss (weighted): 1.003689 ← Should DECREASE
+  Reward range: [0.10, 0.51]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 200] Reward: 0.099 | Dist to cube: 1.960m
+
+[DIFFUSION MLP DEBUG - Step 1078700]
+  Actual noise magnitude: 0.7894
+  Predicted noise magnitude: 0.1900
+  Noise prediction error (MAE): 0.7720 ← Should DECREASE
+  Loss (weighted): 0.899176 ← Should DECREASE
+  Reward range: [0.10, 0.42]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 300] Reward: 0.082 | Dist to cube: 1.953m
+
+[DIFFUSION MLP DEBUG - Step 1078800]
+  Actual noise magnitude: 0.7564
+  Predicted noise magnitude: 0.2159
+  Noise prediction error (MAE): 0.7344 ← Should DECREASE
+  Loss (weighted): 0.812039 ← Should DECREASE
+  Reward range: [0.10, 0.44]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 400] Reward: 0.119 | Dist to cube: 1.942m
+
+[DIFFUSION MLP DEBUG - Step 1078900]
+  Actual noise magnitude: 0.8121
+  Predicted noise magnitude: 0.2328
+  Noise prediction error (MAE): 0.7385 ← Should DECREASE
+  Loss (weighted): 0.780114 ← Should DECREASE
+  Reward range: [0.10, 0.45]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 500] Reward: 0.080 | Dist to cube: 2.004m
+
+[DIFFUSION MLP DEBUG - Step 1079000]
+  Actual noise magnitude: 0.7590
+  Predicted noise magnitude: 0.2247
+  Noise prediction error (MAE): 0.7121 ← Should DECREASE
+  Loss (weighted): 0.853739 ← Should DECREASE
+  Reward range: [0.10, 0.44]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+[INFO] Training on 6619 meaningful experiences (>0.1) only!
+  [Step 600] Reward: 0.000 | Dist to cube: 2.017m
+
+[DIFFUSION MLP DEBUG - Step 1079100]
+  Actual noise magnitude: 0.8008
+  Predicted noise magnitude: 0.2111
+  Noise prediction error (MAE): 0.7504 ← Should DECREASE
+  Loss (weighted): 0.920213 ← Should DECREASE
+  Reward range: [0.10, 0.44]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 700] Reward: 0.141 | Dist to cube: 2.006m
+
+[DIFFUSION MLP DEBUG - Step 1079200]
+  Actual noise magnitude: 0.8229
+  Predicted noise magnitude: 0.2181
+  Noise prediction error (MAE): 0.7829 ← Should DECREASE
+  Loss (weighted): 0.823688 ← Should DECREASE
+  Reward range: [0.11, 0.45]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 800] Reward: 0.126 | Dist to cube: 1.986m
+
+[DIFFUSION MLP DEBUG - Step 1079300]
+  Actual noise magnitude: 0.8014
+  Predicted noise magnitude: 0.2582
+  Noise prediction error (MAE): 0.7508 ← Should DECREASE
+  Loss (weighted): 0.909972 ← Should DECREASE
+  Reward range: [0.10, 0.42]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
+  [Step 900] Reward: 0.004 | Dist to cube: 1.973m
+
+[DIFFUSION MLP DEBUG - Step 1079400]
+  Actual noise magnitude: 0.8243
+  Predicted noise magnitude: 0.1997
+  Noise prediction error (MAE): 0.7709 ← Should DECREASE
+  Loss (weighted): 0.903777 ← Should DECREASE
+  Reward range: [0.10, 0.45]
+  Alpha_cumprod range: [0.9506, 0.9999]
+  Exploration noise scale: 0.100
