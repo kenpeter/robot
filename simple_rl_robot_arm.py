@@ -193,7 +193,7 @@ class DiTAgent:
         self.step_count = 0  # Total training steps
 
     def get_action(self, state, image=None, deterministic=False):
-        """Generate action using reverse diffusion process"""
+        """Generate action using reverse diffusion process with DDIM (fast sampling)"""
         self.model.eval()
         with torch.no_grad():
             # Check for NaN in state
@@ -220,8 +220,14 @@ class DiTAgent:
                 * 0.5
             )
 
-            # Reverse diffusion process (DDPM sampling)
-            for t in reversed(range(self.num_diffusion_steps)):
+            # DDIM sampling: Use only 10 steps instead of 1000 for fast inference!
+            # Training uses all 1000 steps, but inference can skip steps
+            inference_steps = 10
+            step_size = self.num_diffusion_steps // inference_steps
+
+            # Reverse diffusion process with DDIM (skipping steps)
+            for i in reversed(range(inference_steps)):
+                t = i * step_size
                 timestep = torch.FloatTensor([[t / self.num_diffusion_steps]]).to(
                     self.device
                 )
@@ -236,25 +242,23 @@ class DiTAgent:
                     print(f"WARNING: NaN in predicted_noise at step {t}")
                     predicted_noise = torch.zeros_like(predicted_noise)
 
-                # Denoise using DDPM formula with numerical stability
-                alpha_t = self.alphas[t]
+                # DDIM update (deterministic, no added noise)
                 alpha_cumprod_t = self.alphas_cumprod[t]
-                beta_t = self.betas[t]
 
-                # Compute coefficients with clamping
-                coef1 = 1.0 / torch.sqrt(alpha_t + 1e-8)
-                coef2 = beta_t / (torch.sqrt(1.0 - alpha_cumprod_t + 1e-8))
+                # Predict x0 (clean action)
+                pred_x0 = (action - torch.sqrt(1.0 - alpha_cumprod_t + 1e-8) * predicted_noise) / torch.sqrt(alpha_cumprod_t + 1e-8)
+                pred_x0 = torch.clamp(pred_x0, -10.0, 10.0)
 
-                # Update action
-                action = coef1 * (action - coef2 * predicted_noise)
+                if i > 0:
+                    # Get next alpha
+                    t_prev = (i - 1) * step_size
+                    alpha_cumprod_prev = self.alphas_cumprod[t_prev]
 
-                # Clamp intermediate values to prevent explosion
-                action = torch.clamp(action, -10.0, 10.0)
-
-                # Add noise if not final step
-                if t > 0:
-                    noise = torch.randn_like(action) * 0.1  # Reduced noise
-                    action = action + noise
+                    # DDIM formula: x_{t-1} = sqrt(alpha_{t-1}) * pred_x0 + sqrt(1-alpha_{t-1}) * predicted_noise
+                    action = torch.sqrt(alpha_cumprod_prev + 1e-8) * pred_x0 + torch.sqrt(1.0 - alpha_cumprod_prev + 1e-8) * predicted_noise
+                else:
+                    # Final step: just use predicted clean action
+                    action = pred_x0
 
             # Add exploration noise during training
             if not deterministic:
