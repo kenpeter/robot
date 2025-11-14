@@ -281,26 +281,27 @@ class DiTAgent:
         if len(self.buffer) < self.batch_size:
             return
 
-        # FILTER: Only train on experiences with reward > 0 (positive experiences only!)
-        positive_indices = [
-            i for i in range(len(self.buffer)) if self.buffer[i][2] > 0.0
+        # FILTER: Only train on experiences with reward > 0.1 (meaningful experiences only!)
+        # Since rewards are normalized 0-1, filter for above-baseline performance
+        meaningful_indices = [
+            i for i in range(len(self.buffer)) if self.buffer[i][2] > 0.1
         ]
 
-        # If not enough positive experiences, use all experiences (fall back)
-        if len(positive_indices) < self.batch_size:
+        # If not enough meaningful experiences, use all experiences (fall back)
+        if len(meaningful_indices) < self.batch_size:
             # Print only every 100 steps to avoid spam
             if self.step_count % 100 == 0:
                 print(
-                    f"[INFO] Only {len(positive_indices)} positive experiences, using all {len(self.buffer)} experiences"
+                    f"[INFO] Only {len(meaningful_indices)} meaningful experiences (>0.1), using all {len(self.buffer)} experiences"
                 )
             indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
         else:
-            # Print only every 1000 steps when using positive-only filter
+            # Print only every 1000 steps when using meaningful-only filter
             if self.step_count % 1000 == 0:
                 print(
-                    f"[INFO] Training on {len(positive_indices)} positive experiences only!"
+                    f"[INFO] Training on {len(meaningful_indices)} meaningful experiences (>0.1) only!"
                 )
-            indices = np.random.choice(positive_indices, self.batch_size, replace=False)
+            indices = np.random.choice(meaningful_indices, self.batch_size, replace=False)
 
         batch = [self.buffer[i] for i in indices]
 
@@ -650,8 +651,24 @@ print("=" * 70)
 # Helper function to reset environment
 def reset_environment():
     """Reset robot and cube to FIXED positions"""
-    # Reset robot to initial position
-    initial_pos = np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0])
+    # Reset robot to initial position that ALREADY FACES the cube direction
+    # Original: [0.0, -π/2, 0.0, -π/2, 0.0, 0.0] - faces left (negative Y)
+    #
+    # Cube is at [0.5, 0.2, 0.026] (front-right, positive X and Y)
+    # Better initial pose: rotate base to face cube direction
+    #
+    # shoulder_pan_joint (base rotation): ~22° (0.4 rad) to point toward cube's Y direction
+    # shoulder_lift_joint: -90° (-π/2)
+    # elbow_joint: slight bend to reach forward
+    # wrist joints: point downward
+    initial_pos = np.array([
+        0.4,         # shoulder_pan: rotate ~22° toward cube's positive Y
+        -np.pi/2,    # shoulder_lift: standard -90°
+        -np.pi/4,    # elbow: bent forward to extend reach
+        -np.pi/2,    # wrist_1: downward
+        0.0,         # wrist_2: neutral
+        0.0          # wrist_3: neutral
+    ])
     gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     robot.set_joint_positions(np.concatenate([initial_pos, gripper_open]))
 
@@ -666,40 +683,94 @@ def reset_environment():
 
 
 # Helper function to compute reward (Distance-based with direction awareness)
-def compute_reward(ee_pos, ball_pos, grasped, prev_distance=None):
+def compute_reward(ee_pos, ball_pos, grasped, prev_distance=None, prev_ee_pos=None, episode_step=0):
     """
-    Compute reward based on distance to cube with directional constraint.
-    The closer the end effector to the cube, the higher the reward.
+    Compute NORMALIZED reward (0 to 1) based on distance to cube with directional constraint.
+    All components are normalized and combined into final 0-1 range.
     """
     # Calculate current distance
     distance = np.linalg.norm(ee_pos - ball_pos)
 
-    # Base reward: inverse of distance (closer = higher reward)
-    # Normalize to reasonable range (0 to 1)
+    # === COMPONENT 1: Distance reward (0 to 0.3) ===
     max_distance = 2.0  # Maximum expected distance
-    distance_reward = max(0.0, 1.0 - (distance / max_distance))
+    distance_reward = max(0.0, 1.0 - (distance / max_distance)) * 0.3
 
-    # Bonus for getting very close
+    # === COMPONENT 2: Proximity bonus (0 to 0.2) ===
     if distance < 0.1:
-        proximity_bonus = 0.5
-    elif distance < 0.2:
         proximity_bonus = 0.2
+    elif distance < 0.2:
+        proximity_bonus = 0.1
+    elif distance < 0.3:
+        proximity_bonus = 0.05
     else:
         proximity_bonus = 0.0
 
-    # Bonus for successful grasp
-    grasp_bonus = 1.0 if grasped else 0.0
+    # === COMPONENT 3: Grasp bonus (0 to 0.3) ===
+    grasp_bonus = 0.3 if grasped else 0.0
 
-    # Progress reward: if getting closer than before
-    progress_bonus = 0.0
+    # === COMPONENT 4: Directional alignment (0 to 0.2) ===
+    direction_reward = 0.0
+
+    if prev_distance is not None and prev_ee_pos is not None:
+        # Check actual movement direction
+        movement_vector = ee_pos - prev_ee_pos
+        direction_to_cube = ball_pos - prev_ee_pos
+
+        # Normalize vectors
+        movement_norm = np.linalg.norm(movement_vector)
+        direction_norm = np.linalg.norm(direction_to_cube)
+
+        if movement_norm > 0.001 and direction_norm > 0.001:
+            movement_unit = movement_vector / movement_norm
+            direction_unit = direction_to_cube / direction_norm
+
+            # Dot product: positive = toward cube, negative = away from cube
+            # Range: -1 to +1
+            dot_product = np.dot(movement_unit, direction_unit)
+
+            # Normalize dot product to 0-1 range: (dot + 1) / 2
+            # Then scale to 0-0.2 range
+            direction_reward = ((dot_product + 1.0) / 2.0) * 0.2
+
+            # Early episode bonus: Scale up directional reward
+            if episode_step < 100:
+                direction_reward *= 1.5  # 1.5x bonus
+            elif episode_step < 200:
+                direction_reward *= 1.2  # 1.2x bonus
+
+    # === COMPONENT 5: Progress reward (0 to 0.2) ===
+    progress_reward = 0.0
     if prev_distance is not None:
         improvement = prev_distance - distance
+        # Normalize improvement: typical improvement is ~0.01 to 0.05 per step
+        # Map to 0-0.2 range
         if improvement > 0:
-            progress_bonus = improvement * 2.0  # Scale up progress
+            # Positive progress
+            progress_reward = min(0.2, improvement * 4.0)  # Scale by 4x, cap at 0.2
 
-    total_reward = distance_reward + proximity_bonus + grasp_bonus + progress_bonus
+            # Early episode bonus
+            if episode_step < 100:
+                progress_reward *= 1.5
+            elif episode_step < 200:
+                progress_reward *= 1.2
+        else:
+            # Negative progress - keep at 0 (no reward, but no penalty)
+            progress_reward = 0.0
 
-    return max(0.0, total_reward), distance
+    # === TOTAL REWARD: Sum all components (max = 0.3 + 0.2 + 0.3 + 0.2 + 0.2 = 1.2) ===
+    # But with early bonuses can go higher, so normalize to 0-1
+    total_reward = (
+        distance_reward +
+        proximity_bonus +
+        grasp_bonus +
+        direction_reward +
+        progress_reward
+    )
+
+    # Normalize to strict 0-1 range
+    normalized_reward = min(1.0, max(0.0, total_reward))
+
+    return normalized_reward, distance
 
 
 try:
@@ -712,6 +783,7 @@ try:
         episode_reward = 0.0
         episode_loss = []
         prev_distance = None  # Track previous distance for progress reward
+        prev_ee_pos = None  # Track previous ee position for direction detection
 
         # Run episode
         for step in range(MAX_STEPS_PER_EPISODE):
@@ -748,7 +820,7 @@ try:
             # Get action from policy (NO image)
             action = agent.get_action(state, image=None, deterministic=False)
 
-            # DIRECTIONAL CONSTRAINT: Ensure end effector moves toward cube, not opposite direction
+            # STRICT DIRECTIONAL CONSTRAINT: FORCE movement toward cube only
             # Calculate direction vector from end effector to cube
             direction_to_cube = ball_pos - ee_pos
             direction_to_cube_norm = np.linalg.norm(direction_to_cube)
@@ -756,21 +828,21 @@ try:
             if direction_to_cube_norm > 0.01:  # Avoid division by zero
                 direction_to_cube_unit = direction_to_cube / direction_to_cube_norm
 
-                # Project action onto direction towards cube
-                delta_pos = action[:3] * 0.15  # 15cm max movement per step
+                # Get the raw action
+                delta_pos_raw = action[:3] * 0.15  # 15cm max movement per step
 
                 # Calculate dot product to check if moving in right direction
-                dot_product = np.dot(delta_pos, direction_to_cube_unit)
+                dot_product = np.dot(delta_pos_raw, direction_to_cube_unit)
 
-                # If moving away from cube (negative dot product), penalize or redirect
-                if dot_product < 0:
-                    # Redirect action towards cube with reduced magnitude
-                    delta_pos = direction_to_cube_unit * 0.05  # Small step towards cube
+                # STRICT ENFORCEMENT: Only allow movement with positive component toward cube
+                if dot_product <= 0:
+                    # Completely BLOCK opposite movement - redirect fully toward cube
+                    delta_pos = direction_to_cube_unit * 0.1  # Force movement toward cube
                 else:
-                    # Scale action to favor movement towards cube
-                    # Keep original action but encourage alignment with cube direction
-                    alignment_factor = max(0.3, dot_product / np.linalg.norm(delta_pos + 1e-8))
-                    delta_pos = delta_pos * alignment_factor + direction_to_cube_unit * 0.02
+                    # Project action onto the direction toward cube (remove perpendicular components)
+                    # This ensures ALL movement is biased toward the cube
+                    projection_magnitude = dot_product
+                    delta_pos = direction_to_cube_unit * min(projection_magnitude, 0.15)
             else:
                 # Very close to cube, use original action
                 delta_pos = action[:3] * 0.15
@@ -832,11 +904,15 @@ try:
                 ]
             )  # Total: 22D
 
-            # Compute distance-based reward with directional awareness
+            # Compute distance-based reward with directional awareness and penalties
             reward, current_distance = compute_reward(
-                ee_pos, ball_pos, grasped, prev_distance=prev_distance
+                ee_pos, ball_pos, grasped,
+                prev_distance=prev_distance,
+                prev_ee_pos=prev_ee_pos,
+                episode_step=step
             )
             prev_distance = current_distance  # Update for next iteration
+            prev_ee_pos = ee_pos.copy()  # Update previous position
 
             # Log progress every 100 steps
             if step % 100 == 0:
@@ -897,20 +973,20 @@ try:
 
                 action = agent.get_action(state, image=None, deterministic=True)
 
-                # DIRECTIONAL CONSTRAINT: Ensure end effector moves toward cube
+                # STRICT DIRECTIONAL CONSTRAINT: FORCE movement toward cube only
                 direction_to_cube = ball_pos - ee_pos
                 direction_to_cube_norm = np.linalg.norm(direction_to_cube)
 
                 if direction_to_cube_norm > 0.01:
                     direction_to_cube_unit = direction_to_cube / direction_to_cube_norm
-                    delta_pos = action[:3] * 0.15
-                    dot_product = np.dot(delta_pos, direction_to_cube_unit)
+                    delta_pos_raw = action[:3] * 0.15
+                    dot_product = np.dot(delta_pos_raw, direction_to_cube_unit)
 
-                    if dot_product < 0:
-                        delta_pos = direction_to_cube_unit * 0.05
+                    if dot_product <= 0:
+                        delta_pos = direction_to_cube_unit * 0.1
                     else:
-                        alignment_factor = max(0.3, dot_product / np.linalg.norm(delta_pos + 1e-8))
-                        delta_pos = delta_pos * alignment_factor + direction_to_cube_unit * 0.02
+                        projection_magnitude = dot_product
+                        delta_pos = direction_to_cube_unit * min(projection_magnitude, 0.15)
                 else:
                     delta_pos = action[:3] * 0.15
 
