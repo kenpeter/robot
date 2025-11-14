@@ -301,7 +301,9 @@ class DiTAgent:
                 print(
                     f"[INFO] Training on {len(meaningful_indices)} meaningful experiences (>0.1) only!"
                 )
-            indices = np.random.choice(meaningful_indices, self.batch_size, replace=False)
+            indices = np.random.choice(
+                meaningful_indices, self.batch_size, replace=False
+            )
 
         batch = [self.buffer[i] for i in indices]
 
@@ -521,16 +523,20 @@ print("✓ Cameras initialized: Overhead (84x84) for RL, Side (1280x720) for vid
 # Add red cube with FIXED position for testing diffusion transformer
 from isaacsim.core.api.objects import DynamicCuboid
 
-# FIXED cube position
+# FIXED cube position - BEHIND robot (negative X)
 cube_size = 0.0515  # 5.15cm cube
-FIXED_CUBE_X = 0.5  # FIXED
-FIXED_CUBE_Y = 0.2  # FIXED
-FIXED_CUBE_Z = cube_size / 2.0  # On ground plane
+# Robot is at origin (0, 0, 0)
+# UR10e reach is ~1.3m, so place cube well within reach
+# Place cube BEHIND robot (negative X direction, Y=0 center)
+FIXED_CUBE_X = -1.0  # 1.0m behind robot - near max reach
+FIXED_CUBE_Y = 0.0  # CENTER
+FIXED_CUBE_Z = (
+    cube_size / 2.0 + 0.1
+)  # Slightly elevated (10cm above ground) for easier grasp
 
-print(f"\n=== RED CUBE SETUP - FIXED POSITION ===")
-print(
-    f"Cube FIXED position: [{FIXED_CUBE_X:.3f}, {FIXED_CUBE_Y:.3f}, {FIXED_CUBE_Z:.3f}]"
-)
+print(f"\n=== RED CUBE SETUP - BEHIND ROBOT ===")
+print(f"Cube position: [{FIXED_CUBE_X:.3f}, {FIXED_CUBE_Y:.3f}, {FIXED_CUBE_Z:.3f}]")
+print(f"(1.0m BEHIND robot, centered, 10cm high - challenging reach!)")
 
 cube = DynamicCuboid(
     name="red_cube",
@@ -623,7 +629,7 @@ print(f"Model will be saved to: {MODEL_PATH}\n")
 
 # Training parameters
 MAX_EPISODES = 1000
-MAX_STEPS_PER_EPISODE = 1000
+MAX_STEPS_PER_EPISODE = 1500
 SAVE_INTERVAL = 1  # Save model every 10 episodes
 VIDEO_INTERVAL = 20  # Record video every 20 episodes
 VIDEO_PATH = "/home/kenpeter/work/robot/training_video.avi"  # Single file, overwrite
@@ -635,10 +641,10 @@ print(f"[DEBUG] World is playing: {my_world.is_playing()}")
 print("✓ Simulation timeline started\n")
 
 
-# FIXED target position for robot end-effector
-FIXED_TARGET_X = 0.5
-FIXED_TARGET_Y = 0.2
-FIXED_TARGET_Z = 0.3  # Above the cube
+# FIXED target position for robot end-effector (just above the cube)
+FIXED_TARGET_X = -1.0  # Match cube X (behind robot)
+FIXED_TARGET_Y = 0.0  # Match cube Y (centered)
+FIXED_TARGET_Z = 0.2  # 10cm above the cube for pre-grasp position
 
 # === DISTANCE-BASED REWARD ===
 print("=" * 70)
@@ -651,24 +657,23 @@ print("=" * 70)
 # Helper function to reset environment
 def reset_environment():
     """Reset robot and cube to FIXED positions"""
-    # Reset robot to initial position that ALREADY FACES the cube direction
-    # Original: [0.0, -π/2, 0.0, -π/2, 0.0, 0.0] - faces left (negative Y)
+    # Reset robot to initial position facing BACKWARD (toward cube)
+    # Cube is NOW at [-1.0, 0.0, 0.126] - 1m BEHIND robot, near max reach
     #
-    # Cube is at [0.5, 0.2, 0.026] (front-right, positive X and Y)
-    # Better initial pose: rotate base to face cube direction
-    #
-    # shoulder_pan_joint (base rotation): ~22° (0.4 rad) to point toward cube's Y direction
-    # shoulder_lift_joint: -90° (-π/2)
-    # elbow_joint: slight bend to reach forward
-    # wrist joints: point downward
-    initial_pos = np.array([
-        0.4,         # shoulder_pan: rotate ~22° toward cube's positive Y
-        -np.pi/2,    # shoulder_lift: standard -90°
-        -np.pi/4,    # elbow: bent forward to extend reach
-        -np.pi/2,    # wrist_1: downward
-        0.0,         # wrist_2: neutral
-        0.0          # wrist_3: neutral
-    ])
+    # shoulder_pan_joint: π (180°) to face backward (negative X axis)
+    # shoulder_lift_joint: -90° (horizontal reach)
+    # elbow_joint: slight bend to reach backward comfortably
+    # wrist joints: point downward for grasping
+    initial_pos = np.array(
+        [
+            np.pi,  # shoulder_pan: 180° = face directly backward (negative X)
+            -np.pi / 2,  # shoulder_lift: -90° = horizontal arm position
+            -np.pi / 4,  # elbow: -45° = bent for comfortable reach
+            -np.pi / 2,  # wrist_1: -90° = gripper points downward
+            0.0,  # wrist_2: neutral
+            0.0,  # wrist_3: neutral
+        ]
+    )
     gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     robot.set_joint_positions(np.concatenate([initial_pos, gripper_open]))
 
@@ -683,7 +688,9 @@ def reset_environment():
 
 
 # Helper function to compute reward (Distance-based with direction awareness)
-def compute_reward(ee_pos, ball_pos, grasped, prev_distance=None, prev_ee_pos=None, episode_step=0):
+def compute_reward(
+    ee_pos, ball_pos, grasped, prev_distance=None, prev_ee_pos=None, episode_step=0
+):
     """
     Compute NORMALIZED reward (0 to 1) based on distance to cube with directional constraint.
     All components are normalized and combined into final 0-1 range.
@@ -705,8 +712,8 @@ def compute_reward(ee_pos, ball_pos, grasped, prev_distance=None, prev_ee_pos=No
     else:
         proximity_bonus = 0.0
 
-    # === COMPONENT 3: Grasp bonus (0 to 0.3) ===
-    grasp_bonus = 0.3 if grasped else 0.0
+    # === COMPONENT 3: Grasp bonus (0 to 0.5) - INCREASED reward for successful grasp!
+    grasp_bonus = 0.5 if grasped else 0.0
 
     # === COMPONENT 4: Directional alignment (0 to 0.2) ===
     direction_reward = 0.0
@@ -760,11 +767,11 @@ def compute_reward(ee_pos, ball_pos, grasped, prev_distance=None, prev_ee_pos=No
     # === TOTAL REWARD: Sum all components (max = 0.3 + 0.2 + 0.3 + 0.2 + 0.2 = 1.2) ===
     # But with early bonuses can go higher, so normalize to 0-1
     total_reward = (
-        distance_reward +
-        proximity_bonus +
-        grasp_bonus +
-        direction_reward +
-        progress_reward
+        distance_reward
+        + proximity_bonus
+        + grasp_bonus
+        + direction_reward
+        + progress_reward
     )
 
     # Normalize to strict 0-1 range
@@ -828,24 +835,22 @@ try:
             if direction_to_cube_norm > 0.01:  # Avoid division by zero
                 direction_to_cube_unit = direction_to_cube / direction_to_cube_norm
 
-                # Get the raw action
-                delta_pos_raw = action[:3] * 0.15  # 15cm max movement per step
+                # Get the raw action with INCREASED scaling for faster movement
+                delta_pos_raw = action[:3] * 0.3  # 30cm max movement per step (2x faster!)
 
                 # Calculate dot product to check if moving in right direction
                 dot_product = np.dot(delta_pos_raw, direction_to_cube_unit)
 
-                # STRICT ENFORCEMENT: Only allow movement with positive component toward cube
-                if dot_product <= 0:
-                    # Completely BLOCK opposite movement - redirect fully toward cube
-                    delta_pos = direction_to_cube_unit * 0.1  # Force movement toward cube
+                # RELAXED ENFORCEMENT: Allow some perpendicular movement for natural paths
+                if dot_product < -0.1:  # Only block strong backward movement
+                    # Redirect toward cube but keep some magnitude
+                    delta_pos = direction_to_cube_unit * 0.2
                 else:
-                    # Project action onto the direction toward cube (remove perpendicular components)
-                    # This ensures ALL movement is biased toward the cube
-                    projection_magnitude = dot_product
-                    delta_pos = direction_to_cube_unit * min(projection_magnitude, 0.15)
+                    # Allow natural movement: keep 70% of original action + 30% bias toward cube
+                    delta_pos = 0.7 * delta_pos_raw + 0.3 * (direction_to_cube_unit * 0.2)
             else:
                 # Very close to cube, use original action
-                delta_pos = action[:3] * 0.15
+                delta_pos = action[:3] * 0.3
 
             target_position = ee_pos + delta_pos
             target_position = np.clip(
@@ -857,7 +862,7 @@ try:
             actions = motion_policy.get_next_articulation_action(1.0 / 60.0)
             robot.apply_action(actions)
 
-            # Gripper control
+            # Gripper control - IMPROVED for better grasping
             gripper_action = np.clip(action[3], -1.0, 1.0)
             current_joints_raw = robot.get_joint_positions()
             if isinstance(current_joints_raw, tuple):
@@ -866,9 +871,17 @@ try:
                 current_joints = current_joints_raw.copy()
             if len(current_joints) > 6:
                 current_gripper = current_joints[6]
-                target_gripper = np.clip(
-                    current_gripper + gripper_action * 0.01, 0.0, 0.04
-                )
+
+                # SMART GRIPPER: Auto-close when near cube
+                if ball_dist < 0.1:  # Very close to cube - try to grasp!
+                    # Force close gripper aggressively
+                    target_gripper = np.clip(current_gripper + 0.05, 0.0, 0.04)
+                else:
+                    # Normal gripper control with faster movement
+                    target_gripper = np.clip(
+                        current_gripper + gripper_action * 0.02, 0.0, 0.04
+                    )
+
                 current_joints[6] = target_gripper
                 robot.set_joint_positions(current_joints)
 
@@ -906,10 +919,12 @@ try:
 
             # Compute distance-based reward with directional awareness and penalties
             reward, current_distance = compute_reward(
-                ee_pos, ball_pos, grasped,
+                ee_pos,
+                ball_pos,
+                grasped,
                 prev_distance=prev_distance,
                 prev_ee_pos=prev_ee_pos,
-                episode_step=step
+                episode_step=step,
             )
             prev_distance = current_distance  # Update for next iteration
             prev_ee_pos = ee_pos.copy()  # Update previous position
@@ -979,16 +994,15 @@ try:
 
                 if direction_to_cube_norm > 0.01:
                     direction_to_cube_unit = direction_to_cube / direction_to_cube_norm
-                    delta_pos_raw = action[:3] * 0.15
+                    delta_pos_raw = action[:3] * 0.3  # Faster movement
                     dot_product = np.dot(delta_pos_raw, direction_to_cube_unit)
 
-                    if dot_product <= 0:
-                        delta_pos = direction_to_cube_unit * 0.1
+                    if dot_product < -0.1:  # Relaxed constraint
+                        delta_pos = direction_to_cube_unit * 0.2
                     else:
-                        projection_magnitude = dot_product
-                        delta_pos = direction_to_cube_unit * min(projection_magnitude, 0.15)
+                        delta_pos = 0.7 * delta_pos_raw + 0.3 * (direction_to_cube_unit * 0.2)
                 else:
-                    delta_pos = action[:3] * 0.15
+                    delta_pos = action[:3] * 0.3
 
                 target_position = ee_pos + delta_pos
                 target_position = np.clip(
@@ -1000,6 +1014,7 @@ try:
                 actions = motion_policy.get_next_articulation_action(1.0 / 60.0)
                 robot.apply_action(actions)
 
+                # Gripper control - IMPROVED for better grasping
                 gripper_action = np.clip(action[3], -1.0, 1.0)
                 current_joints_raw = robot.get_joint_positions()
                 if isinstance(current_joints_raw, tuple):
@@ -1008,9 +1023,15 @@ try:
                     current_joints = current_joints_raw.copy()
                 if len(current_joints) > 6:
                     current_gripper = current_joints[6]
-                    target_gripper = np.clip(
-                        current_gripper + gripper_action * 0.01, 0.0, 0.04
-                    )
+
+                    # SMART GRIPPER: Auto-close when near cube
+                    if ball_dist < 0.1:
+                        target_gripper = np.clip(current_gripper + 0.05, 0.0, 0.04)
+                    else:
+                        target_gripper = np.clip(
+                            current_gripper + gripper_action * 0.02, 0.0, 0.04
+                        )
+
                     current_joints[6] = target_gripper
                     robot.set_joint_positions(current_joints)
 
