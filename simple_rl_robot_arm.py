@@ -291,9 +291,9 @@ side_camera.initialize()
 from isaacsim.core.api.objects import DynamicCuboid
 
 cube_size = 0.0515
-FIXED_CUBE_X = 0.6
-FIXED_CUBE_Y = 0.0
-FIXED_CUBE_Z = cube_size / 2.0 + 0.3
+FIXED_CUBE_X = 0.3
+FIXED_CUBE_Y = 0.3
+FIXED_CUBE_Z = cube_size / 2.0 + 0.0
 
 cube = DynamicCuboid(
     name="red_cube",
@@ -371,14 +371,14 @@ print(f"World is playing: {my_world.is_playing()}")
 # === CORRECTED RESET ===
 def reset_environment():
     """CORRECTED: Proper joint initialization with 12 joints total"""
-    # 6 arm joints
+    # 6 arm joints - FIXED: Better initial pose
     initial_pos = np.array(
         [
-            0.0,  # shoulder_pan: face forward
-            -np.pi / 3,  # shoulder_lift: arm raised
-            np.pi / 2,  # elbow: bent upward
-            -np.pi / 6,  # wrist_1: slight downward
-            0.0,  # wrist_2: neutral
+            np.pi / 4,  # shoulder_pan: angled toward cube
+            -np.pi / 2,  # shoulder_lift: arm horizontal
+            np.pi / 3,  # elbow: bent
+            -np.pi / 2,  # wrist_1: point down
+            -np.pi / 2,  # wrist_2: rotate gripper down
             0.0,  # wrist_3: neutral
         ]
     )
@@ -439,32 +439,34 @@ def compute_reward(ee_pos, ball_pos, grasped, gripper_pos, left_finger, right_fi
 def get_guided_action(ee_pos, ball_pos, action, step_count):
     """Direct waypoint guidance with corrected approach"""
     # Define waypoints with better approach path
-    if step_count < 300:
-        # Phase 1: Move to approach position (more direct)
-        target_position = np.array([0.5, 0.0, 0.4])  # Centered approach
+    if step_count < 200:
+        # Phase 1: Move above the cube
+        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.2])
         phase = "APPROACH"
-    elif step_count < 700:
-        # Phase 2: Move to pre-grasp position
-        target_position = np.array(
-            [ball_pos[0], ball_pos[1] - 0.05, ball_pos[2] + 0.08]
-        )
+    elif step_count < 500:
+        # Phase 2: Move to pre-grasp position (directly above)
+        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.08])
         phase = "PRE_GRASP"
+    elif step_count < 700:
+        # Phase 3: Descend to grasp
+        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.03])
+        phase = "DESCEND"
     else:
-        # Phase 3: Fine control near cube
-        target_position = ee_pos + action[:3] * 0.1
+        # Phase 4: Fine control
+        target_position = ee_pos + action[:3] * 0.05
         phase = "FINE_CONTROL"
 
-    # Add some policy influence
+    # Smooth movement
     if phase != "FINE_CONTROL":
         direction = target_position - ee_pos
         distance = np.linalg.norm(direction)
         if distance > 0.01:
-            move_speed = min(0.2, distance * 0.3)
+            move_speed = min(0.15, distance * 0.5)
             direction_normalized = direction / distance
             target_position = ee_pos + direction_normalized * move_speed
 
     # Safety limits
-    target_position = np.clip(target_position, [-0.2, -0.8, 0.05], [1.0, 0.8, 0.8])
+    target_position = np.clip(target_position, [-0.2, -0.5, 0.02], [0.8, 0.8, 0.8])
 
     return target_position, phase
 
@@ -472,12 +474,14 @@ def get_guided_action(ee_pos, ball_pos, action, step_count):
 # === CORRECTED GRIPPER CONTROL ===
 def get_gripper_action(current_gripper, min_finger_dist, phase):
     """CORRECTED: Proper gripper scaling with 40.0 range"""
-    if phase == "FINE_CONTROL" and min_finger_dist < 0.05:
-        return min(current_gripper + 2.0, 40.0)  # Close faster when very close
+    if phase == "DESCEND" and min_finger_dist < 0.08:
+        return min(current_gripper + 1.5, 40.0)  # Start closing during descend
+    elif phase == "FINE_CONTROL" and min_finger_dist < 0.05:
+        return min(current_gripper + 2.5, 40.0)  # Close faster when very close
     elif phase == "FINE_CONTROL" and min_finger_dist < 0.1:
-        return min(current_gripper + 1.0, 40.0)  # Start closing
+        return min(current_gripper + 1.5, 40.0)  # Start closing
     else:
-        return max(current_gripper - 0.5, 0.0)  # Keep open during approach
+        return max(current_gripper - 1.0, 0.0)  # Keep open during approach
 
 
 # === MAIN TRAINING LOOP ===
@@ -553,9 +557,13 @@ try:
                 ee_pos, ball_pos, action, step
             )
 
-            # Apply movement
+            # FIXED: Add downward-facing gripper orientation
+            # Quaternion for gripper pointing down (Z-axis down)
+            target_orientation = np.array([0.7071, 0.0, 0.7071, 0.0])  # 90° pitch
+
+            # Apply movement with orientation
             rmp_flow.set_end_effector_target(
-                target_position=target_position, target_orientation=None
+                target_position=target_position, target_orientation=target_orientation
             )
             actions = motion_policy.get_next_articulation_action(1.0 / 60.0)
             robot.apply_action(actions)
