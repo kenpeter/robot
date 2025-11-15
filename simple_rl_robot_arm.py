@@ -13,9 +13,9 @@ from isaacsim import SimulationApp
 # Initialize simulation
 simulation_app = SimulationApp(
     {
-        "headless": False,
-        "width": 1280,
-        "height": 720,
+        "headless": True,
+        "width": 500,
+        "height": 200,
         # ray trace vs path trace: ray trace -> good performance -> path trace -> more real
         "renderer": "RayTracedLighting",
     }
@@ -153,7 +153,7 @@ class DiTAgent:
         self.device = device
 
         # Diffusion hyperparameters (fixed for proper denoising)
-        self.num_diffusion_steps = 50  # Increased from 5 → 50 for proper denoising
+        self.num_diffusion_steps = 1000  # Increased from 5 → 50 for proper denoising
         self.beta_start = 0.0001
         self.beta_end = 0.02
 
@@ -175,7 +175,7 @@ class DiTAgent:
             state_dim=state_dim,
             action_dim=action_dim,
             hidden_dim=512,  # Increased from 256 → 512 for better capacity
-            num_layers=6,    # Increased from 4 → 6 for deeper network
+            num_layers=6,  # Increased from 4 → 6 for deeper network
             use_vision=False,  # No vision
         ).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
@@ -806,7 +806,9 @@ try:
                 direction_to_cube_unit = direction_to_cube / direction_to_cube_norm
 
                 # Get the raw action with INCREASED scaling for faster movement
-                delta_pos_raw = action[:3] * 0.3  # 30cm max movement per step (2x faster!)
+                delta_pos_raw = (
+                    action[:3] * 0.3
+                )  # 30cm max movement per step (2x faster!)
 
                 # Calculate dot product to check if moving in right direction
                 dot_product = np.dot(delta_pos_raw, direction_to_cube_unit)
@@ -817,7 +819,9 @@ try:
                     delta_pos = direction_to_cube_unit * 0.2
                 else:
                     # Allow natural movement: keep 70% of original action + 30% bias toward cube
-                    delta_pos = 0.7 * delta_pos_raw + 0.3 * (direction_to_cube_unit * 0.2)
+                    delta_pos = 0.7 * delta_pos_raw + 0.3 * (
+                        direction_to_cube_unit * 0.2
+                    )
             else:
                 # Very close to cube, use original action
                 delta_pos = action[:3] * 0.3
@@ -970,7 +974,9 @@ try:
                     if dot_product < -0.1:  # Relaxed constraint
                         delta_pos = direction_to_cube_unit * 0.2
                     else:
-                        delta_pos = 0.7 * delta_pos_raw + 0.3 * (direction_to_cube_unit * 0.2)
+                        delta_pos = 0.7 * delta_pos_raw + 0.3 * (
+                            direction_to_cube_unit * 0.2
+                        )
                 else:
                     delta_pos = action[:3] * 0.3
 
