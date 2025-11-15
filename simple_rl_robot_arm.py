@@ -613,30 +613,38 @@ def compute_reward(
     # === STAGE 3: GRASP PREPARATION (0.08m < distance <= 0.15m) ===
     elif distance > 0.08:
         # Maximum exponential for final approach
-        distance_reward = np.exp(-8.0 * distance) * 0.30  # Max ~0.30
+        distance_reward = np.exp(-8.0 * distance) * 0.25  # Max ~0.25
 
         # Maximum progress bonus
         progress_bonus = 0.0
         if prev_distance is not None and prev_distance > distance:
             improvement = prev_distance - distance
-            progress_bonus = min(0.30, improvement * 50.0)  # Max 0.30
+            progress_bonus = min(0.25, improvement * 50.0)  # Max 0.25
 
-        # MODERATE gripper reward (start closing for grasp preparation!)
-        gripper_reward = 0.05 * gripper_normalized  # Max 0.05 for closing gripper
+        # STRONG gripper closing guidance (proportional to how close we are)
+        # At 0.15m: expect ~20% closed, at 0.08m: expect ~50% closed
+        desired_gripper = 0.2 + (0.15 - distance) / (0.15 - 0.08) * 0.3  # 0.2 to 0.5
+        gripper_error = abs(gripper_normalized - desired_gripper)
+        gripper_reward = 0.15 * (1.0 - gripper_error)  # Max 0.15 for perfect timing
 
         reward = distance_reward + progress_bonus + gripper_reward  # Max ~0.65
 
     # === STAGE 4: GRASPING RANGE (distance <= 0.08m) ===
     else:
-        # Very high base reward for being in perfect grasp range
-        proximity_reward = 0.35
+        # Base reward for being in perfect grasp range (scaled by proximity)
+        # Closer = higher reward (0.08m -> 0.20, 0.00m -> 0.35)
+        proximity_reward = 0.20 + (0.08 - distance) / 0.08 * 0.15  # 0.20 to 0.35
 
-        # STRONG gripper closing reward (encourage closing!)
-        gripper_reward = 0.15 * gripper_normalized  # Max 0.15 for fully closing
+        # VERY STRONG gripper closing guidance
+        # At this range, gripper should be closing aggressively!
+        # Desired: 0.5 (50% closed) at 0.08m -> 1.0 (100% closed) at contact
+        desired_gripper = 0.5 + (0.08 - distance) / 0.08 * 0.5  # 0.5 to 1.0
+        gripper_error = abs(gripper_normalized - desired_gripper)
+        gripper_reward = 0.25 * (1.0 - gripper_error)  # Max 0.25 for perfect closing
 
-        # HUGE bonus for successful grasp
+        # HUGE bonus for successful grasp (actual contact + gripper closed)
         if grasped:
-            grasp_bonus = 0.50  # Massive success signal!
+            grasp_bonus = 0.40  # Massive success signal!
         else:
             grasp_bonus = 0.0
 
