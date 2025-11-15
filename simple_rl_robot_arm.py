@@ -291,8 +291,8 @@ side_camera.initialize()
 from isaacsim.core.api.objects import DynamicCuboid
 
 cube_size = 0.0515
-FIXED_CUBE_X = 0.3
-FIXED_CUBE_Y = 0.3
+FIXED_CUBE_X = 0.5
+FIXED_CUBE_Y = 0.0
 FIXED_CUBE_Z = cube_size / 2.0 + 0.0
 
 cube = DynamicCuboid(
@@ -371,14 +371,14 @@ print(f"World is playing: {my_world.is_playing()}")
 # === CORRECTED RESET ===
 def reset_environment():
     """CORRECTED: Proper joint initialization with 12 joints total"""
-    # 6 arm joints - FIXED: Better initial pose
+    # 6 arm joints - STABLE starting configuration with downward gripper
     initial_pos = np.array(
         [
-            np.pi / 4,  # shoulder_pan: angled toward cube
-            -np.pi / 2,  # shoulder_lift: arm horizontal
-            np.pi / 3,  # elbow: bent
+            0.0,  # shoulder_pan: face forward
+            -np.pi / 3,  # shoulder_lift: stable raised position
+            np.pi / 2.5,  # elbow: moderate bend
             -np.pi / 2,  # wrist_1: point down
-            -np.pi / 2,  # wrist_2: rotate gripper down
+            -np.pi / 2,  # wrist_2: downward pitch alignment
             0.0,  # wrist_3: neutral
         ]
     )
@@ -437,19 +437,23 @@ def compute_reward(ee_pos, ball_pos, grasped, gripper_pos, left_finger, right_fi
 
 # === CORRECTED ACTION GUIDANCE ===
 def get_guided_action(ee_pos, ball_pos, action, step_count):
-    """Direct waypoint guidance with corrected approach"""
-    # Define waypoints with better approach path
+    """Direct waypoint guidance with corrected approach - FIXED Z-heights"""
+    # CRITICAL FIX: Account for gripper geometry (gripper base is ~15cm from fingers)
+    # When EE is at cube height, fingers are actually 15cm lower!
+    # All target Z positions already include this 15cm offset
+
+    # Define waypoints with CORRECTED heights
     if step_count < 200:
         # Phase 1: Move above the cube
-        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.2])
+        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.35])
         phase = "APPROACH"
     elif step_count < 500:
-        # Phase 2: Move to pre-grasp position (directly above)
-        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.08])
+        # Phase 2: Move to pre-grasp position (fingers 8cm above cube)
+        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.23])
         phase = "PRE_GRASP"
     elif step_count < 700:
-        # Phase 3: Descend to grasp
-        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.03])
+        # Phase 3: Descend to grasp (fingers 3cm above cube)
+        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.18])
         phase = "DESCEND"
     else:
         # Phase 4: Fine control
@@ -465,8 +469,8 @@ def get_guided_action(ee_pos, ball_pos, action, step_count):
             direction_normalized = direction / distance
             target_position = ee_pos + direction_normalized * move_speed
 
-    # Safety limits
-    target_position = np.clip(target_position, [-0.2, -0.5, 0.02], [0.8, 0.8, 0.8])
+    # Safety limits - allow lower Z for descent
+    target_position = np.clip(target_position, [-0.2, -0.5, 0.1], [0.8, 0.8, 0.8])
 
     return target_position, phase
 
@@ -557,11 +561,16 @@ try:
                 ee_pos, ball_pos, action, step
             )
 
-            # FIXED: Add downward-facing gripper orientation
-            # Quaternion for gripper pointing down (Z-axis down)
-            target_orientation = np.array([0.7071, 0.0, 0.7071, 0.0])  # 90° pitch
+            # FIXED: Use correct downward orientation
+            # Quaternion for gripper pointing DOWN toward cube
+            if current_phase in ["APPROACH", "PRE_GRASP", "DESCEND"]:
+                # Downward orientation: rotate 180° around X-axis [w, x, y, z]
+                target_orientation = np.array([0.0, 1.0, 0.0, 0.0])
+            else:
+                # Allow flexibility in fine control
+                target_orientation = None
 
-            # Apply movement with orientation
+            # Apply movement
             rmp_flow.set_end_effector_target(
                 target_position=target_position, target_orientation=target_orientation
             )
