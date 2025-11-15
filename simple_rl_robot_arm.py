@@ -42,7 +42,8 @@ from isaacsim.robot_motion.motion_generation import (
 )
 
 print("=" * 60)
-print("CORRECTED GRASPING TRAINING - FIXED VERSION")
+print("PURE RL GRASPING TRAINING")
+print("No guidance - Learning from scratch via policy gradient")
 print("Fixed: 12 joints, State dimensions, Gripper scaling")
 print("=" * 60)
 
@@ -364,7 +365,7 @@ print(f"✓ CORRECTED: State dim={state_dim} (12 joints), Gripper scaling fixed"
 
 # Training parameters
 MAX_EPISODES = 1000
-MAX_STEPS_PER_EPISODE = 1000
+MAX_STEPS_PER_EPISODE = 1500
 SAVE_INTERVAL = 10
 VIDEO_INTERVAL = 20
 VIDEO_PATH = "/home/kenpeter/work/robot/training_video.avi"
@@ -386,11 +387,16 @@ def reset_environment():
     # FIXED: Reset cube position using USD API without invalidating physics view
     # Don't clear xform ops - just update existing translate op
     from pxr import UsdGeom, Gf
+
     cube_prim = stage.GetPrimAtPath(Sdf.Path("/World/Cube"))
     xform = UsdGeom.Xformable(cube_prim)
 
     # Get or create translate op (without clearing)
-    translate_ops = [op for op in xform.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeTranslate]
+    translate_ops = [
+        op
+        for op in xform.GetOrderedXformOps()
+        if op.GetOpType() == UsdGeom.XformOp.TypeTranslate
+    ]
     if translate_ops:
         translate_op = translate_ops[0]
     else:
@@ -431,7 +437,15 @@ def reset_environment():
 
 
 # === SIMPLE REWARD ===
-def compute_reward(ee_pos, ball_pos, grasped, gripper_pos, left_finger, right_finger, prev_distance=None):
+def compute_reward(
+    ee_pos,
+    ball_pos,
+    grasped,
+    gripper_pos,
+    left_finger,
+    right_finger,
+    prev_distance=None,
+):
     """SUPER SIMPLE: Closer = reward, Away = penalty, Grasp = BIG reward"""
     # Average finger distance to cube (closer = better)
     left_dist = np.linalg.norm(left_finger - ball_pos)
@@ -462,57 +476,8 @@ def compute_reward(ee_pos, ball_pos, grasped, gripper_pos, left_finger, right_fi
     return normalized_reward, avg_finger_dist
 
 
-# === CORRECTED ACTION GUIDANCE ===
-def get_guided_action(ee_pos, ball_pos, action, step_count):
-    """Direct waypoint guidance with corrected approach - FIXED Z-heights"""
-    # CRITICAL FIX: Account for gripper geometry (gripper base is ~15cm from fingers)
-    # When EE is at cube height, fingers are actually 15cm lower!
-    # All target Z positions already include this 15cm offset
-
-    # Define waypoints with SAFER heights to avoid collision avoidance
-    if step_count < 200:
-        # Phase 1: Move above the cube
-        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.35])
-        phase = "APPROACH"
-    elif step_count < 500:
-        # Phase 2: Move to pre-grasp position (higher - safer)
-        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.25])
-        phase = "PRE_GRASP"
-    elif step_count < 700:
-        # Phase 3: Descend slowly (less aggressive - avoid triggering avoidance)
-        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.20])
-        phase = "DESCEND"
-    else:
-        # Phase 4: Fine control - let policy learn final approach
-        target_position = ee_pos + action[:3] * 0.03  # Smaller steps
-        phase = "FINE_CONTROL"
-
-    # Slower, gentler movement to reduce avoidance triggers
-    if phase != "FINE_CONTROL":
-        direction = target_position - ee_pos
-        distance = np.linalg.norm(direction)
-        if distance > 0.01:
-            move_speed = min(0.08, distance * 0.3)  # Much slower
-            direction_normalized = direction / distance
-            target_position = ee_pos + direction_normalized * move_speed
-
-    # Safety limits - allow lower Z for descent
-    target_position = np.clip(target_position, [-0.2, -0.5, 0.1], [0.8, 0.8, 0.8])
-
-    return target_position, phase
-
-
-# === CORRECTED GRIPPER CONTROL ===
-def get_gripper_action(current_gripper, min_finger_dist, phase):
-    """CORRECTED: Proper gripper scaling with 40.0 range"""
-    if phase == "DESCEND" and min_finger_dist < 0.08:
-        return min(current_gripper + 1.5, 40.0)  # Start closing during descend
-    elif phase == "FINE_CONTROL" and min_finger_dist < 0.05:
-        return min(current_gripper + 2.5, 40.0)  # Close faster when very close
-    elif phase == "FINE_CONTROL" and min_finger_dist < 0.1:
-        return min(current_gripper + 1.5, 40.0)  # Start closing
-    else:
-        return max(current_gripper - 1.0, 0.0)  # Keep open during approach
+# === PURE RL LEARNING ===
+# No guided actions - agent learns everything from scratch
 
 
 # === MAIN TRAINING LOOP ===
@@ -581,31 +546,31 @@ try:
                 print(f"⚠️ WARNING: State dimension mismatch: {len(state)} != 25")
                 continue
 
-            # Get action
+            # Get action from pure RL policy (no guidance!)
             action = agent.get_action(state, deterministic=False)
 
-            # Simple guided action
-            target_position, current_phase = get_guided_action(
-                ee_pos, ball_pos, action, step
+            # Action format: [delta_x, delta_y, delta_z, gripper_delta]
+            # Scale actions for smoother movement
+            position_scale = 0.05  # 5cm max movement per step
+            gripper_scale = 2.0  # Gripper change rate
+
+            # Apply position delta from action
+            target_position = ee_pos + action[:3] * position_scale
+
+            # Clip to safety limits
+            target_position = np.clip(
+                target_position, [-0.3, -0.6, 0.05], [0.8, 0.8, 1.0]
             )
 
-            # FIXED: Use correct downward orientation
-            # Quaternion for gripper pointing DOWN toward cube
-            if current_phase in ["APPROACH", "PRE_GRASP", "DESCEND"]:
-                # Downward orientation: rotate 180° around X-axis [w, x, y, z]
-                target_orientation = np.array([0.0, 1.0, 0.0, 0.0])
-            else:
-                # Allow flexibility in fine control
-                target_orientation = None
-
-            # Apply movement
+            # Apply EE target (no forced orientation - let policy learn)
             rmp_flow.set_end_effector_target(
-                target_position=target_position, target_orientation=target_orientation
+                target_position=target_position,
+                target_orientation=None,  # Pure learning - no orientation constraint
             )
             actions = motion_policy.get_next_articulation_action(1.0 / 60.0)
             robot.apply_action(actions)
 
-            # CORRECTED gripper control
+            # Apply gripper action from policy
             current_joints_raw = robot.get_joint_positions()
             current_joints = (
                 current_joints_raw[0]
@@ -614,13 +579,9 @@ try:
             )
             if len(current_joints) > 6:
                 current_gripper = current_joints[6]
-                left_dist = np.linalg.norm(left_finger - ball_pos)
-                right_dist = np.linalg.norm(right_finger - ball_pos)
-                min_finger_dist = min(left_dist, right_dist)
-
-                target_gripper = get_gripper_action(
-                    current_gripper, min_finger_dist, current_phase
-                )
+                # Apply gripper delta from action[3]
+                target_gripper = current_gripper + action[3] * gripper_scale
+                target_gripper = np.clip(target_gripper, 0.0, 40.0)
                 current_joints[6] = target_gripper
                 robot.set_joint_positions(current_joints)
 
@@ -665,7 +626,13 @@ try:
 
             # Compute reward with movement penalty/bonus
             reward, gripper_distance = compute_reward(
-                ee_pos, ball_pos, grasped, gripper_pos, left_finger, right_finger, prev_finger_distance
+                ee_pos,
+                ball_pos,
+                grasped,
+                gripper_pos,
+                left_finger,
+                right_finger,
+                prev_finger_distance,
             )
             prev_finger_distance = gripper_distance  # Update for next step
             episode_reward += reward
@@ -674,12 +641,12 @@ try:
             if step % 100 == 0:
                 left_dist = np.linalg.norm(left_finger - ball_pos)
                 right_dist = np.linalg.norm(right_finger - ball_pos)
-                print(f"  [Step {step}] {current_phase} | Reward: {reward:.3f}")
+                print(f"  [Step {step}] PURE_RL | Reward: {reward:.3f}")
                 print(
                     f"    EE: [{ee_pos[0]:.2f}, {ee_pos[1]:.2f}, {ee_pos[2]:.2f}] | Cube: [{ball_pos[0]:.2f}, {ball_pos[1]:.2f}, {ball_pos[2]:.2f}]"
                 )
                 print(
-                    f"    Dist: {gripper_distance:.3f}m | Gripper: {gripper_pos:.1f}/40.0"
+                    f"    Dist: {gripper_distance:.3f}m | Gripper: {gripper_pos:.1f}/40.0 | Grasped: {grasped}"
                 )
 
             # Train
