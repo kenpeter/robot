@@ -269,7 +269,7 @@ robot = SingleManipulator(
 # Camera setup
 from isaacsim.core.utils.prims import create_prim
 from isaacsim.sensors.camera import Camera
-from pxr import Gf, UsdLux
+from pxr import Gf, UsdLux, UsdPhysics, Sdf
 
 camera_prim_path = "/World/OverheadCamera"
 create_prim(camera_prim_path, "Camera")
@@ -329,12 +329,18 @@ action_dim = 4
 # FIXED: Add missing MODEL_PATH definition
 MODEL_PATH = "rl_robot_arm_model.pth"
 
-# Initialize world
+# CRITICAL: Reset world FIRST to create physics simulation view
 my_world.reset()
+
+# Now initialize components (they need the physics view)
 robot.initialize()
 ball.initialize()
 
-# Initialize components
+# NOTE: Removed physics disabling to prevent view invalidation
+# RMPflow collision avoidance can be tuned via rmpflow config instead
+print("✓ Cube physics enabled")
+
+# Initialize RL components
 finger_tracker = FingerTracker(robot)
 agent = MLPAgent(state_dim=state_dim, action_dim=action_dim, device="cuda")
 
@@ -367,10 +373,30 @@ VIDEO_PATH = "/home/kenpeter/work/robot/training_video.avi"
 my_world.play()
 print(f"World is playing: {my_world.is_playing()}")
 
+# CRITICAL: Stabilize physics views with initial steps
+print("Stabilizing physics views...")
+for _ in range(5):  # 5 steps ~83ms at 60Hz
+    my_world.step(render=False)
+print("✓ Physics stabilized")
+
 
 # === CORRECTED RESET ===
 def reset_environment():
     """CORRECTED: Proper joint initialization with 12 joints total"""
+    # FIXED: Reset cube position using USD API without invalidating physics view
+    # Don't clear xform ops - just update existing translate op
+    from pxr import UsdGeom, Gf
+    cube_prim = stage.GetPrimAtPath(Sdf.Path("/World/Cube"))
+    xform = UsdGeom.Xformable(cube_prim)
+
+    # Get or create translate op (without clearing)
+    translate_ops = [op for op in xform.GetOrderedXformOps() if op.GetOpType() == UsdGeom.XformOp.TypeTranslate]
+    if translate_ops:
+        translate_op = translate_ops[0]
+    else:
+        translate_op = xform.AddTranslateOp()
+    translate_op.Set(Gf.Vec3d(FIXED_CUBE_X, FIXED_CUBE_Y, FIXED_CUBE_Z))
+
     # 6 arm joints - STABLE starting configuration with downward gripper
     initial_pos = np.array(
         [
@@ -385,10 +411,9 @@ def reset_environment():
 
     # CORRECTED: 6 gripper mimic joints (all should be 0 for open gripper)
     gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-
     joint_positions = np.concatenate([initial_pos, gripper_open])
 
-    # Debug: Check joint count
+    # Set positions with physics view intact
     print(f"Setting {len(joint_positions)} joint positions")
     robot.set_joint_positions(joint_positions)
 
@@ -398,8 +423,7 @@ def reset_environment():
         actual_positions = actual_positions[0]
     print(f"✓ Reset: Set {len(actual_positions)} joints")
 
-    ball.set_world_pose(position=np.array([FIXED_CUBE_X, FIXED_CUBE_Y, FIXED_CUBE_Z]))
-
+    # Stabilize after reset
     for _ in range(10):
         my_world.step(render=False)
 
@@ -417,20 +441,23 @@ def compute_reward(ee_pos, ball_pos, grasped, gripper_pos, left_finger, right_fi
     # Base distance reward: normalize to [0, 1]
     distance_reward = max(0.0, 1.0 - (avg_finger_dist / 2.0))
 
-    # Movement penalty/reward: penalize moving away, reward moving closer
+    # Movement penalty/reward: STRONG penalty for moving away
     movement_reward = 0.0
     if prev_distance is not None:
         delta = prev_distance - avg_finger_dist  # positive if closer, negative if away
-        movement_reward = delta * 2.0  # Scale to make it significant
+        movement_reward = delta * 5.0  # Much stronger penalty for avoidance
+
+    # Proximity bonus: exponential reward for being very close
+    proximity_bonus = np.exp(-avg_finger_dist / 0.05)  # High when <5cm
 
     # Big bonus for successful grasp
-    grasp_reward = 1.0 if grasped else 0.0
+    grasp_reward = 2.0 if grasped else 0.0  # Increased from 1.0
 
-    # Total reward (can be negative if moving away!)
-    total_reward = distance_reward + movement_reward + grasp_reward
+    # Total reward (can be very negative if moving away!)
+    total_reward = distance_reward + movement_reward + proximity_bonus + grasp_reward
 
-    # Normalize to roughly [-1, 2] range, then to [0, 1]
-    normalized_reward = (total_reward + 1.0) / 3.0
+    # Normalize to roughly [-2, 4] range, then to [0, 1]
+    normalized_reward = max(0.0, min(1.0, (total_reward + 2.0) / 6.0))
 
     return normalized_reward, avg_finger_dist
 
@@ -442,30 +469,30 @@ def get_guided_action(ee_pos, ball_pos, action, step_count):
     # When EE is at cube height, fingers are actually 15cm lower!
     # All target Z positions already include this 15cm offset
 
-    # Define waypoints with CORRECTED heights
+    # Define waypoints with SAFER heights to avoid collision avoidance
     if step_count < 200:
         # Phase 1: Move above the cube
         target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.35])
         phase = "APPROACH"
     elif step_count < 500:
-        # Phase 2: Move to pre-grasp position (fingers 8cm above cube)
-        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.23])
+        # Phase 2: Move to pre-grasp position (higher - safer)
+        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.25])
         phase = "PRE_GRASP"
     elif step_count < 700:
-        # Phase 3: Descend to grasp (fingers 3cm above cube)
-        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.18])
+        # Phase 3: Descend slowly (less aggressive - avoid triggering avoidance)
+        target_position = np.array([ball_pos[0], ball_pos[1], ball_pos[2] + 0.20])
         phase = "DESCEND"
     else:
-        # Phase 4: Fine control
-        target_position = ee_pos + action[:3] * 0.05
+        # Phase 4: Fine control - let policy learn final approach
+        target_position = ee_pos + action[:3] * 0.03  # Smaller steps
         phase = "FINE_CONTROL"
 
-    # Smooth movement
+    # Slower, gentler movement to reduce avoidance triggers
     if phase != "FINE_CONTROL":
         direction = target_position - ee_pos
         distance = np.linalg.norm(direction)
         if distance > 0.01:
-            move_speed = min(0.15, distance * 0.5)
+            move_speed = min(0.08, distance * 0.3)  # Much slower
             direction_normalized = direction / distance
             target_position = ee_pos + direction_normalized * move_speed
 
