@@ -480,13 +480,17 @@ FIXED_TARGET_X = -1.0  # Match cube X (behind robot)
 FIXED_TARGET_Y = 0.0  # Match cube Y (centered)
 FIXED_TARGET_Z = 0.2  # 10cm above the cube for pre-grasp position
 
-# === STAGE-BASED DENSE REWARD ===
+# === STAGE-BASED DENSE REWARD (6 STAGES) ===
 print("=" * 70)
-print("USING STAGE-BASED DENSE REWARD")
+print("USING 6-STAGE DENSE REWARD (ALL NORMALIZED 0-1)")
 print("=" * 70)
-print("Stage 1 (>0.5m): Dense exponential reward for approach")
-print("Stage 2 (0.1-0.5m): Precision positioning with strong progress bonus")
-print("Stage 3 (<0.1m): Grasping focus with 2.0x bonus for success")
+print("Stage 0 (>2.0m):    Very far - initial movement        (max ~0.15)")
+print("Stage 1 (1.5-2.0m): Far checkpoint - sustained motion  (max ~0.18)")
+print("Stage 2 (1.0-1.5m): Medium far - acceleration          (max ~0.22)")
+print("Stage 3 (0.5-1.0m): Medium close - focused approach    (max ~0.33)")
+print("Stage 4 (0.1-0.5m): Close - precision positioning      (max ~0.45)")
+print("Stage 5 (<0.1m):    Grasping range - completion        (max 1.00)")
+print("Progress bonuses at EVERY stage for moving closer!")
 print("=" * 70)
 
 
@@ -523,60 +527,104 @@ def reset_environment():
     return FIXED_CUBE_X, FIXED_CUBE_Y
 
 
-# Helper function to compute reward (STAGE-BASED DENSE REWARD)
+# Helper function to compute reward (STAGE-BASED DENSE REWARD with 6 stages)
 def compute_reward(
     ee_pos, ball_pos, grasped, prev_distance=None, prev_ee_pos=None, episode_step=0
 ):
     """
-    STAGE-BASED DENSE REWARD: Provides strong guidance at each task phase.
-    - Stage 1 (far): Focus on getting closer
-    - Stage 2 (close): Focus on precise positioning
-    - Stage 3 (very close): Focus on grasping
+    STAGE-BASED DENSE REWARD with PROPER NORMALIZATION (6 STAGES)
+    - Stage 0 (>2.0m):    Very far - initial movement
+    - Stage 1 (1.5-2.0m): Far checkpoint - consistent movement
+    - Stage 2 (1.0-1.5m): Medium far - acceleration phase
+    - Stage 3 (0.5-1.0m): Medium close - focused approach
+    - Stage 4 (0.1-0.5m): Close approach - precision positioning
+    - Stage 5 (<0.1m):    Grasping range - completion focus
+
+    ALL REWARDS NORMALIZED TO 0-1 RANGE
     """
     # Calculate current distance
     distance = np.linalg.norm(ee_pos - ball_pos)
 
-    # === STAGE 1: FAR APPROACH (distance > 0.5m) ===
-    if distance > 0.5:
-        # Dense exponential reward for getting closer from far away
-        distance_reward = np.exp(-2.0 * distance) * 0.3
+    # === STAGE 0: VERY VERY FAR (distance > 2.0m) ===
+    if distance > 2.0:
+        # Very gentle reward to initiate any movement
+        distance_reward = np.exp(-0.5 * distance) * 0.08  # Max ~0.08
 
-        # Progress bonus if moving closer
+        # Small progress bonus
         progress_bonus = 0.0
         if prev_distance is not None and prev_distance > distance:
             improvement = prev_distance - distance
-            progress_bonus = min(0.2, improvement * 15.0)
+            progress_bonus = min(0.07, improvement * 8.0)  # Max 0.07
 
-        reward = distance_reward + progress_bonus
+        reward = distance_reward + progress_bonus  # Max ~0.15
 
-    # === STAGE 2: CLOSE APPROACH (0.1m < distance <= 0.5m) ===
+    # === STAGE 1: VERY FAR (1.5m < distance <= 2.0m) ===
+    elif distance > 1.5:
+        # Gentle exponential to encourage consistent movement
+        distance_reward = np.exp(-0.8 * distance) * 0.10  # Max ~0.10
+
+        # Progress bonus for sustained approach
+        progress_bonus = 0.0
+        if prev_distance is not None and prev_distance > distance:
+            improvement = prev_distance - distance
+            progress_bonus = min(0.08, improvement * 10.0)  # Max 0.08
+
+        reward = distance_reward + progress_bonus  # Max ~0.18
+
+    # === STAGE 2: FAR (1.0m < distance <= 1.5m) ===
+    elif distance > 1.0:
+        # Moderate exponential for acceleration
+        distance_reward = np.exp(-1.2 * distance) * 0.12  # Max ~0.12
+
+        # Moderate progress bonus
+        progress_bonus = 0.0
+        if prev_distance is not None and prev_distance > distance:
+            improvement = prev_distance - distance
+            progress_bonus = min(0.10, improvement * 12.0)  # Max 0.10
+
+        reward = distance_reward + progress_bonus  # Max ~0.22
+
+    # === STAGE 3: MEDIUM (0.5m < distance <= 1.0m) ===
+    elif distance > 0.5:
+        # Stronger exponential for focused approach
+        distance_reward = np.exp(-2.0 * distance) * 0.18  # Max ~0.18
+
+        # Stronger progress bonus
+        progress_bonus = 0.0
+        if prev_distance is not None and prev_distance > distance:
+            improvement = prev_distance - distance
+            progress_bonus = min(0.15, improvement * 15.0)  # Max 0.15
+
+        reward = distance_reward + progress_bonus  # Max ~0.33
+
+    # === STAGE 4: CLOSE (0.1m < distance <= 0.5m) ===
     elif distance > 0.1:
-        # Stronger exponential reward for precise positioning
-        distance_reward = np.exp(-8.0 * distance) * 0.4 + 0.1
+        # Very strong exponential for precision positioning
+        distance_reward = np.exp(-4.0 * distance) * 0.25  # Max ~0.25
 
-        # Strong progress bonus for final approach
+        # Very strong progress bonus
         progress_bonus = 0.0
         if prev_distance is not None and prev_distance > distance:
             improvement = prev_distance - distance
-            progress_bonus = min(0.3, improvement * 20.0)
+            progress_bonus = min(0.20, improvement * 20.0)  # Max 0.20
 
-        reward = distance_reward + progress_bonus
+        reward = distance_reward + progress_bonus  # Max ~0.45
 
-    # === STAGE 3: GRASPING RANGE (distance <= 0.1m) ===
+    # === STAGE 5: GRASPING RANGE (distance <= 0.1m) ===
     else:
         # Very high base reward for being in grasp range
-        proximity_reward = 0.5
+        proximity_reward = 0.40
 
-        # Huge bonus for successful grasp
+        # HUGE bonus for successful grasp
         if grasped:
-            grasp_bonus = 2.0  # Big success signal!
+            grasp_bonus = 0.60  # Massive success signal!
         else:
             grasp_bonus = 0.0
 
-        reward = proximity_reward + grasp_bonus
+        reward = proximity_reward + grasp_bonus  # Max 1.00 (perfect!)
 
-    # Normalize to 0-1 range (with grasp, can go up to ~2.0, so normalize)
-    reward = min(1.0, reward / 2.5)
+    # Ensure final reward is in 0-1 range
+    reward = np.clip(reward, 0.0, 1.0)
 
     return reward, distance
 
