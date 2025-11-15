@@ -13,7 +13,7 @@ from isaacsim import SimulationApp
 # Initialize simulation
 simulation_app = SimulationApp(
     {
-        "headless": True,
+        "headless": False,
         "width": 500,
         "height": 200,
         # ray trace vs path trace: ray trace -> good performance -> path trace -> more real
@@ -43,16 +43,16 @@ from isaacsim.robot_motion.motion_generation import (
     RmpFlow,
 )
 
-# Using Conditional MLP for Diffusion (no attention - honest and fast!)
+# Using MLP for online RL (simple and fast)
 print("=" * 60)
-print("DIFFUSION MODEL: Conditional MLP (no transformer)")
-print("Why: Single action vector doesn't need attention")
+print("SIMPLE MLP AGENT: Direct state-to-action mapping")
+print("Why: Fast learning for sparse rewards")
 print("=" * 60)
 
 
-# conditional diffusion MLP
-class ConditionalDiffusionMLP(nn.Module):
-    """Conditional MLP for diffusion-based action generation (no attention waste!)"""
+# Simple MLP policy network
+class PolicyMLP(nn.Module):
+    """Simple MLP that maps state directly to actions"""
 
     def __init__(
         self,
@@ -60,125 +60,67 @@ class ConditionalDiffusionMLP(nn.Module):
         action_dim,
         hidden_dim=256,
         num_layers=4,
-        use_vision=False,  # Disabled vision
     ):
-        # self, state_dim, action_dim, hidden_dim, 4 layers
         super().__init__()
         self.action_dim = action_dim
         self.state_dim = state_dim
         self.hidden_dim = hidden_dim
-        self.use_vision = False  # Force disable vision
-
-        # Input: concatenate [noisy_action, state, timestep]
-        input_dim = action_dim + state_dim + 1
 
         # Build MLP layers
         layers = []
+        layers.extend([nn.Linear(state_dim, hidden_dim), nn.ReLU()])
 
-        # First layer: input → hidden
-        layers.extend(
-            [
-                nn.Linear(input_dim, hidden_dim),
-                nn.SiLU(),
-            ]
-        )
-
-        # Middle layers with residual connections
         for _ in range(num_layers - 2):
             layers.extend(
                 [
-                    nn.Linear(hidden_dim, hidden_dim * 2),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim * 2, hidden_dim),
-                    nn.SiLU(),
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.ReLU(),
                 ]
             )
 
-        # Final layer: hidden → action (noise prediction)
         layers.extend(
             [
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.SiLU(),
-                nn.Linear(hidden_dim // 2, action_dim),
+                nn.Linear(hidden_dim, action_dim),
+                nn.Tanh(),  # Output in [-1, 1]
             ]
         )
 
         self.network = nn.Sequential(*layers)
 
-        print(f"ConditionalDiffusionMLP initialized:")
-        print(
-            f"  Input dim: {input_dim} (state={state_dim} + action={action_dim} + timestep=1)"
-        )
+        print(f"PolicyMLP initialized:")
+        print(f"  State dim: {state_dim}")
+        print(f"  Action dim: {action_dim}")
         print(f"  Hidden dim: {hidden_dim}")
         print(f"  Num layers: {num_layers}")
-        print(f"  Output dim: {action_dim}")
         print(f"  Total parameters: {sum(p.numel() for p in self.parameters()):,}")
 
-    def forward(self, noisy_action, state, timestep, image=None):
-        """
-        noisy_action: [batch, action_dim] - noisy action at timestep t
-        state: [batch, state_dim] - robot proprioceptive state
-        timestep: [batch, 1] - diffusion timestep (0 to 1)
-        image: IGNORED - no vision
-
-        Returns: predicted noise [batch, action_dim]
-        """
-        # Simply concatenate all inputs
-        x = torch.cat(
-            [noisy_action, state, timestep], dim=-1
-        )  # [batch, state_dim + action_dim + 1]
-
-        # Pass through MLP
-        noise_pred = self.network(x)  # [batch, action_dim]
-
-        return noise_pred
+    def forward(self, state):
+        """Returns: action [batch, action_dim]"""
+        return self.network(state)
 
 
-# rl agent using DiT
-class DiTAgent:
-    """RL Agent using Diffusion Transformer for action generation"""
+# Simple MLP agent for online RL
+class MLPAgent:
+    """Simple MLP Agent for online RL with direct state-to-action mapping"""
 
-    # self, state dim, action dim, NO vision, device cuda
     def __init__(
         self,
         state_dim,
         action_dim,
-        use_vision=False,  # Disabled
         device="cuda",
     ):
-        # state + action -> new state: state -> action -> new state
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.use_vision = use_vision
         self.device = device
 
-        # Diffusion hyperparameters (fixed for proper denoising)
-        self.num_diffusion_steps = 1000  # Increased from 5 → 50 for proper denoising
-        self.beta_start = 0.0001
-        self.beta_end = 0.02
-
-        # Create diffusion schedule with careful numerical stability
-        self.betas = torch.linspace(
-            self.beta_start,
-            self.beta_end,
-            self.num_diffusion_steps,
-            dtype=torch.float32,
-        ).to(device)
-        self.alphas = 1.0 - self.betas
-        self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
-
-        # Clamp to avoid numerical issues
-        self.alphas_cumprod = torch.clamp(self.alphas_cumprod, min=1e-8, max=1.0)
-
-        # Initialize ConditionalDiffusionMLP (increased capacity)
-        self.model = ConditionalDiffusionMLP(
+        # Initialize simple PolicyMLP
+        self.model = PolicyMLP(
             state_dim=state_dim,
             action_dim=action_dim,
-            hidden_dim=512,  # Increased from 256 → 512 for better capacity
-            num_layers=6,  # Increased from 4 → 6 for deeper network
-            use_vision=False,  # No vision
+            hidden_dim=256,
+            num_layers=3,
         ).to(device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-4)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=3e-4)
 
         # Experience replay buffer (using deque for O(1) append/pop)
         self.buffer = deque(maxlen=10000)
@@ -193,7 +135,7 @@ class DiTAgent:
         self.step_count = 0  # Total training steps
 
     def get_action(self, state, image=None, deterministic=False):
-        """Generate action using reverse diffusion process"""
+        """Generate action directly from MLP policy"""
         self.model.eval()
         with torch.no_grad():
             # Check for NaN in state
@@ -203,64 +145,14 @@ class DiTAgent:
 
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
 
-            # Process image if provided
-            image_tensor = None
-            if image is not None and self.use_vision:
-                # Check for NaN in image
-                if np.any(np.isnan(image)):
-                    print(f"WARNING: NaN detected in image")
-                    image = np.nan_to_num(image, 0.0)
-                image_tensor = (
-                    torch.FloatTensor(image).unsqueeze(0).to(self.device) / 255.0
-                )
-
-            # Start from random noise
-            action = (
-                torch.randn(1, self.action_dim, dtype=torch.float32).to(self.device)
-                * 0.5
-            )
-
-            # Reverse diffusion process (DDPM sampling)
-            for t in reversed(range(self.num_diffusion_steps)):
-                timestep = torch.FloatTensor([[t / self.num_diffusion_steps]]).to(
-                    self.device
-                )
-
-                # Predict noise
-                predicted_noise = self.model(
-                    action, state_tensor, timestep, image_tensor
-                )
-
-                # Check for NaN in predicted noise
-                if torch.isnan(predicted_noise).any():
-                    print(f"WARNING: NaN in predicted_noise at step {t}")
-                    predicted_noise = torch.zeros_like(predicted_noise)
-
-                # Denoise using DDPM formula with numerical stability
-                alpha_t = self.alphas[t]
-                alpha_cumprod_t = self.alphas_cumprod[t]
-                beta_t = self.betas[t]
-
-                # Compute coefficients with clamping
-                coef1 = 1.0 / torch.sqrt(alpha_t + 1e-8)
-                coef2 = beta_t / (torch.sqrt(1.0 - alpha_cumprod_t + 1e-8))
-
-                # Update action
-                action = coef1 * (action - coef2 * predicted_noise)
-
-                # Clamp intermediate values to prevent explosion
-                action = torch.clamp(action, -10.0, 10.0)
-
-                # Add noise if not final step
-                if t > 0:
-                    noise = torch.randn_like(action) * 0.1  # Reduced noise
-                    action = action + noise
+            # Get action directly from policy network (single forward pass!)
+            action = self.model(state_tensor)
 
             # Add exploration noise during training
             if not deterministic:
-                action = action + self.noise_scale * 0.1 * torch.randn_like(action)
-
-            action = torch.clamp(action, -1.0, 1.0)  # Keep actions normalized
+                noise = torch.randn_like(action) * self.noise_scale
+                action = action + noise
+                action = torch.clamp(action, -1.0, 1.0)
 
             # Final NaN check
             if torch.isnan(action).any():
@@ -270,9 +162,8 @@ class DiTAgent:
         return action.cpu().numpy()[0]
 
     def update(self, state, action, reward, next_state, image=None):
-        """Store experience and train the diffusion model with reward weighting"""
-        # No vision - ignore image
-        experience = (state, action, reward, next_state, None)
+        """Store experience and train with simple supervised learning (behavioral cloning on good actions)"""
+        experience = (state, action, reward, next_state)
 
         # Add to buffer
         self.buffer.append(experience)
@@ -281,54 +172,36 @@ class DiTAgent:
         if len(self.buffer) < self.batch_size:
             return
 
-        # REMOVED FILTERING: Train on ALL experiences for unbiased gradients
-        # Diffusion models need to learn from the full distribution (including failures)
+        # Sample batch
         indices = np.random.choice(len(self.buffer), self.batch_size, replace=False)
-
         batch = [self.buffer[i] for i in indices]
 
         # Convert to tensors
-        states = torch.FloatTensor(np.array([s for s, a, r, ns, img in batch])).to(
+        states = torch.FloatTensor(np.array([s for s, a, r, ns in batch])).to(
             self.device
         )
-        actions = torch.FloatTensor(np.array([a for s, a, r, ns, img in batch])).to(
+        actions = torch.FloatTensor(np.array([a for s, a, r, ns in batch])).to(
             self.device
         )
-        rewards = torch.FloatTensor(np.array([r for s, a, r, ns, img in batch])).to(
+        rewards = torch.FloatTensor(np.array([r for s, a, r, ns in batch])).to(
             self.device
         )
 
-        # No vision - images_tensor is always None
-        images_tensor = None
-
-        # Diffusion training
+        # Simple supervised learning: predict actions from states
         self.model.train()
+        predicted_actions = self.model(states)
 
-        # Sample random timesteps
-        t = torch.randint(
-            0, self.num_diffusion_steps, (self.batch_size,), dtype=torch.long
-        ).to(self.device)
-
-        # Add noise to actions (forward diffusion process)
-        noise = torch.randn_like(actions)
-        alpha_cumprod_t = self.alphas_cumprod[t].view(-1, 1)
-
-        # x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * noise
-        noisy_actions = (
-            torch.sqrt(alpha_cumprod_t + 1e-8) * actions
-            + torch.sqrt(1.0 - alpha_cumprod_t + 1e-8) * noise
+        # Weighted MSE loss: higher reward = more weight on that action
+        # This encourages the policy to imitate good actions
+        weights = torch.softmax(rewards * 5.0, dim=0) * len(
+            rewards
+        )  # Scale by 5 to emphasize good actions
+        per_sample_loss = F.mse_loss(predicted_actions, actions, reduction="none").mean(
+            dim=1
         )
+        loss = (per_sample_loss * weights).mean()
 
-        # Predict noise
-        timesteps = (t.float() / self.num_diffusion_steps).view(-1, 1)
-        predicted_noise = self.model(noisy_actions, states, timesteps, images_tensor)
-
-        # Compute loss (MSE between predicted and actual noise)
-        # REMOVED REWARD WEIGHTING: Use uniform loss for stable gradients
-        # Let the RL reward signal guide exploration, not the diffusion loss
-        loss = F.mse_loss(predicted_noise, noise)
-
-        # Optimize with gradient clipping
+        # Optimize
         self.optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -338,29 +211,21 @@ class DiTAgent:
         self.loss_history.append(loss.item())
         self.step_count += 1
 
-        # Decay exploration noise - floor at 0.10 for bold exploration
-        self.noise_scale = max(0.10, self.noise_scale * 0.999)
+        # Decay exploration noise
+        self.noise_scale = max(0.05, self.noise_scale * 0.9995)
 
-        # DEBUG: Print diffusion MLP stats every 100 steps
+        # DEBUG: Print stats every 100 steps
         if self.step_count % 100 == 0:
-            print(f"\n[DIFFUSION MLP DEBUG - Step {self.step_count}]")
-            print(f"  Actual noise magnitude: {noise.abs().mean().item():.4f}")
+            print(f"\n[MLP TRAINING - Step {self.step_count}]")
             print(
-                f"  Predicted noise magnitude: {predicted_noise.abs().mean().item():.4f}"
+                f"  Action prediction error (MSE): {per_sample_loss.mean().item():.6f} ← Should DECREASE"
             )
-            print(
-                f"  Noise prediction error (MAE): {(noise - predicted_noise).abs().mean().item():.4f} ← Should DECREASE"
-            )
-            print(f"  Loss (unweighted MSE): {loss.item():.6f} ← Should DECREASE")
+            print(f"  Loss (weighted): {loss.item():.6f} ← Should DECREASE")
             print(
                 f"  Reward range: [{rewards.min().item():.2f}, {rewards.max().item():.2f}]"
             )
-            print(
-                f"  Alpha_cumprod range: [{alpha_cumprod_t.min().item():.4f}, {alpha_cumprod_t.max().item():.4f}]"
-            )
             print(f"  Exploration noise scale: {self.noise_scale:.3f}")
 
-        # Return loss for logging
         return loss.item()
 
     def save_model(self, filepath):
@@ -578,13 +443,12 @@ MODEL_PATH = "rl_robot_arm_model.pth"
 # Simpler 4D action space instead of 12D joint control
 # UR10e has 12 DOF: 6 arm joints + 6 gripper joints (with mimic)
 
-# FIXED STATE DIMENSION: Now includes spatial awareness!
-# Old (broken): 13D = 12 joints + 1 grasped (model was blind!)
-# New (fixed): 22D = 12 joints + 1 grasped + 3 cube_pos + 3 ee_pos + 3 target_pos
-state_dim = 22  # 12 joints + 1 grasped + 3 cube + 3 gripper + 3 target
+# SIMPLIFIED STATE: Remove target position, keep it simple!
+# State: 12 joints + 1 grasped + 3 cube_pos + 3 ee_pos = 19D
+state_dim = 19  # 12 joints + 1 grasped + 3 cube + 3 ee
 action_dim = 4  # dx, dy, dz, gripper
 
-agent = DiTAgent(state_dim=state_dim, action_dim=action_dim, use_vision=False)
+agent = MLPAgent(state_dim=state_dim, action_dim=action_dim, device="cuda")
 
 # Try to load existing model
 agent.load_model(MODEL_PATH)
@@ -599,7 +463,7 @@ print(f"Model will be saved to: {MODEL_PATH}\n")
 
 # Training parameters
 MAX_EPISODES = 1000
-MAX_STEPS_PER_EPISODE = 1500
+MAX_STEPS_PER_EPISODE = 2000
 SAVE_INTERVAL = 1  # Save model every 10 episodes
 VIDEO_INTERVAL = 1  # Record video every 20 episodes
 VIDEO_PATH = "/home/kenpeter/work/robot/training_video.avi"  # Single file, overwrite
@@ -616,11 +480,13 @@ FIXED_TARGET_X = -1.0  # Match cube X (behind robot)
 FIXED_TARGET_Y = 0.0  # Match cube Y (centered)
 FIXED_TARGET_Z = 0.2  # 10cm above the cube for pre-grasp position
 
-# === DISTANCE-BASED REWARD ===
+# === STAGE-BASED DENSE REWARD ===
 print("=" * 70)
-print("USING DISTANCE-BASED REWARD")
+print("USING STAGE-BASED DENSE REWARD")
 print("=" * 70)
-print("Reward: Closer to cube = higher reward")
+print("Stage 1 (>0.5m): Dense exponential reward for approach")
+print("Stage 2 (0.1-0.5m): Precision positioning with strong progress bonus")
+print("Stage 3 (<0.1m): Grasping focus with 2.0x bonus for success")
 print("=" * 70)
 
 
@@ -657,55 +523,62 @@ def reset_environment():
     return FIXED_CUBE_X, FIXED_CUBE_Y
 
 
-# Helper function to compute reward (Simplified distance-based)
+# Helper function to compute reward (STAGE-BASED DENSE REWARD)
 def compute_reward(
     ee_pos, ball_pos, grasped, prev_distance=None, prev_ee_pos=None, episode_step=0
 ):
     """
-    Compute SIMPLIFIED reward focusing on distance reduction.
-    Removes complex directional bonuses that may confuse learning.
+    STAGE-BASED DENSE REWARD: Provides strong guidance at each task phase.
+    - Stage 1 (far): Focus on getting closer
+    - Stage 2 (close): Focus on precise positioning
+    - Stage 3 (very close): Focus on grasping
     """
     # Calculate current distance
     distance = np.linalg.norm(ee_pos - ball_pos)
 
-    # === COMPONENT 1: Inverse distance reward (0 to 0.5) - INCREASED weight ===
-    # Exponential reward: closer = exponentially better
-    max_distance = 2.5
-    distance_reward = max(0.0, 1.0 - (distance / max_distance)) ** 2 * 0.5
+    # === STAGE 1: FAR APPROACH (distance > 0.5m) ===
+    if distance > 0.5:
+        # Dense exponential reward for getting closer from far away
+        distance_reward = np.exp(-2.0 * distance) * 0.3
 
-    # === COMPONENT 2: Proximity bonus (0 to 0.3) - INCREASED for closer approach ===
-    if distance < 0.08:
-        proximity_bonus = 0.3
-    elif distance < 0.15:
-        proximity_bonus = 0.2
-    elif distance < 0.3:
-        proximity_bonus = 0.1
-    elif distance < 0.5:
-        proximity_bonus = 0.05
+        # Progress bonus if moving closer
+        progress_bonus = 0.0
+        if prev_distance is not None and prev_distance > distance:
+            improvement = prev_distance - distance
+            progress_bonus = min(0.2, improvement * 15.0)
+
+        reward = distance_reward + progress_bonus
+
+    # === STAGE 2: CLOSE APPROACH (0.1m < distance <= 0.5m) ===
+    elif distance > 0.1:
+        # Stronger exponential reward for precise positioning
+        distance_reward = np.exp(-8.0 * distance) * 0.4 + 0.1
+
+        # Strong progress bonus for final approach
+        progress_bonus = 0.0
+        if prev_distance is not None and prev_distance > distance:
+            improvement = prev_distance - distance
+            progress_bonus = min(0.3, improvement * 20.0)
+
+        reward = distance_reward + progress_bonus
+
+    # === STAGE 3: GRASPING RANGE (distance <= 0.1m) ===
     else:
-        proximity_bonus = 0.0
+        # Very high base reward for being in grasp range
+        proximity_reward = 0.5
 
-    # === COMPONENT 3: Grasp bonus (0 to 0.5) ===
-    grasp_bonus = 0.5 if grasped else 0.0
-
-    # === COMPONENT 4: Progress reward (0 to 0.3) - INCREASED weight ===
-    progress_reward = 0.0
-    if prev_distance is not None:
-        improvement = prev_distance - distance
-        if improvement > 0:
-            # Strong reward for getting closer
-            progress_reward = min(0.3, improvement * 10.0)  # Increased from 4.0 → 10.0
+        # Huge bonus for successful grasp
+        if grasped:
+            grasp_bonus = 2.0  # Big success signal!
         else:
-            # Small penalty for moving away
-            progress_reward = max(-0.1, improvement * 2.0)
+            grasp_bonus = 0.0
 
-    # === TOTAL REWARD ===
-    total_reward = distance_reward + proximity_bonus + grasp_bonus + progress_reward
+        reward = proximity_reward + grasp_bonus
 
-    # Normalize to 0-1 range
-    normalized_reward = min(1.0, max(0.0, total_reward))
+    # Normalize to 0-1 range (with grasp, can go up to ~2.0, so normalize)
+    reward = min(1.0, reward / 2.5)
 
-    return normalized_reward, distance
+    return reward, distance
 
 
 try:
@@ -739,18 +612,15 @@ try:
             gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
             grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
 
-            # FIXED STATE: Include cube position, ee position, and target position
-            # This gives the model spatial awareness!
-            target_pos = np.array([FIXED_TARGET_X, FIXED_TARGET_Y, FIXED_TARGET_Z])
+            # SIMPLIFIED STATE: Just joints, grasp status, cube position, and ee position
             state = np.concatenate(
                 [
                     joint_positions,  # 12D: robot joint angles
                     [grasped],  # 1D: is cube grasped?
-                    ball_pos,  # 3D: WHERE IS THE CUBE? (was missing!)
-                    ee_pos,  # 3D: WHERE IS THE GRIPPER? (was missing!)
-                    target_pos,  # 3D: WHERE SHOULD WE GO? (was missing!)
+                    ball_pos,  # 3D: cube position
+                    ee_pos,  # 3D: end-effector position
                 ]
-            )  # Total: 22D (was 13D)
+            )  # Total: 19D
 
             # Get action from policy (NO image)
             action = agent.get_action(state, image=None, deterministic=False)
@@ -813,17 +683,15 @@ try:
             )
             grasped_next = float(ball_dist_next < 0.15 and gripper_pos_next > 0.02)
 
-            # FIXED NEXT STATE: Include spatial information
-            target_pos_next = np.array([FIXED_TARGET_X, FIXED_TARGET_Y, FIXED_TARGET_Z])
+            # SIMPLIFIED NEXT STATE
             next_state = np.concatenate(
                 [
                     joint_positions_next,  # 12D
                     [grasped_next],  # 1D
                     ball_pos_next,  # 3D: cube position
-                    ee_pos_next,  # 3D: gripper position
-                    target_pos_next,  # 3D: target position
+                    ee_pos_next,  # 3D: ee position
                 ]
-            )  # Total: 22D
+            )  # Total: 19D
 
             # Compute distance-based reward with directional awareness and penalties
             reward, current_distance = compute_reward(
@@ -888,11 +756,10 @@ try:
                 gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
                 grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
 
-                # Fixed state for video recording
-                target_pos = np.array([FIXED_TARGET_X, FIXED_TARGET_Y, FIXED_TARGET_Z])
+                # Simplified state for video recording
                 state = np.concatenate(
-                    [joint_positions, [grasped], ball_pos, ee_pos, target_pos]
-                )  # 22D
+                    [joint_positions, [grasped], ball_pos, ee_pos]
+                )  # 19D
 
                 action = agent.get_action(state, image=None, deterministic=True)
 
