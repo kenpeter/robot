@@ -42,9 +42,10 @@ from isaacsim.robot_motion.motion_generation import (
 )
 
 print("=" * 60)
-print("PURE RL GRASPING TRAINING")
-print("No guidance - Learning from scratch via policy gradient")
-print("Fixed: 12 joints, State dimensions, Gripper scaling")
+print("PURE RL GRASPING - STAGED REWARD SHAPING")
+print("6 stages: >1m, 0.5-1m, 0.3-0.5m, 0.15-0.3m, 0.08-0.15m, <0.08m")
+print("Rewards scale up: closer = much higher reward!")
+print("Components: stage, progress, alignment, gripper, height, grasp")
 print("=" * 60)
 
 
@@ -436,7 +437,7 @@ def reset_environment():
     return FIXED_CUBE_X, FIXED_CUBE_Y
 
 
-# === SIMPLE REWARD ===
+# === STAGED DENSE REWARD SHAPING ===
 def compute_reward(
     ee_pos,
     ball_pos,
@@ -446,32 +447,114 @@ def compute_reward(
     right_finger,
     prev_distance=None,
 ):
-    """SUPER SIMPLE: Closer = reward, Away = penalty, Grasp = BIG reward"""
-    # Average finger distance to cube (closer = better)
+    """STAGED reward shaping - bigger rewards as fingers get closer!"""
+
+    # Calculate distances
     left_dist = np.linalg.norm(left_finger - ball_pos)
     right_dist = np.linalg.norm(right_finger - ball_pos)
     avg_finger_dist = (left_dist + right_dist) / 2.0
 
-    # Base distance reward: normalize to [0, 1]
-    distance_reward = max(0.0, 1.0 - (avg_finger_dist / 2.0))
+    # === STAGE-BASED DISTANCE REWARDS ===
+    # Give MUCH higher rewards as we cross closer distance thresholds
+    stage_reward = 0.0
 
-    # Movement penalty/reward: STRONG penalty for moving away
-    movement_reward = 0.0
+    if avg_finger_dist > 1.0:
+        # Stage 0: Very far (>1m) - small reward just for existing
+        stage_reward = 0.5
+    elif avg_finger_dist > 0.5:
+        # Stage 1: Far (0.5-1m) - reward for getting into range
+        stage_reward = 1.0 + (1.0 - avg_finger_dist) * 2.0  # 1.0 to 3.0
+    elif avg_finger_dist > 0.3:
+        # Stage 2: Medium (0.3-0.5m) - approaching zone
+        stage_reward = 3.0 + (0.5 - avg_finger_dist) * 5.0  # 3.0 to 4.0
+    elif avg_finger_dist > 0.15:
+        # Stage 3: Close (0.15-0.3m) - near grasp zone
+        stage_reward = 4.0 + (0.3 - avg_finger_dist) * 10.0  # 4.0 to 5.5
+    elif avg_finger_dist > 0.08:
+        # Stage 4: Very close (0.08-0.15m) - pre-grasp
+        stage_reward = 5.5 + (0.15 - avg_finger_dist) * 20.0  # 5.5 to 6.9
+    else:
+        # Stage 5: Extremely close (<0.08m) - grasp range!
+        stage_reward = 6.9 + (0.08 - avg_finger_dist) * 50.0  # 6.9 to 10.9
+
+    # === PROGRESS REWARD ===
+    # HUGE bonus for moving closer, HUGE penalty for moving away
+    progress_reward = 0.0
     if prev_distance is not None:
-        delta = prev_distance - avg_finger_dist  # positive if closer, negative if away
-        movement_reward = delta * 5.0  # Much stronger penalty for avoidance
+        delta = prev_distance - avg_finger_dist
+        # Scale progress reward based on how close we are (more important when close)
+        if avg_finger_dist < 0.15:
+            progress_reward = delta * 30.0  # Very strong when close!
+        elif avg_finger_dist < 0.3:
+            progress_reward = delta * 20.0  # Strong when near
+        else:
+            progress_reward = delta * 10.0  # Moderate when far
 
-    # Proximity bonus: exponential reward for being very close
-    proximity_bonus = np.exp(-avg_finger_dist / 0.05)  # High when <5cm
+    # === ALIGNMENT REWARD ===
+    # Encourage approaching from above (proper grasp orientation)
+    finger_center = (left_finger + right_finger) / 2.0
+    approach_vector = ball_pos - finger_center
+    if np.linalg.norm(approach_vector) > 1e-6:
+        approach_vector = approach_vector / np.linalg.norm(approach_vector)
+        # Bigger bonus when close and properly aligned
+        if avg_finger_dist < 0.2:
+            alignment_reward = max(0.0, approach_vector[2]) * 1.0
+        else:
+            alignment_reward = max(0.0, approach_vector[2]) * 0.3
+    else:
+        alignment_reward = 0.0
 
-    # Big bonus for successful grasp
-    grasp_reward = 2.0 if grasped else 0.0  # Increased from 1.0
+    # === GRIPPER CONTROL REWARD ===
+    # Open when far, close when near
+    if avg_finger_dist > 0.15:
+        # Far: want gripper OPEN
+        if gripper_pos < 10.0:  # Gripper is open (good!)
+            gripper_control_reward = 0.5
+        else:  # Gripper closing too early (bad)
+            gripper_control_reward = -0.3
+    elif avg_finger_dist > 0.08:
+        # Medium close: start closing slightly
+        optimal_gripper = 15.0
+        gripper_control_reward = 0.5 - abs(gripper_pos - optimal_gripper) / 40.0
+    else:
+        # Very close: want gripper CLOSING
+        if gripper_pos > 20.0:  # Gripper is closing (good!)
+            gripper_control_reward = (gripper_pos / 40.0) * 1.0
+        else:  # Gripper still open (bad)
+            gripper_control_reward = -0.2
 
-    # Total reward (can be very negative if moving away!)
-    total_reward = distance_reward + movement_reward + proximity_bonus + grasp_reward
+    # === HEIGHT SAFETY ===
+    # Penalize going too low
+    height_penalty = 0.0
+    if finger_center[2] < 0.03:
+        height_penalty = -1.0  # Strong penalty!
+    elif finger_center[2] < 0.05:
+        height_penalty = -0.3
 
-    # Normalize to roughly [-2, 4] range, then to [0, 1]
-    normalized_reward = max(0.0, min(1.0, (total_reward + 2.0) / 6.0))
+    # === GRASP SUCCESS REWARD ===
+    if grasped:
+        grasp_reward = 20.0  # MASSIVE reward for grasping!
+
+        # Extra bonus for lifting the cube
+        if ball_pos[2] > (0.0515 / 2.0 + 0.05):  # Lifted >5cm
+            grasp_reward += 10.0
+        elif ball_pos[2] > (0.0515 / 2.0 + 0.02):  # Lifted >2cm
+            grasp_reward += 5.0
+    else:
+        grasp_reward = 0.0
+
+    # === TOTAL REWARD ===
+    total_reward = (
+        stage_reward +              # Stage-based distance (0.5 to 10.9)
+        progress_reward +           # Progress toward cube (-inf to +inf)
+        alignment_reward +          # Approach angle (0 to 1.0)
+        gripper_control_reward +    # Gripper timing (-0.3 to 1.0)
+        height_penalty +            # Safety (-1.0 to 0)
+        grasp_reward                # Grasp success (0 to 30)
+    )
+
+    # Normalize to [0, 1] - typical range: -5 to 50
+    normalized_reward = np.clip((total_reward + 5.0) / 55.0, 0.0, 1.0)
 
     return normalized_reward, avg_finger_dist
 
@@ -639,15 +722,9 @@ try:
 
             # Log progress every 100 steps
             if step % 100 == 0:
-                left_dist = np.linalg.norm(left_finger - ball_pos)
-                right_dist = np.linalg.norm(right_finger - ball_pos)
-                print(f"  [Step {step}] PURE_RL | Reward: {reward:.3f}")
-                print(
-                    f"    EE: [{ee_pos[0]:.2f}, {ee_pos[1]:.2f}, {ee_pos[2]:.2f}] | Cube: [{ball_pos[0]:.2f}, {ball_pos[1]:.2f}, {ball_pos[2]:.2f}]"
-                )
-                print(
-                    f"    Dist: {gripper_distance:.3f}m | Gripper: {gripper_pos:.1f}/40.0 | Grasped: {grasped}"
-                )
+                print(f"  [Step {step}] Reward: {reward:.3f} | Dist: {gripper_distance:.3f}m")
+                print(f"    Fingers→Cube: L={np.linalg.norm(left_finger - ball_pos):.3f} R={np.linalg.norm(right_finger - ball_pos):.3f}")
+                print(f"    Gripper: {gripper_pos:.1f}/40.0 | Grasped: {bool(grasped)}")
 
             # Train
             loss = agent.update(state, action, reward, next_state)
