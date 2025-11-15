@@ -407,24 +407,32 @@ def reset_environment():
 
 
 # === SIMPLE REWARD ===
-def compute_reward(ee_pos, ball_pos, grasped, gripper_pos, left_finger, right_finger):
-    """SUPER SIMPLE: Closer fingers = more reward, grasp = big reward"""
+def compute_reward(ee_pos, ball_pos, grasped, gripper_pos, left_finger, right_finger, prev_distance=None):
+    """SUPER SIMPLE: Closer = reward, Away = penalty, Grasp = BIG reward"""
     # Average finger distance to cube (closer = better)
     left_dist = np.linalg.norm(left_finger - ball_pos)
     right_dist = np.linalg.norm(right_finger - ball_pos)
     avg_finger_dist = (left_dist + right_dist) / 2.0
 
-    # Normalize distance to [0, 1] range (assume max distance ~2m)
-    # Closer = higher reward
+    # Base distance reward: normalize to [0, 1]
     distance_reward = max(0.0, 1.0 - (avg_finger_dist / 2.0))
+
+    # Movement penalty/reward: penalize moving away, reward moving closer
+    movement_reward = 0.0
+    if prev_distance is not None:
+        delta = prev_distance - avg_finger_dist  # positive if closer, negative if away
+        movement_reward = delta * 2.0  # Scale to make it significant
 
     # Big bonus for successful grasp
     grasp_reward = 1.0 if grasped else 0.0
 
-    # Total normalized reward [0, 2]
-    total_reward = distance_reward + grasp_reward
+    # Total reward (can be negative if moving away!)
+    total_reward = distance_reward + movement_reward + grasp_reward
 
-    return total_reward / 2.0, avg_finger_dist  # Normalize to [0, 1]
+    # Normalize to roughly [-1, 2] range, then to [0, 1]
+    normalized_reward = (total_reward + 1.0) / 3.0
+
+    return normalized_reward, avg_finger_dist
 
 
 # === CORRECTED ACTION GUIDANCE ===
@@ -488,6 +496,7 @@ try:
         cube_x, cube_y = reset_environment()
         episode_reward = 0.0
         episode_loss = []
+        prev_finger_distance = None  # Track previous distance for penalty/reward
 
         for step in range(MAX_STEPS_PER_EPISODE):
             my_world.step(render=True)
@@ -627,10 +636,11 @@ try:
                 ]
             )
 
-            # Compute reward
+            # Compute reward with movement penalty/bonus
             reward, gripper_distance = compute_reward(
-                ee_pos, ball_pos, grasped, gripper_pos, left_finger, right_finger
+                ee_pos, ball_pos, grasped, gripper_pos, left_finger, right_finger, prev_finger_distance
             )
+            prev_finger_distance = gripper_distance  # Update for next step
             episode_reward += reward
 
             # Log progress every 100 steps
