@@ -406,33 +406,25 @@ def reset_environment():
     return FIXED_CUBE_X, FIXED_CUBE_Y
 
 
-# === CORRECTED REWARD ===
+# === SIMPLE REWARD ===
 def compute_reward(ee_pos, ball_pos, grasped, gripper_pos, left_finger, right_finger):
-    """CORRECTED: Proper gripper scaling with 40.0"""
-    # Gripper center distance
-    gripper_center = (left_finger + right_finger) / 2.0
-    gripper_distance = np.linalg.norm(gripper_center - ball_pos)
+    """SUPER SIMPLE: Closer fingers = more reward, grasp = big reward"""
+    # Average finger distance to cube (closer = better)
+    left_dist = np.linalg.norm(left_finger - ball_pos)
+    right_dist = np.linalg.norm(right_finger - ball_pos)
+    avg_finger_dist = (left_dist + right_dist) / 2.0
 
-    # Base distance reward
-    distance_reward = np.exp(-3.0 * gripper_distance)
+    # Normalize distance to [0, 1] range (assume max distance ~2m)
+    # Closer = higher reward
+    distance_reward = max(0.0, 1.0 - (avg_finger_dist / 2.0))
 
-    # Height bonus
-    height_bonus = 0.2 if ee_pos[2] > ball_pos[2] + 0.05 else 0.0
+    # Big bonus for successful grasp
+    grasp_reward = 1.0 if grasped else 0.0
 
-    # CORRECTED: Use 40.0 for gripper normalization
-    gripper_normalized = gripper_pos / 40.0
+    # Total normalized reward [0, 2]
+    total_reward = distance_reward + grasp_reward
 
-    # Gripper control bonus
-    if gripper_distance > 0.1:
-        gripper_bonus = 0.1 * (1.0 - gripper_normalized)  # Open when far
-    else:
-        gripper_bonus = 0.1 * gripper_normalized  # Closed when close
-
-    # CORRECTED: Proper grasp detection with scaled threshold
-    grasp_bonus = 0.5 if grasped else 0.0
-
-    total_reward = distance_reward + height_bonus + gripper_bonus + grasp_bonus
-    return min(total_reward, 1.0), gripper_distance
+    return total_reward / 2.0, avg_finger_dist  # Normalize to [0, 1]
 
 
 # === CORRECTED ACTION GUIDANCE ===
