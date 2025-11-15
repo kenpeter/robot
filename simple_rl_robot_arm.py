@@ -540,23 +540,51 @@ def reset_environment():
 
 # Helper function to compute reward (STAGE-BASED DENSE REWARD - OPTIMIZED for close start)
 def compute_reward(
-    ee_pos, ball_pos, grasped, prev_distance=None, prev_ee_pos=None, episode_step=0, gripper_pos=0.0
+    ee_pos, ball_pos, grasped, prev_distance=None, prev_ee_pos=None, episode_step=0, gripper_pos=0.0, ee_rot=None
 ):
     """
     STAGE-BASED DENSE REWARD - OPTIMIZED FOR CLOSE STARTING POSITION
     Robot starts at 0.3-0.5m away, so we need VERY DENSE rewards in this range!
 
-    - Stage 0 (>0.4m):    Initial close range - gentle approach
-    - Stage 1 (0.25-0.4m): Very close - careful positioning
-    - Stage 2 (0.15-0.25m): Pre-grasp - precise alignment
-    - Stage 3 (0.08-0.15m): Grasp preparation - gripper positioning
-    - Stage 4 (<0.08m):    Grasping range - completion focus
+    TWO-PHASE REWARD:
+    1. ARM POSITIONING: Get end-effector close to cube (for far distances)
+    2. GRIPPER POSITIONING: Get gripper CENTER (between fingers) close to cube
+
+    IMPORTANT: We measure distance from GRIPPER CENTER (not end-effector base!)
+    - Gripper center is ~10cm forward from end-effector base (in gripper's local Z direction)
+    - This ensures we reward gripper fingers getting close, not just the wrist
+
+    - Stage 0 (>0.4m):    Initial close range - arm positioning
+    - Stage 1 (0.25-0.4m): Very close - arm positioning
+    - Stage 2 (0.15-0.25m): Pre-grasp - arm positioning complete
+    - Stage 3 (0.08-0.15m): Grasp preparation - gripper fingers approaching
+    - Stage 4 (<0.08m):    Grasping range - gripper fingers must close on cube
 
     ALL REWARDS NORMALIZED TO 0-1 RANGE with STRONG PROGRESS BONUSES
-    Includes NORMALIZED gripper closing rewards at each stage
     """
-    # Calculate current distance
-    distance = np.linalg.norm(ee_pos - ball_pos)
+    # Calculate gripper center position (fingers extend in local +Z direction from ee_link)
+    if ee_rot is not None:
+        # Convert quaternion to rotation matrix to get forward direction
+        # quaternion format: [w, x, y, z]
+        w, x, y, z = ee_rot[0], ee_rot[1], ee_rot[2], ee_rot[3]
+
+        # Rotation matrix (extract Z axis - forward direction of gripper)
+        forward_x = 2.0 * (x*z + w*y)
+        forward_y = 2.0 * (y*z - w*x)
+        forward_z = 1.0 - 2.0 * (x*x + y*y)
+        forward_dir = np.array([forward_x, forward_y, forward_z])
+        forward_dir = forward_dir / (np.linalg.norm(forward_dir) + 1e-8)  # normalize
+
+        # Gripper center is ~10cm forward from end-effector base
+        gripper_forward_offset = 0.10
+        gripper_center = ee_pos + forward_dir * gripper_forward_offset
+    else:
+        # Fallback: simple offset (if rotation not provided)
+        gripper_forward_offset = 0.10
+        gripper_center = ee_pos + np.array([0, 0, gripper_forward_offset])
+
+    # Calculate current distance (gripper center to cube center)
+    distance = np.linalg.norm(gripper_center - ball_pos)
 
     # Normalize gripper position to [0, 1] range (0 = open, 1 = closed)
     # gripper_pos ranges from 0.0 (open) to 0.04 (closed)
@@ -596,51 +624,55 @@ def compute_reward(
 
     # === STAGE 2: PRE-GRASP (0.15m < distance <= 0.25m) ===
     elif distance > 0.15:
-        # Very strong exponential for precise positioning
-        distance_reward = np.exp(-6.0 * distance) * 0.28  # Max ~0.28
+        # ARM POSITIONING REWARD: Strong exponential for precise positioning
+        distance_reward = np.exp(-6.0 * distance) * 0.25  # Max ~0.25
 
-        # Extremely strong progress bonus
+        # Progress bonus for arm movement
         progress_bonus = 0.0
         if prev_distance is not None and prev_distance > distance:
             improvement = prev_distance - distance
             progress_bonus = min(0.25, improvement * 40.0)  # Max 0.25
 
-        # Small gripper reward (still keep open for alignment)
-        gripper_reward = 0.02 * (1.0 - gripper_normalized)  # Max 0.02 for staying open
+        # Keep gripper OPEN for alignment (arm positioning priority)
+        gripper_reward = 0.05 * (1.0 - gripper_normalized)  # Max 0.05 for staying open
 
         reward = distance_reward + progress_bonus + gripper_reward  # Max ~0.55
 
     # === STAGE 3: GRASP PREPARATION (0.08m < distance <= 0.15m) ===
     elif distance > 0.08:
-        # Maximum exponential for final approach
-        distance_reward = np.exp(-8.0 * distance) * 0.25  # Max ~0.25
+        # ARM POSITIONING REWARD: Good position maintained
+        distance_reward = np.exp(-8.0 * distance) * 0.20  # Max ~0.20
 
-        # Maximum progress bonus
+        # Progress bonus for getting even closer
         progress_bonus = 0.0
         if prev_distance is not None and prev_distance > distance:
             improvement = prev_distance - distance
-            progress_bonus = min(0.25, improvement * 50.0)  # Max 0.25
+            progress_bonus = min(0.20, improvement * 50.0)  # Max 0.20
 
-        # STRONG gripper closing guidance (proportional to how close we are)
-        # At 0.15m: expect ~20% closed, at 0.08m: expect ~50% closed
-        desired_gripper = 0.2 + (0.15 - distance) / (0.15 - 0.08) * 0.3  # 0.2 to 0.5
+        # GRIPPER CLOSING GUIDANCE: Start closing when arm is positioned!
+        # The closer the arm, the MORE the gripper should close
+        # At 0.15m: gripper should be ~30% closed (fingers approaching)
+        # At 0.08m: gripper should be ~60% closed (fingers very close to cube)
+        desired_gripper = 0.3 + (0.15 - distance) / (0.15 - 0.08) * 0.3  # 0.3 to 0.6
         gripper_error = abs(gripper_normalized - desired_gripper)
-        gripper_reward = 0.15 * (1.0 - gripper_error)  # Max 0.15 for perfect timing
+        gripper_reward = 0.25 * (1.0 - gripper_error)  # Max 0.25 - HIGH WEIGHT!
 
         reward = distance_reward + progress_bonus + gripper_reward  # Max ~0.65
 
     # === STAGE 4: GRASPING RANGE (distance <= 0.08m) ===
     else:
-        # Base reward for being in perfect grasp range (scaled by proximity)
-        # Closer = higher reward (0.08m -> 0.20, 0.00m -> 0.35)
-        proximity_reward = 0.20 + (0.08 - distance) / 0.08 * 0.15  # 0.20 to 0.35
+        # ARM POSITIONING REWARD: Excellent position, slightly scale with closeness
+        # At 0.08m: 0.15, at 0.00m: 0.20
+        proximity_reward = 0.15 + (0.08 - min(distance, 0.08)) / 0.08 * 0.05  # 0.15 to 0.20
 
-        # VERY STRONG gripper closing guidance
-        # At this range, gripper should be closing aggressively!
-        # Desired: 0.5 (50% closed) at 0.08m -> 1.0 (100% closed) at contact
-        desired_gripper = 0.5 + (0.08 - distance) / 0.08 * 0.5  # 0.5 to 1.0
+        # GRIPPER CLOSING REWARD: VERY STRONG - this is the main action now!
+        # Arm is positioned well, now gripper fingers MUST close to grasp
+        # At 0.08m: expect 60% closed (fingers touching cube sides)
+        # At 0.04m: expect 80% closed (fingers wrapping around)
+        # At 0.00m: expect 100% closed (full grasp!)
+        desired_gripper = 0.6 + (0.08 - min(distance, 0.08)) / 0.08 * 0.4  # 0.6 to 1.0
         gripper_error = abs(gripper_normalized - desired_gripper)
-        gripper_reward = 0.25 * (1.0 - gripper_error)  # Max 0.25 for perfect closing
+        gripper_closing_reward = 0.40 * (1.0 - gripper_error)  # Max 0.40 - VERY HIGH WEIGHT!
 
         # HUGE bonus for successful grasp (actual contact + gripper closed)
         if grasped:
@@ -648,7 +680,7 @@ def compute_reward(
         else:
             grasp_bonus = 0.0
 
-        reward = proximity_reward + gripper_reward + grasp_bonus  # Max 1.00 (perfect!)
+        reward = proximity_reward + gripper_closing_reward + grasp_bonus  # Max 1.00 (perfect!)
 
     # Ensure final reward is in 0-1 range
     reward = np.clip(reward, 0.0, 1.0)
@@ -681,8 +713,9 @@ try:
 
             ball_pos, _ = ball.get_world_pose()
             ball_pos = np.array(ball_pos).flatten()
-            ee_pos, _ = robot.end_effector.get_world_pose()
+            ee_pos, ee_rot = robot.end_effector.get_world_pose()
             ee_pos = np.array(ee_pos).flatten()
+            ee_rot = np.array(ee_rot).flatten()  # quaternion [w, x, y, z]
             ball_dist = np.linalg.norm(ee_pos - ball_pos)
             gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
             grasped = float(ball_dist < 0.15 and gripper_pos > 0.02)
@@ -784,6 +817,7 @@ try:
                 prev_ee_pos=prev_ee_pos,
                 episode_step=step,
                 gripper_pos=gripper_pos,
+                ee_rot=ee_rot,
             )
             prev_distance = current_distance  # Update for next iteration
             prev_ee_pos = ee_pos.copy()  # Update previous position
