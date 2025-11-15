@@ -131,7 +131,7 @@ class MLPAgent:
         self.episode_count = 0
         self.total_reward_history = []
         self.loss_history = []  # Track training loss
-        self.noise_scale = 0.3  # Exploration noise
+        self.noise_scale = 0.1  # REDUCED exploration noise (was 0.3, too high!)
         self.step_count = 0  # Total training steps
 
     def get_action(self, state, image=None, deterministic=False):
@@ -187,19 +187,27 @@ class MLPAgent:
             self.device
         )
 
-        # Simple supervised learning: predict actions from states
+        # IMPROVED: Only learn from good experiences (reward > 0.1)
         self.model.train()
         predicted_actions = self.model(states)
 
-        # Weighted MSE loss: higher reward = more weight on that action
-        # This encourages the policy to imitate good actions
-        weights = torch.softmax(rewards * 5.0, dim=0) * len(
-            rewards
-        )  # Scale by 5 to emphasize good actions
-        per_sample_loss = F.mse_loss(predicted_actions, actions, reduction="none").mean(
-            dim=1
-        )
-        loss = (per_sample_loss * weights).mean()
+        # Filter to meaningful experiences only
+        good_mask = rewards > 0.1
+
+        if good_mask.sum() > 10:  # Need at least 10 good samples
+            # Only train on good experiences
+            good_predicted = predicted_actions[good_mask]
+            good_actions = actions[good_mask]
+            good_rewards = rewards[good_mask]
+
+            # Weighted loss: better actions get more weight
+            weights = torch.softmax(good_rewards * 3.0, dim=0) * len(good_rewards)
+            per_sample_loss = F.mse_loss(good_predicted, good_actions, reduction="none").mean(dim=1)
+            loss = (per_sample_loss * weights).mean()
+        else:
+            # Not enough good data yet, uniform loss on all
+            per_sample_loss = F.mse_loss(predicted_actions, actions, reduction="none").mean(dim=1)
+            loss = per_sample_loss.mean()
 
         # Optimize
         self.optimizer.zero_grad()
@@ -211,8 +219,8 @@ class MLPAgent:
         self.loss_history.append(loss.item())
         self.step_count += 1
 
-        # Decay exploration noise
-        self.noise_scale = max(0.05, self.noise_scale * 0.9995)
+        # Decay exploration noise more aggressively
+        self.noise_scale = max(0.02, self.noise_scale * 0.998)  # Faster decay, lower floor
 
         # DEBUG: Print stats every 100 steps
         if self.step_count % 100 == 0:
@@ -358,20 +366,20 @@ print("✓ Cameras initialized: Overhead (84x84) for RL, Side (1280x720) for vid
 # Add red cube with FIXED position for testing diffusion transformer
 from isaacsim.core.api.objects import DynamicCuboid
 
-# FIXED cube position - BEHIND robot (negative X)
+# FIXED cube position - IN FRONT of robot (easier reach)
 cube_size = 0.0515  # 5.15cm cube
-# Robot is at origin (0, 0, 0)
-# UR10e reach is ~1.3m, so place cube well within reach
-# Place cube BEHIND robot (negative X direction, Y=0 center)
-FIXED_CUBE_X = -1.0  # 1.0m behind robot - near max reach
-FIXED_CUBE_Y = 0.0  # CENTER
+# Robot base is at origin (0, 0, 0)
+# UR10e reach is ~1.3m, so place cube well within comfortable reach
+# Place cube IN FRONT (positive X direction, Y=0 center)
+FIXED_CUBE_X = 0.6  # 0.6m in front of robot - comfortable reach
+FIXED_CUBE_Y = 0.0  # CENTER (directly in front)
 FIXED_CUBE_Z = (
-    cube_size / 2.0 + 0.1
-)  # Slightly elevated (10cm above ground) for easier grasp
+    cube_size / 2.0 + 0.3
+)  # 30cm above ground - table height
 
-print(f"\n=== RED CUBE SETUP - BEHIND ROBOT ===")
+print(f"\n=== RED CUBE SETUP - IN FRONT OF ROBOT ===")
 print(f"Cube position: [{FIXED_CUBE_X:.3f}, {FIXED_CUBE_Y:.3f}, {FIXED_CUBE_Z:.3f}]")
-print(f"(1.0m BEHIND robot, centered, 10cm high - challenging reach!)")
+print(f"(0.6m IN FRONT of robot, centered, table height - easy reach!)")
 
 cube = DynamicCuboid(
     name="red_cube",
@@ -497,21 +505,24 @@ print("=" * 70)
 # Helper function to reset environment
 def reset_environment():
     """Reset robot and cube to FIXED positions"""
-    # Reset robot to initial position facing BACKWARD (toward cube)
-    # Cube is NOW at [-1.0, 0.0, 0.126] - 1m BEHIND robot, near max reach
+    # Reset robot to NATURAL initial position (arm relaxed, ready to reach forward)
+    # Cube is at [0.6, 0.0, 0.33] - IN FRONT of robot at table height
     #
-    # shoulder_pan_joint: π (180°) to face backward (negative X axis)
-    # shoulder_lift_joint: -90° (horizontal reach)
-    # elbow_joint: slight bend to reach backward comfortably
-    # wrist joints: point downward for grasping
+    # UR10e joint configuration for natural "ready" pose:
+    # - shoulder_pan: 0° (facing forward, positive X direction)
+    # - shoulder_lift: -60° (arm slightly raised from horizontal)
+    # - elbow: 90° (bent upward for comfortable reach)
+    # - wrist_1: -30° (slight downward tilt)
+    # - wrist_2: 0° (neutral)
+    # - wrist_3: 0° (neutral)
     initial_pos = np.array(
         [
-            np.pi,  # shoulder_pan: 180° = face directly backward (negative X)
-            -np.pi / 2,  # shoulder_lift: -90° = horizontal arm position
-            -np.pi / 4,  # elbow: -45° = bent for comfortable reach
-            -np.pi / 2,  # wrist_1: -90° = gripper points downward
-            0.0,  # wrist_2: neutral
-            0.0,  # wrist_3: neutral
+            0.0,            # shoulder_pan: 0° = face forward (positive X)
+            -np.pi / 3,     # shoulder_lift: -60° = arm raised comfortably
+            np.pi / 2,      # elbow: 90° = bent upward
+            -np.pi / 6,     # wrist_1: -30° = slight downward tilt
+            0.0,            # wrist_2: neutral
+            0.0,            # wrist_3: neutral
         ]
     )
     gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -527,101 +538,109 @@ def reset_environment():
     return FIXED_CUBE_X, FIXED_CUBE_Y
 
 
-# Helper function to compute reward (STAGE-BASED DENSE REWARD with 6 stages)
+# Helper function to compute reward (STAGE-BASED DENSE REWARD - OPTIMIZED for close start)
 def compute_reward(
-    ee_pos, ball_pos, grasped, prev_distance=None, prev_ee_pos=None, episode_step=0
+    ee_pos, ball_pos, grasped, prev_distance=None, prev_ee_pos=None, episode_step=0, gripper_pos=0.0
 ):
     """
-    STAGE-BASED DENSE REWARD with PROPER NORMALIZATION (6 STAGES)
-    - Stage 0 (>2.0m):    Very far - initial movement
-    - Stage 1 (1.5-2.0m): Far checkpoint - consistent movement
-    - Stage 2 (1.0-1.5m): Medium far - acceleration phase
-    - Stage 3 (0.5-1.0m): Medium close - focused approach
-    - Stage 4 (0.1-0.5m): Close approach - precision positioning
-    - Stage 5 (<0.1m):    Grasping range - completion focus
+    STAGE-BASED DENSE REWARD - OPTIMIZED FOR CLOSE STARTING POSITION
+    Robot starts at 0.3-0.5m away, so we need VERY DENSE rewards in this range!
 
-    ALL REWARDS NORMALIZED TO 0-1 RANGE
+    - Stage 0 (>0.4m):    Initial close range - gentle approach
+    - Stage 1 (0.25-0.4m): Very close - careful positioning
+    - Stage 2 (0.15-0.25m): Pre-grasp - precise alignment
+    - Stage 3 (0.08-0.15m): Grasp preparation - gripper positioning
+    - Stage 4 (<0.08m):    Grasping range - completion focus
+
+    ALL REWARDS NORMALIZED TO 0-1 RANGE with STRONG PROGRESS BONUSES
+    Includes NORMALIZED gripper closing rewards at each stage
     """
     # Calculate current distance
     distance = np.linalg.norm(ee_pos - ball_pos)
 
-    # === STAGE 0: VERY VERY FAR (distance > 2.0m) ===
-    if distance > 2.0:
-        # Very gentle reward to initiate any movement
-        distance_reward = np.exp(-0.5 * distance) * 0.08  # Max ~0.08
+    # Normalize gripper position to [0, 1] range (0 = open, 1 = closed)
+    # gripper_pos ranges from 0.0 (open) to 0.04 (closed)
+    gripper_normalized = np.clip(gripper_pos / 0.04, 0.0, 1.0)
 
-        # Small progress bonus
+    # === STAGE 0: INITIAL CLOSE RANGE (distance > 0.4m) ===
+    if distance > 0.4:
+        # Moderate reward for being reasonably close
+        distance_reward = np.exp(-3.0 * distance) * 0.18  # Max ~0.18
+
+        # Strong progress bonus to encourage movement
         progress_bonus = 0.0
         if prev_distance is not None and prev_distance > distance:
             improvement = prev_distance - distance
-            progress_bonus = min(0.07, improvement * 8.0)  # Max 0.07
+            progress_bonus = min(0.15, improvement * 25.0)  # Max 0.15
 
-        reward = distance_reward + progress_bonus  # Max ~0.15
+        # Small gripper reward (keep it open at this stage)
+        gripper_reward = 0.02 * (1.0 - gripper_normalized)  # Max 0.02 for staying open
 
-    # === STAGE 1: VERY FAR (1.5m < distance <= 2.0m) ===
-    elif distance > 1.5:
-        # Gentle exponential to encourage consistent movement
-        distance_reward = np.exp(-0.8 * distance) * 0.10  # Max ~0.10
+        reward = distance_reward + progress_bonus + gripper_reward  # Max ~0.35
 
-        # Progress bonus for sustained approach
-        progress_bonus = 0.0
-        if prev_distance is not None and prev_distance > distance:
-            improvement = prev_distance - distance
-            progress_bonus = min(0.08, improvement * 10.0)  # Max 0.08
-
-        reward = distance_reward + progress_bonus  # Max ~0.18
-
-    # === STAGE 2: FAR (1.0m < distance <= 1.5m) ===
-    elif distance > 1.0:
-        # Moderate exponential for acceleration
-        distance_reward = np.exp(-1.2 * distance) * 0.12  # Max ~0.12
-
-        # Moderate progress bonus
-        progress_bonus = 0.0
-        if prev_distance is not None and prev_distance > distance:
-            improvement = prev_distance - distance
-            progress_bonus = min(0.10, improvement * 12.0)  # Max 0.10
-
-        reward = distance_reward + progress_bonus  # Max ~0.22
-
-    # === STAGE 3: MEDIUM (0.5m < distance <= 1.0m) ===
-    elif distance > 0.5:
-        # Stronger exponential for focused approach
-        distance_reward = np.exp(-2.0 * distance) * 0.18  # Max ~0.18
-
-        # Stronger progress bonus
-        progress_bonus = 0.0
-        if prev_distance is not None and prev_distance > distance:
-            improvement = prev_distance - distance
-            progress_bonus = min(0.15, improvement * 15.0)  # Max 0.15
-
-        reward = distance_reward + progress_bonus  # Max ~0.33
-
-    # === STAGE 4: CLOSE (0.1m < distance <= 0.5m) ===
-    elif distance > 0.1:
-        # Very strong exponential for precision positioning
-        distance_reward = np.exp(-4.0 * distance) * 0.25  # Max ~0.25
+    # === STAGE 1: VERY CLOSE (0.25m < distance <= 0.4m) ===
+    elif distance > 0.25:
+        # Strong exponential reward for getting very close
+        distance_reward = np.exp(-5.0 * distance) * 0.23  # Max ~0.23
 
         # Very strong progress bonus
         progress_bonus = 0.0
         if prev_distance is not None and prev_distance > distance:
             improvement = prev_distance - distance
-            progress_bonus = min(0.20, improvement * 20.0)  # Max 0.20
+            progress_bonus = min(0.20, improvement * 30.0)  # Max 0.20
 
-        reward = distance_reward + progress_bonus  # Max ~0.45
+        # Small gripper reward (keep it open, approaching)
+        gripper_reward = 0.02 * (1.0 - gripper_normalized)  # Max 0.02 for staying open
 
-    # === STAGE 5: GRASPING RANGE (distance <= 0.1m) ===
+        reward = distance_reward + progress_bonus + gripper_reward  # Max ~0.45
+
+    # === STAGE 2: PRE-GRASP (0.15m < distance <= 0.25m) ===
+    elif distance > 0.15:
+        # Very strong exponential for precise positioning
+        distance_reward = np.exp(-6.0 * distance) * 0.28  # Max ~0.28
+
+        # Extremely strong progress bonus
+        progress_bonus = 0.0
+        if prev_distance is not None and prev_distance > distance:
+            improvement = prev_distance - distance
+            progress_bonus = min(0.25, improvement * 40.0)  # Max 0.25
+
+        # Small gripper reward (still keep open for alignment)
+        gripper_reward = 0.02 * (1.0 - gripper_normalized)  # Max 0.02 for staying open
+
+        reward = distance_reward + progress_bonus + gripper_reward  # Max ~0.55
+
+    # === STAGE 3: GRASP PREPARATION (0.08m < distance <= 0.15m) ===
+    elif distance > 0.08:
+        # Maximum exponential for final approach
+        distance_reward = np.exp(-8.0 * distance) * 0.30  # Max ~0.30
+
+        # Maximum progress bonus
+        progress_bonus = 0.0
+        if prev_distance is not None and prev_distance > distance:
+            improvement = prev_distance - distance
+            progress_bonus = min(0.30, improvement * 50.0)  # Max 0.30
+
+        # MODERATE gripper reward (start closing for grasp preparation!)
+        gripper_reward = 0.05 * gripper_normalized  # Max 0.05 for closing gripper
+
+        reward = distance_reward + progress_bonus + gripper_reward  # Max ~0.65
+
+    # === STAGE 4: GRASPING RANGE (distance <= 0.08m) ===
     else:
-        # Very high base reward for being in grasp range
-        proximity_reward = 0.40
+        # Very high base reward for being in perfect grasp range
+        proximity_reward = 0.35
+
+        # STRONG gripper closing reward (encourage closing!)
+        gripper_reward = 0.15 * gripper_normalized  # Max 0.15 for fully closing
 
         # HUGE bonus for successful grasp
         if grasped:
-            grasp_bonus = 0.60  # Massive success signal!
+            grasp_bonus = 0.50  # Massive success signal!
         else:
             grasp_bonus = 0.0
 
-        reward = proximity_reward + grasp_bonus  # Max 1.00 (perfect!)
+        reward = proximity_reward + gripper_reward + grasp_bonus  # Max 1.00 (perfect!)
 
     # Ensure final reward is in 0-1 range
     reward = np.clip(reward, 0.0, 1.0)
@@ -673,14 +692,21 @@ try:
             # Get action from policy (NO image)
             action = agent.get_action(state, image=None, deterministic=False)
 
-            # TRUST THE LEARNED POLICY: Use agent's actions directly
-            # Scale actions to meters: allow up to 0.5m movement per step for faster approach
-            delta_pos = action[:3] * 0.5  # Increased from 0.3 → 0.5 for faster movement
+            # TRUST THE LEARNED POLICY with SMALL GUIDANCE BIAS
+            # Scale actions to meters
+            delta_pos = action[:3] * 0.5
+
+            # Add small bias toward cube (10% guidance) to prevent random drift
+            direction_to_cube = ball_pos - ee_pos
+            direction_norm = np.linalg.norm(direction_to_cube)
+            if direction_norm > 0.01:
+                cube_bias = (direction_to_cube / direction_norm) * 0.05  # 5cm bias toward cube
+                delta_pos = delta_pos * 0.9 + cube_bias  # 90% policy + 10% guidance
 
             target_position = ee_pos + delta_pos
-            # Expand workspace limits to allow reaching the cube at [-1.0, 0.0, 0.126]
+            # Workspace limits for cube at [0.6, 0.0, 0.33] (in front of robot)
             target_position = np.clip(
-                target_position, [-1.5, -0.8, 0.05], [0.8, 0.8, 1.0]
+                target_position, [-0.2, -0.8, 0.05], [1.0, 0.8, 0.8]
             )
             rmp_flow.set_end_effector_target(
                 target_position=target_position, target_orientation=None
@@ -749,6 +775,7 @@ try:
                 prev_distance=prev_distance,
                 prev_ee_pos=prev_ee_pos,
                 episode_step=step,
+                gripper_pos=gripper_pos,
             )
             prev_distance = current_distance  # Update for next iteration
             prev_ee_pos = ee_pos.copy()  # Update previous position
@@ -815,9 +842,9 @@ try:
                 delta_pos = action[:3] * 0.5
 
                 target_position = ee_pos + delta_pos
-                # Expand workspace limits
+                # Workspace limits for cube in front
                 target_position = np.clip(
-                    target_position, [-1.5, -0.8, 0.05], [0.8, 0.8, 1.0]
+                    target_position, [-0.2, -0.8, 0.05], [1.0, 0.8, 0.8]
                 )
                 rmp_flow.set_end_effector_target(
                     target_position=target_position, target_orientation=None
