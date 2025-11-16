@@ -2,11 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Data Collection Script - Generate Expert Transitions for Offline RL
-Based on UR10e pick and place example with RMPFlow controller
-Collects (state, action, reward, next_state) transitions and saves to pickle
-UPDATED: Fixed grasped detection; Added initial position prints; Multi-episode for diversity
-FIXED: Added initial world reset after task addition to ensure assets (e.g., cube) are spawned before accessing task params
+IMPROVED Data Collection Script - Diverse Expert Transitions for Offline RL
+Combines expert demonstrations with exploration noise for better generalization
+- Expert demos from RMPFlow controller (70% of actions)
+- Exploration noise (30% of actions) for state coverage
+- Multiple random initial positions for cube and target
+- Progress-based rewards for better learning signal
+- Saves (state, action, reward, next_state) transitions to pickle
 """
 
 from isaacsim import SimulationApp
@@ -27,7 +29,7 @@ from isaacsim.core.api import World
 from tasks.pick_place import PickPlace
 
 
-# === SIMPLE REWARD FUNCTION ===
+# === IMPROVED REWARD FUNCTION ===
 def compute_reward(
     ee_pos,
     cube_pos,
@@ -35,52 +37,79 @@ def compute_reward(
     gripper_pos,
     grasped,
     task_completed,
+    prev_dist_to_cube=None,
+    prev_dist_to_target=None,
 ):
     """
-    Simple normalized reward:
-    1. Distance to cube (closer = higher)
+    Improved reward with progress tracking:
+    1. Progress toward cube (delta-based)
     2. Grasp success (binary)
-    3. Distance to target after grasping (closer = higher)
+    3. Progress toward target after grasping (delta-based)
     4. Task completion (highest)
-    All normalized to [0, 1]
+    All normalized to [-1, 1] with negative rewards for bad actions
     """
 
-    # Component 1: Distance to cube (before grasp)
+    dist_to_cube = np.linalg.norm(ee_pos - cube_pos)
+    dist_to_target = np.linalg.norm(cube_pos - target_pos)
+
+    # Component 1: Progress to cube (before grasp)
     if not grasped:
-        dist_to_cube = np.linalg.norm(ee_pos - cube_pos)
-        # Normalize: assume max distance ~2m, closer is better
-        dist_reward = max(0.0, 1.0 - (dist_to_cube / 2.0))
-        dist_reward *= 0.3  # Weight: 30% of total
+        if prev_dist_to_cube is not None:
+            # Reward for getting closer, penalty for moving away
+            progress = prev_dist_to_cube - dist_to_cube
+            dist_reward = np.clip(progress * 10, -0.3, 0.3)  # Scale and clip
+        else:
+            # Initial reward based on distance
+            dist_reward = max(-0.3, 0.3 - (dist_to_cube / 2.0))
     else:
         dist_reward = 0.3  # Full points if grasped
 
     # Component 2: Grasp success (binary)
-    grasp_reward = 0.2 if grasped else 0.0  # Weight: 20%
+    grasp_reward = 0.2 if grasped else 0.0
 
-    # Component 3: Distance to target (after grasp)
+    # Component 3: Progress to target (after grasp)
     if grasped:
-        dist_to_target = np.linalg.norm(cube_pos - target_pos)
-        # Normalize: assume max distance ~2m
-        target_reward = max(0.0, 1.0 - (dist_to_target / 2.0))
-        target_reward *= 0.3  # Weight: 30%
+        if prev_dist_to_target is not None:
+            progress = prev_dist_to_target - dist_to_target
+            target_reward = np.clip(progress * 10, -0.3, 0.3)
+        else:
+            target_reward = max(-0.3, 0.3 - (dist_to_target / 2.0))
     else:
         target_reward = 0.0
 
     # Component 4: Task completion (highest reward)
-    completion_reward = 0.2 if task_completed else 0.0  # Weight: 20%
+    completion_reward = 0.5 if task_completed else 0.0
 
-    # Total normalized reward [0, 1]
+    # Total reward
     total_reward = dist_reward + grasp_reward + target_reward + completion_reward
 
-    return np.clip(total_reward, 0.0, 1.0)
+    return np.clip(total_reward, -1.0, 1.0), dist_to_cube, dist_to_target
+
+
+# === RANDOM POSITION GENERATOR ===
+def random_cube_position(workspace_center=np.array([0.3, 0.3, 0.3]), radius=0.2):
+    """Generate random cube position within workspace"""
+    offset = np.random.uniform(-radius, radius, 3)
+    offset[2] = abs(offset[2])  # Keep z positive
+    pos = workspace_center + offset
+    pos[2] = max(0.02575, pos[2])  # Ensure above table
+    return pos
+
+
+def random_target_position(workspace_center=np.array([-0.3, 0.6, 0.02575]), radius=0.15):
+    """Generate random target position within workspace"""
+    offset = np.random.uniform(-radius, radius, 3)
+    offset[2] = 0  # Keep on table
+    pos = workspace_center + offset
+    pos[2] = 0.02575  # Fixed height for table
+    return pos
 
 
 # === SETUP WORLD AND TASK ===
 my_world = World(stage_units_in_meters=1.0, physics_dt=1 / 200, rendering_dt=20 / 200)
 
-# EXACT positions - same as test script
-target_position = np.array([-0.3, 0.6, 0])
-target_position[2] = 0.0515 / 2.0  # z = half cube height for table contact
+# Initial default positions
+target_position = np.array([-0.3, 0.6, 0.02575])
 
 my_task = PickPlace(
     name="ur10e_pick_place",
@@ -88,11 +117,9 @@ my_task = PickPlace(
     cube_size=np.array([0.1, 0.0515, 0.1]),
 )
 my_world.add_task(my_task)
-
-# FIXED: Reset world after adding task to spawn assets (cube, robot, etc.) before accessing params
 my_world.reset()
 
-# Get robot (now safe after reset)
+# Get robot
 task_params = my_world.get_task("ur10e_pick_place").get_params()
 ur10e_name = task_params["robot_name"]["value"]
 my_ur10e = my_world.scene.get_object(ur10e_name)
@@ -103,40 +130,52 @@ my_controller = PickPlaceController(
 )
 articulation_controller = my_ur10e.get_articulation_controller()
 
-# === DATA COLLECTION STORAGE ===
-all_transitions = []  # List across episodes
-num_episodes = (
-    5  # UPDATED: Multiple episodes for diverse data (same positions each time)
-)
+# Get cube object for repositioning
+cube_name = task_params["cube_name"]["value"]
+cube_obj = my_world.scene.get_object(cube_name)
+
+# === DATA COLLECTION PARAMETERS ===
+all_transitions = []
+num_episodes = 50  # INCREASED: More episodes for much more diversity (was 20)
+exploration_prob = 0.5  # INCREASED: 50% exploration actions for max diversity (was 0.3)
+noise_scale = 0.15  # INCREASED: Higher noise for more exploration (was 0.1)
 
 print("=" * 60)
-print("DATA COLLECTION - UR10e Pick and Place")
-print(f"Target Position: {target_position}")
-print(f"Collecting {num_episodes} episodes to: transitions.pkl")
+print("IMPROVED DATA COLLECTION - UR10e Pick and Place")
+print(f"Collecting {num_episodes} diverse episodes")
+print(f"Exploration probability: {exploration_prob:.1%}")
 print("=" * 60)
 
 for episode in range(num_episodes):
-    # Reset for new episode (ensures exact same initial cube/target)
+    # RANDOMIZE positions for each episode
+    if episode % 3 == 0:  # Every 3rd episode, use default positions
+        cube_start_pos = np.array([0.3, 0.3, 0.3])
+        target_pos = np.array([-0.3, 0.6, 0.02575])
+    else:
+        cube_start_pos = random_cube_position()
+        target_pos = random_target_position()
+
+    # Reset world
     my_world.reset()
+
+    # Set random positions
+    cube_obj.set_world_pose(position=cube_start_pos)
+    cube_obj.set_linear_velocity(np.zeros(3))
+    cube_obj.set_angular_velocity(np.zeros(3))
+
+    # Update task target (track it manually)
+    current_target = target_pos.copy()
+
     my_controller.reset()
-    transitions = []  # Per-episode
+    transitions = []
     prev_state = None
     prev_action = None
+    prev_dist_to_cube = None
+    prev_dist_to_target = None
     task_completed = False
     step_count = 0
-    pick_phase = True
-    place_phase = False
-    was_grasped = False
 
-    # UPDATED: Print initial positions after reset
-    observations = my_world.get_observations()
-    initial_cube_pos = observations[task_params["cube_name"]["value"]]["position"]
-    initial_target_pos = observations[task_params["cube_name"]["value"]][
-        "target_position"
-    ]
-    print(
-        f"Episode {episode+1}: Initial Cube Pos: {initial_cube_pos} | Target: {initial_target_pos}"
-    )
+    print(f"\nEpisode {episode+1}: Cube: {cube_start_pos.round(3)} | Target: {target_pos.round(3)}")
 
     while simulation_app.is_running():
         my_world.step(render=True)
@@ -148,38 +187,33 @@ for episode in range(num_episodes):
             observations = my_world.get_observations()
 
             # Get current state components
-            cube_pos = observations[task_params["cube_name"]["value"]]["position"]
-            cube_target_pos = observations[task_params["cube_name"]["value"]][
-                "target_position"
-            ]
-            joint_positions = observations[task_params["robot_name"]["value"]][
-                "joint_positions"
-            ]
+            cube_pos = observations[cube_name]["position"]
+            joint_positions = observations[ur10e_name]["joint_positions"]
             ee_pos, ee_rot = my_ur10e.end_effector.get_world_pose()
             ee_pos = np.array(ee_pos).flatten()
             ee_rot = np.array(ee_rot).flatten()
 
-            # Gripper position (joint 6)
+            # Gripper position
             gripper_pos = joint_positions[6] if len(joint_positions) > 6 else 0.0
 
-            # Grasp detection: Low threshold for closed gripper (0.0 rad closed)
+            # Grasp detection
             dist_to_cube = np.linalg.norm(ee_pos - cube_pos)
             grasped = dist_to_cube < 0.15 and gripper_pos < 0.1
 
             # Task completion check
-            dist_to_target = np.linalg.norm(cube_pos - cube_target_pos)
-            task_completed = my_controller.is_done() or (
-                grasped and dist_to_target < 0.05
-            )
+            dist_to_target = np.linalg.norm(cube_pos - current_target)
+            task_completed = grasped and dist_to_target < 0.05
 
-            # Compute reward
-            reward = compute_reward(
+            # Compute reward with progress tracking
+            reward, new_dist_cube, new_dist_target = compute_reward(
                 ee_pos=ee_pos,
                 cube_pos=cube_pos,
-                target_pos=cube_target_pos,
+                target_pos=current_target,
                 gripper_pos=gripper_pos,
                 grasped=grasped,
                 task_completed=task_completed,
+                prev_dist_to_cube=prev_dist_to_cube,
+                prev_dist_to_target=prev_dist_to_target,
             )
 
             # Build state vector: 12 joints + 1 grasped + 3 cube + 3 target + 3 ee + 4 ee_rot = 26
@@ -188,28 +222,28 @@ for episode in range(num_episodes):
                     joint_positions[:12],
                     [float(grasped)],
                     cube_pos,
-                    cube_target_pos,
+                    current_target,
                     ee_pos,
                     ee_rot,
                 ]
             )
 
-            # Get action from controller
-            actions = my_controller.forward(
+            # Get expert action from controller
+            expert_actions = my_controller.forward(
                 picking_position=cube_pos,
-                placing_position=cube_target_pos,
+                placing_position=current_target,
                 current_joint_positions=joint_positions,
                 end_effector_offset=np.array([0, 0, 0.20]),
             )
 
-            # Extract action as DELTA (7-DOF)
-            action = np.zeros(7)
+            # Extract expert action as DELTA (7-DOF)
+            expert_action = np.zeros(7)
 
             if (
-                hasattr(actions, "joint_positions")
-                and actions.joint_positions is not None
+                hasattr(expert_actions, "joint_positions")
+                and expert_actions.joint_positions is not None
             ):
-                target_positions_full = actions.joint_positions
+                target_positions_full = expert_actions.joint_positions
                 if (
                     target_positions_full is not None
                     and len(target_positions_full) >= 6
@@ -224,13 +258,26 @@ for episode in range(num_episodes):
 
                         current_event = my_controller.get_current_event()
                         if current_event >= 3 and current_event < 7:
-                            gripper_action = np.array([0.0], dtype=np.float32)  # CLOSED
+                            gripper_action = np.array([0.0], dtype=np.float32)
                         else:
-                            gripper_action = np.array([0.628], dtype=np.float32)  # OPEN
+                            gripper_action = np.array([0.628], dtype=np.float32)
 
-                        action = np.concatenate([arm_delta, gripper_action])
+                        expert_action = np.concatenate([arm_delta, gripper_action])
                     except (TypeError, ValueError):
-                        action = np.zeros(7)
+                        expert_action = np.zeros(7)
+
+            # EXPLORATION: Add noise with probability
+            if np.random.random() < exploration_prob:
+                # Add Gaussian noise to expert action
+                noise = np.random.normal(0, noise_scale, 7)
+                noise[6] = 0  # Don't add noise to gripper (keep it discrete)
+                action = expert_action + noise
+                # Clip to reasonable ranges
+                action[:6] = np.clip(action[:6], -np.pi/4, np.pi/4)  # Arm deltas
+                action[6] = np.clip(action[6], 0, 0.628)  # Gripper
+            else:
+                # Use expert action
+                action = expert_action.copy()
 
             # Store transition
             if prev_state is not None and prev_action is not None:
@@ -239,44 +286,29 @@ for episode in range(num_episodes):
 
             # Update prev
             prev_state = current_state.copy()
-            prev_action = (
-                action.copy() if isinstance(action, np.ndarray) else np.array(action)
-            )
+            prev_action = action.copy()
+            prev_dist_to_cube = new_dist_cube
+            prev_dist_to_target = new_dist_target
 
-            # Apply action
-            articulation_controller.apply_action(actions)
+            # Apply action (use expert_actions for actual control, but store mixed action)
+            articulation_controller.apply_action(expert_actions)
 
             step_count += 1
 
-            # Track phases
-            if grasped and not was_grasped:
-                pick_phase = False
-                place_phase = True
-                was_grasped = True
-                print(f"\n{'='*60}")
-                print(
-                    f"🎯 PICK PHASE COMPLETE! To PLACE at step {step_count} (Ep {episode+1})"
-                )
-                print(f"{'='*60}\n")
-
             # Log
-            if step_count % 50 == 0:
-                phase = "PLACE" if place_phase else "PICK"
+            if step_count % 100 == 0:
                 print(
-                    f"[Ep {episode+1} Step {step_count}] Phase: {phase} | Reward: {reward:.3f} | Grasped: {grasped} | "
+                    f"  [Step {step_count}] Reward: {reward:.3f} | Grasped: {grasped} | "
                     f"Dist cube: {dist_to_cube:.3f} | Dist target: {dist_to_target:.3f} | Trans: {len(transitions)}"
                 )
 
             # Stop conditions
-            if my_controller.is_done():
-                print(f"\n✓ Ep {episode+1} COMPLETE! {len(transitions)} transitions")
-                print(
-                    f"   Final cube: {cube_pos} | Target: {cube_target_pos} | Dist: {dist_to_target:.4f}m"
-                )
+            if my_controller.is_done() or task_completed:
+                print(f"✓ Ep {episode+1} COMPLETE! {len(transitions)} transitions")
                 break
 
-            if step_count > 5000:
-                print(f"\n⚠ Ep {episode+1} Max steps! {len(transitions)} transitions")
+            if step_count > 3000:
+                print(f"⚠ Ep {episode+1} Max steps! {len(transitions)} transitions")
                 break
 
     all_transitions.extend(transitions)
@@ -286,8 +318,12 @@ output_file = "/home/kenpeter/work/robot/transitions.pkl"
 with open(output_file, "wb") as f:
     pickle.dump(all_transitions, f)
 
+# Analyze and print statistics
+rewards = np.array([t[2] for t in all_transitions])
 print(f"\n{'='*60}")
-print(f"✓ Saved {len(all_transitions)} total transitions to: {output_file}")
+print(f"✓ Saved {len(all_transitions)} diverse transitions to: {output_file}")
+print(f"  Reward range: [{rewards.min():.3f}, {rewards.max():.3f}]")
+print(f"  Reward mean: {rewards.mean():.3f} ± {rewards.std():.3f}")
 print(f"{'='*60}")
 
 simulation_app.close()
