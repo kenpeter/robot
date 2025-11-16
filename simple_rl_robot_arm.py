@@ -122,10 +122,18 @@ class MLPAgent:
         self.buffer = deque(maxlen=10000)
         self.batch_size = 64
 
+        # Quality filtering for replay buffer
+        self.recent_rewards = deque(maxlen=1000)  # Track recent rewards for percentile
+        self.buffer_add_count = 0  # Track total attempted adds
+        self.buffer_skip_count = 0  # Track filtered experiences
+        self.min_buffer_for_filtering = 200  # Start filtering after this many experiences
+        self.last_states = deque(maxlen=50)  # Track recent states for diversity check
+
         self.episode_count = 0
         self.total_reward_history = []
         self.loss_history = []
         self.noise_scale = 0.3  # Start higher for better exploration
+        self.gripper_noise_scale = 0.2  # Separate higher noise for gripper exploration
         self.step_count = 0
 
     def get_action(self, state, deterministic=False):
@@ -139,15 +147,55 @@ class MLPAgent:
             action = self.model(state_tensor)
 
             if not deterministic:
-                noise = torch.randn_like(action) * self.noise_scale
+                # Separate noise: higher for gripper to force exploration
+                pos_noise = torch.randn_like(action[:, :3]) * self.noise_scale
+                gripper_noise = torch.randn_like(action[:, 3:4]) * self.gripper_noise_scale
+                noise = torch.cat([pos_noise, gripper_noise], dim=1)
                 action = action + noise
                 action = torch.clamp(action, -1.0, 1.0)
 
         return action.cpu().numpy()[0]
 
     def update(self, state, action, reward, next_state):
-        experience = (state, action, reward, next_state)
-        self.buffer.append(experience)
+        """Update with quality filtering for replay buffer"""
+        self.buffer_add_count += 1
+        self.recent_rewards.append(reward)
+
+        # === QUALITY FILTERING ===
+        should_add = True
+
+        # Phase 1: Always add first N experiences for bootstrapping
+        if len(self.buffer) < self.min_buffer_for_filtering:
+            should_add = True
+        else:
+            # Phase 2: Reward-based filtering (keep top 25%)
+            if len(self.recent_rewards) >= 100:  # Need enough samples for percentile
+                # Adaptive threshold: 75th percentile = top 25% of recent rewards
+                reward_threshold = np.percentile(list(self.recent_rewards), 75)
+
+                if reward < reward_threshold:
+                    should_add = False
+
+            # Phase 3: Diversity check - avoid redundant states
+            if should_add and len(self.last_states) > 0:
+                # Check state similarity with recent states
+                state_norm = np.linalg.norm(state) + 1e-8
+                for prev_state in self.last_states:
+                    prev_norm = np.linalg.norm(prev_state) + 1e-8
+                    similarity = np.dot(state, prev_state) / (state_norm * prev_norm)
+
+                    # If too similar (>95% cosine similarity), skip
+                    if similarity > 0.95:
+                        should_add = False
+                        break
+
+        # Add experience if it passes filters
+        if should_add:
+            experience = (state, action, reward, next_state)
+            self.buffer.append(experience)
+            self.last_states.append(state.copy())  # Track for diversity
+        else:
+            self.buffer_skip_count += 1
 
         if len(self.buffer) < self.batch_size:
             return None
@@ -184,16 +232,28 @@ class MLPAgent:
         self.loss_history.append(loss.item())
         self.step_count += 1
 
-        # Slower noise decay to maintain exploration
+        # Separate decay: arm decays faster, gripper slower for sustained exploration
         if self.step_count > 100000:  # Late-game: keep exploration alive
             self.noise_scale = max(0.05, self.noise_scale * 0.9995)
+            self.gripper_noise_scale = max(0.10, self.gripper_noise_scale * 0.9998)  # Slower
         else:
             self.noise_scale = max(0.02, self.noise_scale * 0.998)
+            self.gripper_noise_scale = max(0.08, self.gripper_noise_scale * 0.999)  # Slower
 
         if self.step_count % 100 == 0:
             avg_reward = rewards.mean().item()
+            # Buffer quality metrics
+            skip_rate = (self.buffer_skip_count / max(1, self.buffer_add_count)) * 100
+            buffer_fill = (len(self.buffer) / (self.buffer.maxlen or 10000)) * 100
+            reward_threshold = np.percentile(list(self.recent_rewards), 75) if len(self.recent_rewards) >= 100 else 0.0
+
             print(
-                f"\n[Step {self.step_count}] Loss: {loss.item():.4f} | Avg Reward: {avg_reward:.3f} | Noise: {self.noise_scale:.4f}"
+                f"\n[Step {self.step_count}] Loss: {loss.item():.4f} | Avg Reward: {avg_reward:.3f} | "
+                f"Noise: pos={self.noise_scale:.4f} grip={self.gripper_noise_scale:.4f}"
+            )
+            print(
+                f"   Buffer: {len(self.buffer)}/{self.buffer.maxlen} ({buffer_fill:.1f}%) | "
+                f"Skip Rate: {skip_rate:.1f}% | Threshold: {reward_threshold:.3f}"
             )
 
         return loss.item()
@@ -394,11 +454,20 @@ def reset_environment(episode_num=0):
     # Don't clear xform ops - just update existing translate op
     from pxr import UsdGeom, Gf
 
-    # Curriculum: vary cube position every 50 episodes for generalization
-    global FIXED_CUBE_X
-    if episode_num % 50 == 0 and episode_num > 0:
-        FIXED_CUBE_X = np.random.uniform(0.35, 0.60)
-        print(f"📍 Curriculum: New cube X = {FIXED_CUBE_X:.3f}m")
+    # Curriculum: precision scaling + position variation
+    global FIXED_CUBE_X, FIXED_CUBE_Y, FIXED_CUBE_Z
+
+    # Precision curriculum: gradually move cube closer for fine manipulation
+    curriculum_factor = max(0.6, 1.0 - (episode_num / 400.0))  # 1.0 → 0.6 over 400 eps
+    base_x = 0.5 * curriculum_factor  # Start 0.5m, shrink to 0.3m
+
+    # Add randomization for robustness
+    FIXED_CUBE_X = base_x + np.random.uniform(-0.08, 0.08)
+    FIXED_CUBE_Y = np.random.uniform(-0.05, 0.05)  # Small Y variation
+    FIXED_CUBE_Z = cube_size / 2.0 + np.random.uniform(0.0, 0.01)  # Tiny Z variation
+
+    if episode_num % 20 == 0:
+        print(f"📍 Curriculum: Cube @ ({FIXED_CUBE_X:.3f}, {FIXED_CUBE_Y:.3f}, {FIXED_CUBE_Z:.3f}) | Factor: {curriculum_factor:.2f}")
 
     cube_prim = stage.GetPrimAtPath(Sdf.Path("/World/Cube"))
     xform = UsdGeom.Xformable(cube_prim)
@@ -472,6 +541,7 @@ def compute_reward(
     right_finger,
     prev_distance=None,
     prev_ee_pos=None,
+    stuck_steps=0,
 ):
     """STAGED reward shaping - bigger rewards as fingers get closer!"""
 
@@ -540,9 +610,19 @@ def compute_reward(
         else:
             progress_reward = delta * 10.0  # Moderate when far
 
+        # EXTRA BONUS if making progress in close zone
+        if avg_finger_dist < 0.5 and delta > 0:
+            progress_reward += 0.8  # Flat bonus for ANY closing step when near
+
         # EXTRA PENALTY for moving away (negative delta)
         if delta < 0:  # Moving away from cube!
             progress_reward *= 3.0  # Triple the penalty!
+
+    # === STUCK PENALTY ===
+    # Penalize hovering without making progress
+    stuck_penalty = 0.0
+    if stuck_steps > 30:  # Stuck for >30 steps
+        stuck_penalty = -0.3 * (stuck_steps / 100.0)  # Gradually increases
 
     # === VELOCITY REWARD ===
     # Encourage faster movement toward cube
@@ -586,15 +666,15 @@ def compute_reward(
         else:  # Gripper closing too early (bad)
             gripper_control_reward = -0.1  # Was -0.3
     elif avg_finger_dist > 0.08:
-        # Medium close: start closing slightly
+        # Medium close: BOOST reward for starting to close
         optimal_gripper = 15.0
-        gripper_control_reward = 0.5 - abs(gripper_pos - optimal_gripper) / 40.0
+        gripper_control_reward = 0.8 - abs(gripper_pos - optimal_gripper) / 40.0 * 0.5
     else:
-        # Very close: want gripper CLOSING
-        if gripper_pos > 20.0:  # Gripper is closing (good!)
-            gripper_control_reward = (gripper_pos / 40.0) * 1.5  # Boosted from 1.0
-        else:  # Gripper still open (bad)
-            gripper_control_reward = -0.2
+        # Very close: STRONG pull to close gripper
+        if gripper_pos > 20.0:  # Gripper is closing (excellent!)
+            gripper_control_reward = (gripper_pos / 40.0) * 2.5  # Was 1.5 → much stronger
+        else:  # Gripper still open (bad!) - scaled penalty
+            gripper_control_reward = -0.5 * (0.08 - avg_finger_dist) / 0.08  # Worse when very close
 
     # === HEIGHT SAFETY ===
     # Penalize going too low
@@ -622,9 +702,10 @@ def compute_reward(
         + milestone_bonus  # Threshold crossing (0 to 3.0)
         + distance_penalty  # Penalty for being far (-inf to 0)
         + progress_reward  # Progress toward cube (-inf to +inf)
+        + stuck_penalty  # Stuck hovering penalty (-inf to 0)
         + velocity_reward  # Movement speed bonus (-inf to +inf)
         + alignment_reward  # Approach angle (0 to 1.5)
-        + gripper_control_reward  # Gripper timing (-0.2 to 1.5)
+        + gripper_control_reward  # Gripper timing (-0.2 to 2.5)
         + height_penalty  # Safety (-1.0 to 0)
         + grasp_reward  # Grasp success (0 to 30)
     )
@@ -641,6 +722,7 @@ def compute_reward(
         'milestone': milestone_bonus if 'milestone_bonus' in locals() else 0.0,
         'dist_penalty': distance_penalty,
         'progress': progress_reward,
+        'stuck': stuck_penalty,
         'velocity': velocity_reward if 'velocity_reward' in locals() else 0.0,
         'alignment': alignment_reward,
         'gripper': gripper_control_reward,
@@ -667,6 +749,9 @@ try:
         prev_finger_distance = None  # Track previous distance for penalty/reward
         prev_ee_pos = None  # Track previous EE position for velocity reward
         closest_dist = float('inf')  # Track closest approach
+        stuck_steps = 0  # Track stuck hovering
+        min_progress_threshold = 0.003  # Minimum distance change to not be "stuck"
+        gripper_positions = []  # Track gripper activity
 
         for step in range(MAX_STEPS_PER_EPISODE):
             my_world.step(render=True)
@@ -809,6 +894,12 @@ try:
                 ]
             )
 
+            # Track stuck detection
+            if prev_finger_distance is not None and abs(prev_finger_distance - np.linalg.norm((left_finger + right_finger) / 2.0 - ball_pos)) < min_progress_threshold:
+                stuck_steps += 1
+            else:
+                stuck_steps = 0
+
             # Compute reward with movement penalty/bonus
             reward, gripper_distance, breakdown = compute_reward(
                 ee_pos,
@@ -819,11 +910,15 @@ try:
                 right_finger,
                 prev_finger_distance,
                 prev_ee_pos,
+                stuck_steps,
             )
 
             # Track closest distance this episode
             if gripper_distance < closest_dist:
                 closest_dist = gripper_distance
+
+            # Track gripper usage
+            gripper_positions.append(gripper_pos)
 
             prev_finger_distance = gripper_distance  # Update for next step
             prev_ee_pos = ee_pos.copy()  # Update for velocity calc
@@ -837,9 +932,9 @@ try:
                 print(
                     f"    Fingers→Cube: L={np.linalg.norm(left_finger - ball_pos):.3f} R={np.linalg.norm(right_finger - ball_pos):.3f}"
                 )
-                print(f"    Gripper: {gripper_pos:.1f}/40.0 | Grasped: {bool(grasped)}")
+                print(f"    Gripper: {gripper_pos:.1f}/40.0 | Grasped: {bool(grasped)} | Stuck: {stuck_steps}")
                 print(
-                    f"    Breakdown: stage={breakdown['stage']:.2f} prog={breakdown['progress']:.2f} "
+                    f"    Breakdown: stage={breakdown['stage']:.2f} prog={breakdown['progress']:.2f} stuck={breakdown['stuck']:.2f} "
                     f"vel={breakdown['velocity']:.2f} grip={breakdown['gripper']:.2f} raw={breakdown['total_raw']:.2f}"
                 )
 
@@ -848,11 +943,16 @@ try:
             if loss is not None:
                 episode_loss.append(loss)
 
-        # Episode summary with closest approach
+        # Episode summary with closest approach and gripper stats
         avg_loss = np.mean(episode_loss) if episode_loss else 0.0
+        avg_gripper = np.mean(gripper_positions) if gripper_positions else 0.0
+        max_gripper = np.max(gripper_positions) if gripper_positions else 0.0
         print(
             f"\n🎯 Episode {episode+1} | Total Reward: {episode_reward:.2f} | "
-            f"Closest: {closest_dist:.3f}m | Avg Loss: {avg_loss:.4f} | Noise: {agent.noise_scale:.3f}"
+            f"Closest: {closest_dist:.3f}m | Gripper: avg={avg_gripper:.1f} max={max_gripper:.1f}/40"
+        )
+        print(
+            f"   Avg Loss: {avg_loss:.4f} | Noise: pos={agent.noise_scale:.3f} grip={agent.gripper_noise_scale:.3f}"
         )
         agent.episode_count += 1
         agent.total_reward_history.append(episode_reward)
