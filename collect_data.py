@@ -184,10 +184,10 @@ while simulation_app.is_running():
 
         if hasattr(actions, 'joint_positions') and actions.joint_positions is not None:
             target_positions_full = actions.joint_positions
-            # Check if target is valid and contains no None values
+            # Check if target is valid and contains no None values (only check arm joints - 6 DOF)
             if (target_positions_full is not None and
-                len(target_positions_full) >= 12 and
-                all(x is not None for x in target_positions_full[:12])):
+                len(target_positions_full) >= 6 and
+                all(x is not None for x in target_positions_full[:6])):
                 try:
                     # Arm joints delta (6 DOF)
                     target_arm = np.array(target_positions_full[:6], dtype=np.float32)
