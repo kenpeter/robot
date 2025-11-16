@@ -242,17 +242,20 @@ while simulation_app.is_running() and train_step_counter < NUM_TRAIN_STEPS:
                     ee_rot,
                 ])
 
-                # Get action from learned policy (6-DOF joint positions)
-                policy_action = agent.get_action(current_state)
+                # Get action DELTA from learned policy
+                policy_action_delta = agent.get_action(current_state)
 
-                # Scale action from [-1, 1] to actual joint ranges
-                # The policy outputs tanh actions, need to scale to joint limits
-                # UR10e approximate joint limits: [-2π, 2π] for most joints
-                scaled_action = policy_action * np.pi
+                # Policy outputs tanh [-1, 1], scale to reasonable joint delta
+                # Max delta per step: ~0.1 radians (~5.7 degrees)
+                delta_scale = 0.1
+                scaled_delta = policy_action_delta * delta_scale
 
-                # Apply learned action to robot's arm joints
+                # Apply delta to current joint positions
                 target_joints = joint_positions.copy()
-                target_joints[:6] = scaled_action  # Update first 6 joints (arm)
+                target_joints[:6] = joint_positions[:6] + scaled_delta  # Add delta to current
+
+                # Clip to safe joint limits
+                target_joints[:6] = np.clip(target_joints[:6], -2*np.pi, 2*np.pi)
 
                 # Apply via articulation controller
                 from isaacsim.core.utils.types import ArticulationAction

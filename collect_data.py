@@ -177,12 +177,23 @@ while simulation_app.is_running():
             end_effector_offset=np.array([0, 0, 0.20]),
         )
 
-        # Extract action (joint positions command)
-        # Action is the joint position targets from controller (6-DOF arm only)
+        # Extract action as DELTA (change in joint positions)
+        # This is critical: we want to learn changes, not absolute positions!
+        action = np.zeros(6)  # Default fallback
+
         if hasattr(actions, 'joint_positions') and actions.joint_positions is not None:
-            action = actions.joint_positions[:6]  # Only take first 6 (arm joints)
-        else:
-            action = np.zeros(6)  # Fallback: 6-DOF zeros
+            target_positions_full = actions.joint_positions
+            # Check if target is valid and contains no None values
+            if (target_positions_full is not None and
+                len(target_positions_full) >= 6 and
+                all(x is not None for x in target_positions_full[:6])):
+                try:
+                    target_positions = np.array(target_positions_full[:6], dtype=np.float32)
+                    current_positions = np.array(joint_positions[:6], dtype=np.float32)
+                    action = target_positions - current_positions  # DELTA = target - current
+                except (TypeError, ValueError) as e:
+                    # Skip this transition if conversion fails
+                    action = np.zeros(6)
 
         # Store transition (state, action, reward, next_state)
         if prev_state is not None and prev_action is not None:
