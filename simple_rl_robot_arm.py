@@ -465,6 +465,12 @@ def compute_reward(
     # Give MUCH higher rewards as we cross closer distance thresholds
     stage_reward = 0.0
 
+    # stage reward: divide flow -> reward base on prev -> heavy reward closer
+
+    # 1. divide flow into stages: 1.0 to 0.08 -> divide them into stages -> then reward
+    # 2. heavy reward if closer: closer -> heavy reward
+    # 3. stage reward base on prev: prev reward -> stage reward
+
     if avg_finger_dist > 1.0:
         # Stage 0: Very far (>1m) - small reward just for existing
         stage_reward = 0.5
@@ -482,6 +488,9 @@ def compute_reward(
         stage_reward = 5.5 + (0.15 - avg_finger_dist) * 20.0  # 5.5 to 6.9
     else:
         # Stage 5: Extremely close (<0.08m) - grasp range!
+
+        # 5.5 + (0.15 - 0.08) * 20.0 = 5.5 + 0.07 * 20 = 5.5 + 1.4 = 6.9
+        # 6.9 from prev stage
         stage_reward = 6.9 + (0.08 - avg_finger_dist) * 50.0  # 6.9 to 10.9
 
     # === PROGRESS REWARD ===
@@ -565,6 +574,8 @@ def compute_reward(
         + height_penalty  # Safety (-1.0 to 0)
         + grasp_reward  # Grasp success (0 to 30)
     )
+
+    # normalize at the end: reward in their scope -> normalize / clip at the end
 
     # Normalize to [0, 1] - adjusted range to account for distance penalty
     # Typical range: -10 to 50 (accounting for distance penalty)
