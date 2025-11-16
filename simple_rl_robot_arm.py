@@ -125,7 +125,7 @@ class MLPAgent:
         self.episode_count = 0
         self.total_reward_history = []
         self.loss_history = []
-        self.noise_scale = 0.1
+        self.noise_scale = 0.3  # Start higher for better exploration
         self.step_count = 0
 
     def get_action(self, state, deterministic=False):
@@ -183,12 +183,17 @@ class MLPAgent:
 
         self.loss_history.append(loss.item())
         self.step_count += 1
-        self.noise_scale = max(0.02, self.noise_scale * 0.998)
+
+        # Slower noise decay to maintain exploration
+        if self.step_count > 100000:  # Late-game: keep exploration alive
+            self.noise_scale = max(0.05, self.noise_scale * 0.9995)
+        else:
+            self.noise_scale = max(0.02, self.noise_scale * 0.998)
 
         if self.step_count % 100 == 0:
             avg_reward = rewards.mean().item()
             print(
-                f"\n[Step {self.step_count}] Loss: {loss.item():.4f} | Avg Reward: {avg_reward:.3f}"
+                f"\n[Step {self.step_count}] Loss: {loss.item():.4f} | Avg Reward: {avg_reward:.3f} | Noise: {self.noise_scale:.4f}"
             )
 
         return loss.item()
@@ -383,11 +388,17 @@ print("✓ Physics stabilized")
 
 
 # === CORRECTED RESET ===
-def reset_environment():
-    """CORRECTED: Proper joint initialization with 12 joints total"""
+def reset_environment(episode_num=0):
+    """CORRECTED: Proper joint initialization with 12 joints total + curriculum"""
     # FIXED: Reset cube position using USD API without invalidating physics view
     # Don't clear xform ops - just update existing translate op
     from pxr import UsdGeom, Gf
+
+    # Curriculum: vary cube position every 50 episodes for generalization
+    global FIXED_CUBE_X
+    if episode_num % 50 == 0 and episode_num > 0:
+        FIXED_CUBE_X = np.random.uniform(0.35, 0.60)
+        print(f"📍 Curriculum: New cube X = {FIXED_CUBE_X:.3f}m")
 
     cube_prim = stage.GetPrimAtPath(Sdf.Path("/World/Cube"))
     xform = UsdGeom.Xformable(cube_prim)
@@ -404,17 +415,31 @@ def reset_environment():
         translate_op = xform.AddTranslateOp()
     translate_op.Set(Gf.Vec3d(FIXED_CUBE_X, FIXED_CUBE_Y, FIXED_CUBE_Z))
 
-    # 6 arm joints - STABLE starting configuration with downward gripper
-    initial_pos = np.array(
-        [
-            0.0,  # shoulder_pan: face forward
-            -np.pi / 3,  # shoulder_lift: stable raised position
-            np.pi / 2.5,  # elbow: moderate bend
-            -np.pi / 2,  # wrist_1: point down
-            -np.pi / 2,  # wrist_2: downward pitch alignment
-            0.0,  # wrist_3: neutral
-        ]
-    )
+    # Curriculum: sometimes start closer (every 10th episode)
+    if episode_num % 10 == 5:
+        # Closer starting pose
+        initial_pos = np.array(
+            [
+                0.0,
+                -np.pi / 4,  # Less raised
+                np.pi / 3,    # More extended
+                -np.pi / 2,
+                -np.pi / 2,
+                0.0,
+            ]
+        )
+    else:
+        # Standard starting pose
+        initial_pos = np.array(
+            [
+                0.0,  # shoulder_pan: face forward
+                -np.pi / 3,  # shoulder_lift: stable raised position
+                np.pi / 2.5,  # elbow: moderate bend
+                -np.pi / 2,  # wrist_1: point down
+                -np.pi / 2,  # wrist_2: downward pitch alignment
+                0.0,  # wrist_3: neutral
+            ]
+        )
 
     # CORRECTED: 6 gripper mimic joints (all should be 0 for open gripper)
     gripper_open = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -446,6 +471,7 @@ def compute_reward(
     left_finger,
     right_finger,
     prev_distance=None,
+    prev_ee_pos=None,
 ):
     """STAGED reward shaping - bigger rewards as fingers get closer!"""
 
@@ -464,6 +490,7 @@ def compute_reward(
     # === STAGE-BASED DISTANCE REWARDS ===
     # Give MUCH higher rewards as we cross closer distance thresholds
     stage_reward = 0.0
+    milestone_bonus = 0.0  # For crossing thresholds
 
     # stage reward: divide flow -> reward base on prev -> heavy reward closer
 
@@ -479,19 +506,25 @@ def compute_reward(
         stage_reward = 1.0 + (1.0 - avg_finger_dist) * 2.0  # 1.0 to 3.0
     elif avg_finger_dist > 0.3:
         # Stage 2: Medium (0.3-0.5m) - approaching zone
-        stage_reward = 3.0 + (0.5 - avg_finger_dist) * 5.0  # 3.0 to 4.0
+        stage_reward = 3.0 + (0.5 - avg_finger_dist) * 8.0  # 3.0 to 4.6 (was 4.0)
+        # Milestone: entering approach zone
+        if prev_distance is not None and prev_distance > 0.5 and avg_finger_dist < 0.5:
+            milestone_bonus = 2.0
     elif avg_finger_dist > 0.15:
         # Stage 3: Close (0.15-0.3m) - near grasp zone
-        stage_reward = 4.0 + (0.3 - avg_finger_dist) * 10.0  # 4.0 to 5.5
+        stage_reward = 4.6 + (0.3 - avg_finger_dist) * 12.0  # 4.6 to 6.4 (boosted)
+        # Milestone: entering grasp zone
+        if prev_distance is not None and prev_distance > 0.3 and avg_finger_dist < 0.3:
+            milestone_bonus = 3.0
     elif avg_finger_dist > 0.08:
         # Stage 4: Very close (0.08-0.15m) - pre-grasp
-        stage_reward = 5.5 + (0.15 - avg_finger_dist) * 20.0  # 5.5 to 6.9
+        stage_reward = 6.4 + (0.15 - avg_finger_dist) * 20.0  # 6.4 to 7.8
     else:
         # Stage 5: Extremely close (<0.08m) - grasp range!
 
         # 5.5 + (0.15 - 0.08) * 20.0 = 5.5 + 0.07 * 20 = 5.5 + 1.4 = 6.9
         # 6.9 from prev stage
-        stage_reward = 6.9 + (0.08 - avg_finger_dist) * 50.0  # 6.9 to 10.9
+        stage_reward = 7.8 + (0.08 - avg_finger_dist) * 50.0  # 7.8 to 11.8
 
     # === PROGRESS REWARD ===
     # HUGE bonus for moving closer, HUGE penalty for moving away
@@ -511,6 +544,25 @@ def compute_reward(
         if delta < 0:  # Moving away from cube!
             progress_reward *= 3.0  # Triple the penalty!
 
+    # === VELOCITY REWARD ===
+    # Encourage faster movement toward cube
+    velocity_reward = 0.0
+    if prev_ee_pos is not None:
+        ee_velocity = np.linalg.norm(ee_pos - prev_ee_pos)
+        to_cube = ball_pos - ee_pos
+        to_cube_norm = to_cube / (np.linalg.norm(to_cube) + 1e-8)
+        ee_motion = ee_pos - prev_ee_pos
+
+        # Check if moving toward cube
+        if np.linalg.norm(ee_motion) > 1e-6:
+            ee_motion_norm = ee_motion / np.linalg.norm(ee_motion)
+            toward_alignment = np.dot(ee_motion_norm, to_cube_norm)
+
+            if toward_alignment > 0:  # Moving toward cube
+                velocity_reward = ee_velocity * toward_alignment * (1.0 - avg_finger_dist) * 3.0
+            else:  # Moving away
+                velocity_reward = ee_velocity * toward_alignment * 1.5  # Penalty
+
     # === ALIGNMENT REWARD ===
     # Encourage approaching from above (proper grasp orientation)
     finger_center = (left_finger + right_finger) / 2.0
@@ -519,7 +571,7 @@ def compute_reward(
         approach_vector = approach_vector / np.linalg.norm(approach_vector)
         # Bigger bonus when close and properly aligned
         if avg_finger_dist < 0.2:
-            alignment_reward = max(0.0, approach_vector[2]) * 1.0
+            alignment_reward = max(0.0, approach_vector[2]) * 1.5  # Boosted from 1.0
         else:
             alignment_reward = max(0.0, approach_vector[2]) * 0.3
     else:
@@ -532,7 +584,7 @@ def compute_reward(
         if gripper_pos < 10.0:  # Gripper is open (good!)
             gripper_control_reward = 0.5
         else:  # Gripper closing too early (bad)
-            gripper_control_reward = -0.3
+            gripper_control_reward = -0.1  # Was -0.3
     elif avg_finger_dist > 0.08:
         # Medium close: start closing slightly
         optimal_gripper = 15.0
@@ -540,7 +592,7 @@ def compute_reward(
     else:
         # Very close: want gripper CLOSING
         if gripper_pos > 20.0:  # Gripper is closing (good!)
-            gripper_control_reward = (gripper_pos / 40.0) * 1.0
+            gripper_control_reward = (gripper_pos / 40.0) * 1.5  # Boosted from 1.0
         else:  # Gripper still open (bad)
             gripper_control_reward = -0.2
 
@@ -566,11 +618,13 @@ def compute_reward(
 
     # === TOTAL REWARD ===
     total_reward = (
-        stage_reward  # Stage-based distance (0.5 to 10.9)
+        stage_reward  # Stage-based distance (0.5 to 11.8)
+        + milestone_bonus  # Threshold crossing (0 to 3.0)
         + distance_penalty  # Penalty for being far (-inf to 0)
         + progress_reward  # Progress toward cube (-inf to +inf)
-        + alignment_reward  # Approach angle (0 to 1.0)
-        + gripper_control_reward  # Gripper timing (-0.3 to 1.0)
+        + velocity_reward  # Movement speed bonus (-inf to +inf)
+        + alignment_reward  # Approach angle (0 to 1.5)
+        + gripper_control_reward  # Gripper timing (-0.2 to 1.5)
         + height_penalty  # Safety (-1.0 to 0)
         + grasp_reward  # Grasp success (0 to 30)
     )
@@ -578,10 +632,24 @@ def compute_reward(
     # normalize at the end: reward in their scope -> normalize / clip at the end
 
     # Normalize to [0, 1] - adjusted range to account for distance penalty
-    # Typical range: -10 to 50 (accounting for distance penalty)
-    normalized_reward = np.clip((total_reward + 10.0) / 60.0, 0.0, 1.0)
+    # Typical range: -10 to 60 (accounting for distance penalty + boosts)
+    normalized_reward = np.clip((total_reward + 10.0) / 70.0, 0.0, 1.0)
 
-    return normalized_reward, avg_finger_dist
+    # Debug breakdown (return for logging)
+    reward_breakdown = {
+        'stage': stage_reward,
+        'milestone': milestone_bonus if 'milestone_bonus' in locals() else 0.0,
+        'dist_penalty': distance_penalty,
+        'progress': progress_reward,
+        'velocity': velocity_reward if 'velocity_reward' in locals() else 0.0,
+        'alignment': alignment_reward,
+        'gripper': gripper_control_reward,
+        'height': height_penalty,
+        'grasp': grasp_reward,
+        'total_raw': total_reward,
+    }
+
+    return normalized_reward, avg_finger_dist, reward_breakdown
 
 
 # === PURE RL LEARNING ===
@@ -593,10 +661,12 @@ try:
     for episode in range(MAX_EPISODES):
         print(f"\n===== Episode {episode+1}/{MAX_EPISODES} =====")
 
-        cube_x, cube_y = reset_environment()
+        cube_x, cube_y = reset_environment(episode)
         episode_reward = 0.0
         episode_loss = []
         prev_finger_distance = None  # Track previous distance for penalty/reward
+        prev_ee_pos = None  # Track previous EE position for velocity reward
+        closest_dist = float('inf')  # Track closest approach
 
         for step in range(MAX_STEPS_PER_EPISODE):
             my_world.step(render=True)
@@ -658,9 +728,16 @@ try:
             action = agent.get_action(state, deterministic=False)
 
             # Action format: [delta_x, delta_y, delta_z, gripper_delta]
-            # Scale actions for smoother movement
-            position_scale = 0.05  # 5cm max movement per step
-            gripper_scale = 2.0  # Gripper change rate
+            # Adaptive scaling based on distance - bolder when far, careful when close
+            finger_center = (left_finger + right_finger) / 2.0
+            current_dist = np.linalg.norm(finger_center - ball_pos)
+
+            if current_dist > 0.3:  # Far: bolder moves
+                position_scale = 0.08  # 8cm max movement per step
+            else:  # Close: fine control
+                position_scale = 0.03  # 3cm max movement per step
+
+            gripper_scale = 5.0  # Faster gripper (was 2.0)
 
             # Apply position delta from action
             target_position = ee_pos + action[:3] * position_scale
@@ -733,7 +810,7 @@ try:
             )
 
             # Compute reward with movement penalty/bonus
-            reward, gripper_distance = compute_reward(
+            reward, gripper_distance, breakdown = compute_reward(
                 ee_pos,
                 ball_pos,
                 grasped,
@@ -741,29 +818,41 @@ try:
                 left_finger,
                 right_finger,
                 prev_finger_distance,
+                prev_ee_pos,
             )
+
+            # Track closest distance this episode
+            if gripper_distance < closest_dist:
+                closest_dist = gripper_distance
+
             prev_finger_distance = gripper_distance  # Update for next step
+            prev_ee_pos = ee_pos.copy()  # Update for velocity calc
             episode_reward += reward
 
-            # Log progress every 100 steps
+            # Log progress every 100 steps with breakdown
             if step % 100 == 0:
                 print(
-                    f"  [Step {step}] Reward: {reward:.3f} | Dist: {gripper_distance:.3f}m"
+                    f"  [Step {step}] Reward: {reward:.3f} | Dist: {gripper_distance:.3f}m | Closest: {closest_dist:.3f}m"
                 )
                 print(
                     f"    Fingers→Cube: L={np.linalg.norm(left_finger - ball_pos):.3f} R={np.linalg.norm(right_finger - ball_pos):.3f}"
                 )
                 print(f"    Gripper: {gripper_pos:.1f}/40.0 | Grasped: {bool(grasped)}")
+                print(
+                    f"    Breakdown: stage={breakdown['stage']:.2f} prog={breakdown['progress']:.2f} "
+                    f"vel={breakdown['velocity']:.2f} grip={breakdown['gripper']:.2f} raw={breakdown['total_raw']:.2f}"
+                )
 
             # Train
             loss = agent.update(state, action, reward, next_state)
             if loss is not None:
                 episode_loss.append(loss)
 
-        # Episode summary
+        # Episode summary with closest approach
         avg_loss = np.mean(episode_loss) if episode_loss else 0.0
         print(
-            f"Episode {episode+1} | Total Reward: {episode_reward:.2f} | Avg Loss: {avg_loss:.4f}"
+            f"\n🎯 Episode {episode+1} | Total Reward: {episode_reward:.2f} | "
+            f"Closest: {closest_dist:.3f}m | Avg Loss: {avg_loss:.4f} | Noise: {agent.noise_scale:.3f}"
         )
         agent.episode_count += 1
         agent.total_reward_history.append(episode_reward)
