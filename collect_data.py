@@ -179,21 +179,40 @@ while simulation_app.is_running():
 
         # Extract action as DELTA (change in joint positions)
         # This is critical: we want to learn changes, not absolute positions!
-        action = np.zeros(6)  # Default fallback
+        # 7-DOF: 6 arm joints + 1 gripper position
+        action = np.zeros(7)  # Default fallback
 
         if hasattr(actions, 'joint_positions') and actions.joint_positions is not None:
             target_positions_full = actions.joint_positions
             # Check if target is valid and contains no None values
             if (target_positions_full is not None and
-                len(target_positions_full) >= 6 and
-                all(x is not None for x in target_positions_full[:6])):
+                len(target_positions_full) >= 12 and
+                all(x is not None for x in target_positions_full[:12])):
                 try:
-                    target_positions = np.array(target_positions_full[:6], dtype=np.float32)
-                    current_positions = np.array(joint_positions[:6], dtype=np.float32)
-                    action = target_positions - current_positions  # DELTA = target - current
+                    # Arm joints delta (6 DOF)
+                    target_arm = np.array(target_positions_full[:6], dtype=np.float32)
+                    current_arm = np.array(joint_positions[:6], dtype=np.float32)
+                    arm_delta = target_arm - current_arm
+
+                    # Gripper action: based on controller phase/event
+                    # Phase 0-2: Approaching cube - gripper OPEN
+                    # Phase 3: Close gripper command
+                    # Phase 4-6: Holding cube - gripper CLOSED
+                    # Phase 7: Open gripper command (RELEASE at target)
+                    # Phase 8-9: After release - gripper OPEN
+                    current_event = my_controller.get_current_event()
+                    if current_event >= 3 and current_event < 7:
+                        # Holding cube (phases 3-6)
+                        gripper_action = np.array([0.0], dtype=np.float32)  # CLOSED
+                    else:
+                        # Approaching (0-2) or releasing/returning (7-9)
+                        gripper_action = np.array([0.628], dtype=np.float32)  # OPEN
+
+                    # Combine: 6 arm deltas + 1 gripper position
+                    action = np.concatenate([arm_delta, gripper_action])
                 except (TypeError, ValueError) as e:
                     # Skip this transition if conversion fails
-                    action = np.zeros(6)
+                    action = np.zeros(7)
 
         # Store transition (state, action, reward, next_state)
         if prev_state is not None and prev_action is not None:

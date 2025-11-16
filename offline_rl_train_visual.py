@@ -41,7 +41,8 @@ class PolicyMLP(nn.Module):
         layers = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
         for _ in range(num_layers - 2):
             layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
-        layers.extend([nn.Linear(hidden_dim, action_dim), nn.Tanh()])
+        # No final activation - output raw deltas
+        layers.append(nn.Linear(hidden_dim, action_dim))
 
         self.network = nn.Sequential(*layers)
 
@@ -213,7 +214,7 @@ while simulation_app.is_running() and train_step_counter < NUM_TRAIN_STEPS:
         my_world.reset()
 
         test_step = 0
-        max_test_steps = 200  # Short test episode
+        max_test_steps = 5000  # Long test episode to allow full pick-and-place
 
         while test_step < max_test_steps:
             my_world.step(render=True)
@@ -242,20 +243,23 @@ while simulation_app.is_running() and train_step_counter < NUM_TRAIN_STEPS:
                     ee_rot,
                 ])
 
-                # Get action DELTA from learned policy
-                policy_action_delta = agent.get_action(current_state)
+                # Get action from learned policy (7-DOF: 6 arm deltas + 1 gripper)
+                policy_action = agent.get_action(current_state)
 
-                # Policy outputs tanh [-1, 1], scale to reasonable joint delta
-                # Max delta per step: ~0.1 radians (~5.7 degrees)
-                delta_scale = 0.1
-                scaled_delta = policy_action_delta * delta_scale
+                # Extract arm deltas (first 6) and gripper position (7th)
+                arm_deltas = policy_action[:6]
+                gripper_pos = policy_action[6]
 
-                # Apply delta to current joint positions
+                # Apply arm deltas to current joint positions
                 target_joints = joint_positions.copy()
-                target_joints[:6] = joint_positions[:6] + scaled_delta  # Add delta to current
+                target_joints[:6] = joint_positions[:6] + arm_deltas
+
+                # Set gripper position (all gripper joints use same value)
+                target_joints[6:12] = gripper_pos
 
                 # Clip to safe joint limits
                 target_joints[:6] = np.clip(target_joints[:6], -2*np.pi, 2*np.pi)
+                target_joints[6:12] = np.clip(target_joints[6:12], 0, 0.628)  # Gripper limits
 
                 # Apply via articulation controller
                 from isaacsim.core.utils.types import ArticulationAction
