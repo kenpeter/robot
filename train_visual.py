@@ -5,6 +5,13 @@
 VISUAL TESTING - Test Trained Model
 Load trained model and test it in Isaac Sim with visualization
 UPDATED: Added initial position prints; Action safeguards (tanh scaling, smoothing); Multi-episode option
+FIXED: Added initial world reset after task addition to ensure assets (e.g., cube) are spawned before accessing task params
+FIXED: Aligned PolicyMLP architecture to match trained model (removed Dropout layers to fix state_dict key mismatch)
+FIXED: Reduced action scale and increased smoothing for stable arm movements (prevents 'crazy' jerky behavior)
+FIXED: Added stability configurations from Isaac Sim docs: higher solver iterations, low sleep/stabilization thresholds, joint gains/damping, gripper friction materials, and UR10e-specific joint limits to prevent erratic movements
+FIXED: Corrected solver iteration setting to use direct attributes (num_position_iterations, num_velocity_iterations) instead of deprecated/non-existent method; Adjusted prim paths based on logs (/ur instead of /ur10e)
+FIXED: Replaced set_prim_property for sleep/stabilization with Articulation API methods (set_sleep_threshold, set_stabilization_threshold) to avoid USD schema errors
+FIXED: Replaced non-existent set_joint_position_gain/set_joint_velocity_gain with USD prim properties (drive:stiffness, drive:damping, drive:maxForce) on joint prims for proper gain/effort setting
 """
 
 from isaacsim import SimulationApp
@@ -26,6 +33,8 @@ from controller.pick_place import PickPlaceController
 from isaacsim.core.api import World
 from tasks.pick_place import PickPlace
 from isaacsim.core.utils.types import ArticulationAction
+from isaacsim.core.utils.prims import set_prim_property
+from omni.isaac.core.materials import PhysicsMaterial
 
 print("=" * 60)
 print("VISUAL TESTING - Testing Trained Model")
@@ -34,17 +43,13 @@ print("=" * 60)
 
 # === SIMPLE MLP POLICY ===
 class PolicyMLP(nn.Module):
-    def __init__(
-        self, state_dim, action_dim, hidden_dim=256, num_layers=3, dropout=0.1
-    ):
+    def __init__(self, state_dim, action_dim, hidden_dim=256, num_layers=3):
         super().__init__()
         self.action_dim = action_dim
 
-        layers = [nn.Linear(state_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout)]
+        layers = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
         for _ in range(num_layers - 2):
-            layers.extend(
-                [nn.Linear(hidden_dim, hidden_dim), nn.ReLU(), nn.Dropout(dropout)]
-            )
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
         layers.append(nn.Linear(hidden_dim, action_dim))
 
         self.network = nn.Sequential(*layers)
@@ -55,6 +60,11 @@ class PolicyMLP(nn.Module):
 
 # === SETUP ENVIRONMENT ===
 my_world = World(stage_units_in_meters=1.0, physics_dt=1 / 200, rendering_dt=20 / 200)
+
+# FIXED: Stability - Set higher solver iterations globally (direct attributes)
+physics_context = my_world.get_physics_context()
+physics_context.num_position_iterations = 64
+physics_context.num_velocity_iterations = 4
 
 # EXACT same positions as collect_data.py
 target_position = np.array([-0.3, 0.6, 0])
@@ -67,12 +77,56 @@ my_task = PickPlace(
 )
 my_world.add_task(my_task)
 
+# FIXED: Reset world after adding task to spawn assets (cube, robot, etc.) before accessing params
+my_world.reset()
+
 task_params = my_world.get_task("ur10e_pick_place").get_params()
 ur10e_name = task_params["robot_name"]["value"]
 my_ur10e = my_world.scene.get_object(ur10e_name)
 articulation_controller = my_ur10e.get_articulation_controller()
 
-print("✓ Environment initialized")
+# FIXED: Stability - Set low sleep/stabilization thresholds using Articulation API (avoids USD schema issues)
+my_ur10e.set_sleep_threshold(0.00005)
+my_ur10e.set_stabilization_threshold(0.00001)
+
+# FIXED: Stability - Set joint gains/damping/max_force using USD properties on joint prims (for SingleManipulator/Articulation)
+stiffness = 1e5  # High for position accuracy
+damping = 1e4  # High for velocity damping to prevent oscillations
+arm_max_force = 500  # Reasonable torque limit for arm
+gripper_max_force = 200  # For gripper
+
+joint_names = my_ur10e.get_joint_names()  # Get all joint names
+for i, joint_name in enumerate(joint_names):
+    joint_path = f"{my_ur10e.prim_path}/{joint_name}"
+    # Set gains (applies to all joints; adjust per-joint if needed)
+    set_prim_property(joint_path, "drive:stiffness", stiffness)
+    set_prim_property(joint_path, "drive:damping", damping)
+    # Set effort limits (arm: first 6, gripper: index 6)
+    max_f = arm_max_force if i < 6 else gripper_max_force
+    set_prim_property(joint_path, "drive:maxForce", max_f)
+
+# FIXED: Stability - Add physics materials to gripper fingers for high friction (prevents slip/unstable grasp); Wrapped in try-except to handle path issues
+try:
+    # Create material
+    gripper_material = PhysicsMaterial(
+        prim_path="/physics_materials/gripper_material",
+        static_friction=1.0,
+        dynamic_friction=1.0,
+        restitution=0.0,
+    )
+    # Apply to finger visuals (logs show visuals/mesh_1 exists; collisions may be separate—focus on visuals for friction)
+    gripper_material.apply_to(
+        "/ur/ee_link/robotiq_arg2f_base_link/left_inner_finger/visuals/mesh_1"
+    )
+    gripper_material.apply_to(
+        "/ur/ee_link/robotiq_arg2f_base_link/right_inner_finger/visuals/mesh_1"
+    )
+    print("✓ Gripper friction material applied")
+except Exception as e:
+    print(f"⚠ Warning: Could not apply gripper material: {e}")
+    print("  (Non-fatal; check stage for exact finger prim paths if needed)")
+
+print("✓ Environment initialized with stability configurations")
 
 # === LOAD MODEL ===
 MODEL_FILE = "/home/kenpeter/work/robot/offline_rl_model.pth"
@@ -165,15 +219,15 @@ for episode in range(num_episodes):
                 state_tensor = torch.FloatTensor(current_state).unsqueeze(0).to("cuda")
                 policy_action = model(state_tensor).cpu().numpy()[0]
 
-            # UPDATED: Safeguards - Tanh scaling + smoothing + clipping
+            # FIXED: Smaller delta scale (pi/8) + stronger smoothing (0.9 prev + 0.1 new) for stability
             arm_deltas_raw = np.tanh(policy_action[:6]) * (
-                np.pi / 4
-            )  # Bound deltas [-π/4, π/4]
+                np.pi / 8
+            )  # Bound deltas [-π/8, π/8] ~0.39 rad/step
             gripper_target_raw = np.clip(policy_action[6], 0, 0.628)
 
             # Smooth
             raw_action = np.concatenate([arm_deltas_raw, [gripper_target_raw]])
-            smoothed_action = 0.8 * smoothed_action + 0.2 * raw_action
+            smoothed_action = 0.9 * smoothed_action + 0.1 * raw_action
             arm_deltas = smoothed_action[:6]
             gripper_target = smoothed_action[6]
 
@@ -182,8 +236,16 @@ for episode in range(num_episodes):
             target_joints[:6] = joint_positions[:6] + arm_deltas
             target_joints[6:12] = gripper_target
 
-            # Clip limits
-            target_joints[:6] = np.clip(target_joints[:6], -2 * np.pi, 2 * np.pi)
+            # Clip limits (UR10e-specific: J0 ±2π, J1/J2 -2π to 0, J3-5 ±2π)
+            arm_limits_low = np.array(
+                [-2 * np.pi, -2 * np.pi, -2 * np.pi, -2 * np.pi, -2 * np.pi, -2 * np.pi]
+            )
+            arm_limits_high = np.array(
+                [2 * np.pi, 0, 0, 2 * np.pi, 2 * np.pi, 2 * np.pi]
+            )
+            target_joints[:6] = np.clip(
+                target_joints[:6], arm_limits_low, arm_limits_high
+            )
             target_joints[6:12] = np.clip(target_joints[6:12], 0, 0.628)
 
             # Apply
@@ -196,8 +258,12 @@ for episode in range(num_episodes):
                 print(
                     f"  [Ep {episode+1} Step {test_step}]: Dist cube: {dist_to_cube:.3f} | Grasped: {grasped} | Dist target: {dist_to_target:.3f}"
                 )
-                print(f"             Policy arm_delta: {arm_deltas}")
-                print(f"             Policy gripper: {gripper_target:.3f}")
+                print(
+                    f"             Policy raw: {policy_action[:6].round(3)} | Gripper raw: {policy_action[6]:.3f}"
+                )
+                print(
+                    f"             Applied delta: {arm_deltas.round(3)} | Gripper: {gripper_target:.3f}"
+                )
 
             # Early stop
             if grasped and dist_to_target < 0.05:
