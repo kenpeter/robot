@@ -99,7 +99,8 @@ class PolicyMLP(nn.Module):
         super().__init__()
         self.action_dim = action_dim
 
-        # state: 6 arm joints ->  6 gripper mimic joints (left finger 3 joints, right finger 3 joints) -> end effector (3) -> left finger (3) -> right finger (3) -> rasp status (1) -> ball posi (3)
+        # 6 arm joints -> 6 finger joints -> end effector -> left finger -> right finger -> grasp status -> cube posi
+        # state: 6 arm joints ->  6 gripper mimic joints (left finger 3 joints, right finger 3 joints) -> end effector (3) -> left finger (3) -> right finger (3) -> grasp status (1) -> ball posi (3)
         # action state: delta x (1) -> d y (1) -> d z (1) -> gripper open close (1) = 4
 
         # linear 2 -> 3: 1x2 * 2x3 -> 1x3
