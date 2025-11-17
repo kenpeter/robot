@@ -46,6 +46,7 @@ print("PURE RL GRASPING - SUPER SIMPLE REWARD")
 print("Reward components:")
 print("  1. Distance: exp(-4 * avg_finger_dist) * 2")
 print("  2. Smoothness penalty: joint_movement * 0.3")
+print("  3. Normalized to [0, 1] with clip")
 print("=" * 60)
 
 
@@ -566,7 +567,12 @@ def compute_reward_simple(
 
     total_reward = distance_reward - smoothness_penalty
 
-    return total_reward, avg_finger_dist
+    # Normalize to [0, 1]
+    # Distance reward range: [0, 2], smoothness penalty range: [0, ~1]
+    # Total range: [-1, 2] → shift and scale to [0, 1]
+    normalized_reward = np.clip((total_reward + 1.0) / 3.0, 0.0, 1.0)
+
+    return normalized_reward, avg_finger_dist
 
 
 # === PURE RL LEARNING ===
