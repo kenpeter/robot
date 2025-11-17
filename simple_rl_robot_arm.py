@@ -559,7 +559,7 @@ def compute_reward_simple(
 
     distance_reward = np.exp(-4.0 * avg_finger_dist) * 2.0
 
-    # pan (base) -> lift -> elbow -> elbow -> wrist 1 -> w2 -> w3
+    # pan (base) -> elbow1 (lift) -> elbow2 -> elbow3 -> wrist 1 -> w2 -> w3
     """
     # joint_positions structure:
         [
