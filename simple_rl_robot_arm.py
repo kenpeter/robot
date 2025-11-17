@@ -42,11 +42,11 @@ from isaacsim.robot_motion.motion_generation import (
 )
 
 print("=" * 60)
-print("PURE RL GRASPING - SUPER SIMPLE REWARD")
+print("PURE RL GRASPING - SIMPLE BUT DENSE REWARD")
 print("Reward components:")
-print("  1. Distance: exp(-4 * avg_finger_dist) * 2")
-print("  2. Smoothness penalty: joint_movement * 0.3")
-print("  3. Normalized to [0, 1] with clip")
+print("  1. EE progress: (0.5 - min(ee_dist, 0.5)) * 2.0  [always active]")
+print("  2. Finger proximity: max(0.2 - avg_finger_dist, 0.0) * 5.0  [when close]")
+print("  3. Time penalty: -0.005")
 print("=" * 60)
 
 
@@ -99,6 +99,7 @@ class PolicyMLP(nn.Module):
         super().__init__()
         self.action_dim = action_dim
 
+        # linear 2 -> 3: 1x2 * 2x3 -> 1x3
         layers = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
         for _ in range(num_layers - 2):
             layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
@@ -546,55 +547,27 @@ def reset_environment(episode_num=0):
     return FIXED_CUBE_X, FIXED_CUBE_Y
 
 
-# === SUPER SIMPLE REWARD FUNCTION ===
+# === SIMPLE BUT DENSE REWARD FUNCTION ===
 def compute_reward_simple(
-    left_finger, right_finger, ball_pos, joint_positions, prev_joints=None
+    left_finger, right_finger, ball_pos, joint_positions, prev_joints=None, ee_pos=None
 ):
-    """Simple reward with joint smoothness constraint"""
-
-    # Main finger distance reward
-    left_dist = np.linalg.norm(left_finger - ball_pos)
-    right_dist = np.linalg.norm(right_finger - ball_pos)
-    avg_finger_dist = (left_dist + right_dist) / 2.0
-
-    distance_reward = np.exp(-4.0 * avg_finger_dist) * 2.0
-
-    # pan (base) -> elbow1 (lift) -> elbow2 -> elbow3 -> wrist 1 -> w2 -> w3
     """
-    # joint_positions structure:
-        [
-            # === ARM JOINTS (6 DOF) ===
-            0.0,     # [0] shoulder_pan_joint      - Base rotation (left/right)
-            -1.57,   # [1] shoulder_lift_joint     - Shoulder up/down  
-            1.57,    # [2] elbow_joint             - Elbow bend
-            -1.57,   # [3] wrist_1_joint           - Wrist rotation
-            -1.57,   # [4] wrist_2_joint           - Wrist bend
-            0.0,     # [5] wrist_3_joint           - Wrist rotation
-            
-            # === GRIPPER MIMIC JOINTS (6 joints) ===
-            0.0,     # [6] finger_joint            - ACTUAL gripper control
-            0.0,     # [7] left_inner_knuckle_joint
-            0.0,     # [8] left_inner_finger_joint  
-            0.0,     # [9] right_inner_knuckle_joint
-            0.0,     # [10] right_inner_finger_joint
-            0.0      # [11] right_outer_knuckle_joint
-        ]
+    SIMPLE but DENSE reward - just 3 components
     """
+    # 1. End effector progress (always active)
+    ee_dist = np.linalg.norm(ee_pos - ball_pos)
+    ee_reward = (0.5 - min(ee_dist, 0.5)) * 2.0  # Linear: 1.0 at 0m, 0.0 at 0.5m
 
-    # Simple joint smoothness penalty
-    smoothness_penalty = 0.0
-    if prev_joints is not None:
-        joint_movement = np.linalg.norm(joint_positions[:6] - prev_joints[:6])
-        smoothness_penalty = joint_movement * 0.3
+    # 2. Finger proximity (activates when close)
+    avg_finger_dist = (np.linalg.norm(left_finger - ball_pos) + np.linalg.norm(right_finger - ball_pos)) / 2.0
+    finger_reward = max(0.2 - avg_finger_dist, 0.0) * 5.0  # Bonus when very close
 
-    total_reward = distance_reward - smoothness_penalty
+    # 3. Time penalty
+    time_penalty = 0.005
 
-    # Normalize to [0, 1]
-    # Distance reward range: [0, 2], smoothness penalty range: [0, ~1]
-    # Total range: [-1, 2] → shift and scale to [0, 1]
-    normalized_reward = np.clip((total_reward + 1.0) / 3.0, 0.0, 1.0)
+    total_reward = ee_reward + finger_reward - time_penalty
 
-    return normalized_reward, avg_finger_dist
+    return max(total_reward, 0.0), avg_finger_dist
 
 
 # === PURE RL LEARNING ===
@@ -756,7 +729,7 @@ try:
 
             # Compute reward
             reward, gripper_distance = compute_reward_simple(
-                left_finger, right_finger, ball_pos, joint_positions, prev_joints
+                left_finger, right_finger, ball_pos, joint_positions, prev_joints, ee_pos
             )
 
             # Track closest distance this episode
