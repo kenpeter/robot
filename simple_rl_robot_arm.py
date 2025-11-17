@@ -42,10 +42,9 @@ from isaacsim.robot_motion.motion_generation import (
 )
 
 print("=" * 60)
-print("PURE RL GRASPING - STAGED REWARD SHAPING")
-print("6 stages: >1m, 0.5-1m, 0.3-0.5m, 0.15-0.3m, 0.08-0.15m, <0.08m")
-print("Rewards scale up: closer = much higher reward!")
-print("Components: stage, progress, alignment, gripper, height, grasp")
+print("PURE RL GRASPING - SUPER SIMPLE REWARD")
+print("Reward: exponential based on finger distance to cube")
+print("  closer = higher reward, normalized [0, 1]")
 print("=" * 60)
 
 
@@ -126,7 +125,9 @@ class MLPAgent:
         self.recent_rewards = deque(maxlen=1000)  # Track recent rewards for percentile
         self.buffer_add_count = 0  # Track total attempted adds
         self.buffer_skip_count = 0  # Track filtered experiences
-        self.min_buffer_for_filtering = 200  # Start filtering after this many experiences
+        self.min_buffer_for_filtering = (
+            200  # Start filtering after this many experiences
+        )
         self.last_states = deque(maxlen=50)  # Track recent states for diversity check
 
         self.episode_count = 0
@@ -149,7 +150,9 @@ class MLPAgent:
             if not deterministic:
                 # Separate noise: higher for gripper to force exploration
                 pos_noise = torch.randn_like(action[:, :3]) * self.noise_scale
-                gripper_noise = torch.randn_like(action[:, 3:4]) * self.gripper_noise_scale
+                gripper_noise = (
+                    torch.randn_like(action[:, 3:4]) * self.gripper_noise_scale
+                )
                 noise = torch.cat([pos_noise, gripper_noise], dim=1)
                 action = action + noise
                 action = torch.clamp(action, -1.0, 1.0)
@@ -235,17 +238,25 @@ class MLPAgent:
         # Separate decay: arm decays faster, gripper slower for sustained exploration
         if self.step_count > 100000:  # Late-game: keep exploration alive
             self.noise_scale = max(0.05, self.noise_scale * 0.9995)
-            self.gripper_noise_scale = max(0.10, self.gripper_noise_scale * 0.9998)  # Slower
+            self.gripper_noise_scale = max(
+                0.10, self.gripper_noise_scale * 0.9998
+            )  # Slower
         else:
             self.noise_scale = max(0.02, self.noise_scale * 0.998)
-            self.gripper_noise_scale = max(0.08, self.gripper_noise_scale * 0.999)  # Slower
+            self.gripper_noise_scale = max(
+                0.08, self.gripper_noise_scale * 0.999
+            )  # Slower
 
         if self.step_count % 100 == 0:
             avg_reward = rewards.mean().item()
             # Buffer quality metrics
             skip_rate = (self.buffer_skip_count / max(1, self.buffer_add_count)) * 100
             buffer_fill = (len(self.buffer) / (self.buffer.maxlen or 10000)) * 100
-            reward_threshold = np.percentile(list(self.recent_rewards), 75) if len(self.recent_rewards) >= 100 else 0.0
+            reward_threshold = (
+                np.percentile(list(self.recent_rewards), 75)
+                if len(self.recent_rewards) >= 100
+                else 0.0
+            )
 
             print(
                 f"\n[Step {self.step_count}] Loss: {loss.item():.4f} | Avg Reward: {avg_reward:.3f} | "
@@ -467,7 +478,9 @@ def reset_environment(episode_num=0):
     FIXED_CUBE_Z = cube_size / 2.0 + np.random.uniform(0.0, 0.01)  # Tiny Z variation
 
     if episode_num % 20 == 0:
-        print(f"📍 Curriculum: Cube @ ({FIXED_CUBE_X:.3f}, {FIXED_CUBE_Y:.3f}, {FIXED_CUBE_Z:.3f}) | Factor: {curriculum_factor:.2f}")
+        print(
+            f"📍 Curriculum: Cube @ ({FIXED_CUBE_X:.3f}, {FIXED_CUBE_Y:.3f}, {FIXED_CUBE_Z:.3f}) | Factor: {curriculum_factor:.2f}"
+        )
 
     cube_prim = stage.GetPrimAtPath(Sdf.Path("/World/Cube"))
     xform = UsdGeom.Xformable(cube_prim)
@@ -491,7 +504,7 @@ def reset_environment(episode_num=0):
             [
                 0.0,
                 -np.pi / 4,  # Less raised
-                np.pi / 3,    # More extended
+                np.pi / 3,  # More extended
                 -np.pi / 2,
                 -np.pi / 2,
                 0.0,
@@ -531,7 +544,7 @@ def reset_environment(episode_num=0):
     return FIXED_CUBE_X, FIXED_CUBE_Y
 
 
-# === STAGED DENSE REWARD SHAPING ===
+# === SUPER SIMPLE REWARD FUNCTION ===
 def compute_reward(
     ee_pos,
     ball_pos,
@@ -543,192 +556,30 @@ def compute_reward(
     prev_ee_pos=None,
     stuck_steps=0,
 ):
-    """STAGED reward shaping - bigger rewards as fingers get closer!"""
+    """Super simple: just reward fingers close to cube"""
 
-    # Calculate distances
+    # finger to cube -> 1/np.exp -> avg_finger_dist / max_dist exp index less -> bigger -> clip [0, 1] -> return
+
+    # Calculate average finger distance to cube
     left_dist = np.linalg.norm(left_finger - ball_pos)
     right_dist = np.linalg.norm(right_finger - ball_pos)
     avg_finger_dist = (left_dist + right_dist) / 2.0
 
-    # === DISTANCE PENALTY ===
-    # Add penalty when fingers are far from cube
-    distance_penalty = 0.0
-    if avg_finger_dist > 0.5:
-        # Penalize being far away - scales quadratically
-        distance_penalty = -((avg_finger_dist - 0.5) ** 2) * 2.0
+    # Reward: closer = better (exponential)
+    # 1.5m away → reward ≈ 0
+    # 0.0m away → reward = 1
 
-    # === STAGE-BASED DISTANCE REWARDS ===
-    # Give MUCH higher rewards as we cross closer distance thresholds
-    stage_reward = 0.0
-    milestone_bonus = 0.0  # For crossing thresholds
+    # ur10e arm 1.3m max reach
+    max_dist = 1.5
+    reward = np.exp(-3.0 * avg_finger_dist / max_dist)
 
-    # stage reward: divide flow -> reward base on prev -> heavy reward closer
+    # Normalized to [0, 1]
+    normalized_reward = np.clip(reward, 0.0, 1.0)
 
-    # 1. divide flow into stages: 1.0 to 0.08 -> divide them into stages -> then reward
-    # 2. heavy reward if closer: closer -> heavy reward
-    # 3. stage reward base on prev: prev reward -> stage reward
-
-    if avg_finger_dist > 1.0:
-        # Stage 0: Very far (>1m) - small reward just for existing
-        stage_reward = 0.5
-    elif avg_finger_dist > 0.5:
-        # Stage 1: Far (0.5-1m) - reward for getting into range
-        stage_reward = 1.0 + (1.0 - avg_finger_dist) * 2.0  # 1.0 to 3.0
-    elif avg_finger_dist > 0.3:
-        # Stage 2: Medium (0.3-0.5m) - approaching zone
-        stage_reward = 3.0 + (0.5 - avg_finger_dist) * 8.0  # 3.0 to 4.6 (was 4.0)
-        # Milestone: entering approach zone
-        if prev_distance is not None and prev_distance > 0.5 and avg_finger_dist < 0.5:
-            milestone_bonus = 2.0
-    elif avg_finger_dist > 0.15:
-        # Stage 3: Close (0.15-0.3m) - near grasp zone
-        stage_reward = 4.6 + (0.3 - avg_finger_dist) * 12.0  # 4.6 to 6.4 (boosted)
-        # Milestone: entering grasp zone
-        if prev_distance is not None and prev_distance > 0.3 and avg_finger_dist < 0.3:
-            milestone_bonus = 3.0
-    elif avg_finger_dist > 0.08:
-        # Stage 4: Very close (0.08-0.15m) - pre-grasp
-        stage_reward = 6.4 + (0.15 - avg_finger_dist) * 20.0  # 6.4 to 7.8
-    else:
-        # Stage 5: Extremely close (<0.08m) - grasp range!
-
-        # 5.5 + (0.15 - 0.08) * 20.0 = 5.5 + 0.07 * 20 = 5.5 + 1.4 = 6.9
-        # 6.9 from prev stage
-        stage_reward = 7.8 + (0.08 - avg_finger_dist) * 50.0  # 7.8 to 11.8
-
-    # === PROGRESS REWARD ===
-    # HUGE bonus for moving closer, HUGE penalty for moving away
-    progress_reward = 0.0
-    if prev_distance is not None:
-        delta = prev_distance - avg_finger_dist  # positive = closer, negative = farther
-
-        # Scale progress reward based on how close we are (more important when close)
-        if avg_finger_dist < 0.15:
-            progress_reward = delta * 30.0  # Very strong when close!
-        elif avg_finger_dist < 0.3:
-            progress_reward = delta * 20.0  # Strong when near
-        else:
-            progress_reward = delta * 10.0  # Moderate when far
-
-        # EXTRA BONUS if making progress in close zone
-        if avg_finger_dist < 0.5 and delta > 0:
-            progress_reward += 0.8  # Flat bonus for ANY closing step when near
-
-        # EXTRA PENALTY for moving away (negative delta)
-        if delta < 0:  # Moving away from cube!
-            progress_reward *= 3.0  # Triple the penalty!
-
-    # === STUCK PENALTY ===
-    # Penalize hovering without making progress
-    stuck_penalty = 0.0
-    if stuck_steps > 30:  # Stuck for >30 steps
-        stuck_penalty = -0.3 * (stuck_steps / 100.0)  # Gradually increases
-
-    # === VELOCITY REWARD ===
-    # Encourage faster movement toward cube
-    velocity_reward = 0.0
-    if prev_ee_pos is not None:
-        ee_velocity = np.linalg.norm(ee_pos - prev_ee_pos)
-        to_cube = ball_pos - ee_pos
-        to_cube_norm = to_cube / (np.linalg.norm(to_cube) + 1e-8)
-        ee_motion = ee_pos - prev_ee_pos
-
-        # Check if moving toward cube
-        if np.linalg.norm(ee_motion) > 1e-6:
-            ee_motion_norm = ee_motion / np.linalg.norm(ee_motion)
-            toward_alignment = np.dot(ee_motion_norm, to_cube_norm)
-
-            if toward_alignment > 0:  # Moving toward cube
-                velocity_reward = ee_velocity * toward_alignment * (1.0 - avg_finger_dist) * 3.0
-            else:  # Moving away
-                velocity_reward = ee_velocity * toward_alignment * 1.5  # Penalty
-
-    # === ALIGNMENT REWARD ===
-    # Encourage approaching from above (proper grasp orientation)
-    finger_center = (left_finger + right_finger) / 2.0
-    approach_vector = ball_pos - finger_center
-    if np.linalg.norm(approach_vector) > 1e-6:
-        approach_vector = approach_vector / np.linalg.norm(approach_vector)
-        # Bigger bonus when close and properly aligned
-        if avg_finger_dist < 0.2:
-            alignment_reward = max(0.0, approach_vector[2]) * 1.5  # Boosted from 1.0
-        else:
-            alignment_reward = max(0.0, approach_vector[2]) * 0.3
-    else:
-        alignment_reward = 0.0
-
-    # === GRIPPER CONTROL REWARD ===
-    # Open when far, close when near
-    if avg_finger_dist > 0.15:
-        # Far: want gripper OPEN
-        if gripper_pos < 10.0:  # Gripper is open (good!)
-            gripper_control_reward = 0.5
-        else:  # Gripper closing too early (bad)
-            gripper_control_reward = -0.1  # Was -0.3
-    elif avg_finger_dist > 0.08:
-        # Medium close: BOOST reward for starting to close
-        optimal_gripper = 15.0
-        gripper_control_reward = 0.8 - abs(gripper_pos - optimal_gripper) / 40.0 * 0.5
-    else:
-        # Very close: STRONG pull to close gripper
-        if gripper_pos > 20.0:  # Gripper is closing (excellent!)
-            gripper_control_reward = (gripper_pos / 40.0) * 2.5  # Was 1.5 → much stronger
-        else:  # Gripper still open (bad!) - scaled penalty
-            gripper_control_reward = -0.5 * (0.08 - avg_finger_dist) / 0.08  # Worse when very close
-
-    # === HEIGHT SAFETY ===
-    # Penalize going too low
-    height_penalty = 0.0
-    if finger_center[2] < 0.03:
-        height_penalty = -1.0  # Strong penalty!
-    elif finger_center[2] < 0.05:
-        height_penalty = -0.3
-
-    # === GRASP SUCCESS REWARD ===
-    if grasped:
-        grasp_reward = 20.0  # MASSIVE reward for grasping!
-
-        # Extra bonus for lifting the cube
-        if ball_pos[2] > (0.0515 / 2.0 + 0.05):  # Lifted >5cm
-            grasp_reward += 10.0
-        elif ball_pos[2] > (0.0515 / 2.0 + 0.02):  # Lifted >2cm
-            grasp_reward += 5.0
-    else:
-        grasp_reward = 0.0
-
-    # === TOTAL REWARD ===
-    total_reward = (
-        stage_reward  # Stage-based distance (0.5 to 11.8)
-        + milestone_bonus  # Threshold crossing (0 to 3.0)
-        + distance_penalty  # Penalty for being far (-inf to 0)
-        + progress_reward  # Progress toward cube (-inf to +inf)
-        + stuck_penalty  # Stuck hovering penalty (-inf to 0)
-        + velocity_reward  # Movement speed bonus (-inf to +inf)
-        + alignment_reward  # Approach angle (0 to 1.5)
-        + gripper_control_reward  # Gripper timing (-0.2 to 2.5)
-        + height_penalty  # Safety (-1.0 to 0)
-        + grasp_reward  # Grasp success (0 to 30)
-    )
-
-    # normalize at the end: reward in their scope -> normalize / clip at the end
-
-    # Normalize to [0, 1] - adjusted range to account for distance penalty
-    # Typical range: -10 to 60 (accounting for distance penalty + boosts)
-    normalized_reward = np.clip((total_reward + 10.0) / 70.0, 0.0, 1.0)
-
-    # Debug breakdown (return for logging)
+    # Debug breakdown
     reward_breakdown = {
-        'stage': stage_reward,
-        'milestone': milestone_bonus if 'milestone_bonus' in locals() else 0.0,
-        'dist_penalty': distance_penalty,
-        'progress': progress_reward,
-        'stuck': stuck_penalty,
-        'velocity': velocity_reward if 'velocity_reward' in locals() else 0.0,
-        'alignment': alignment_reward,
-        'gripper': gripper_control_reward,
-        'height': height_penalty,
-        'grasp': grasp_reward,
-        'total_raw': total_reward,
+        "distance": reward,
+        "total_raw": reward,
     }
 
     return normalized_reward, avg_finger_dist, reward_breakdown
@@ -748,7 +599,7 @@ try:
         episode_loss = []
         prev_finger_distance = None  # Track previous distance for penalty/reward
         prev_ee_pos = None  # Track previous EE position for velocity reward
-        closest_dist = float('inf')  # Track closest approach
+        closest_dist = float("inf")  # Track closest approach
         stuck_steps = 0  # Track stuck hovering
         min_progress_threshold = 0.003  # Minimum distance change to not be "stuck"
         gripper_positions = []  # Track gripper activity
@@ -895,7 +746,14 @@ try:
             )
 
             # Track stuck detection
-            if prev_finger_distance is not None and abs(prev_finger_distance - np.linalg.norm((left_finger + right_finger) / 2.0 - ball_pos)) < min_progress_threshold:
+            if (
+                prev_finger_distance is not None
+                and abs(
+                    prev_finger_distance
+                    - np.linalg.norm((left_finger + right_finger) / 2.0 - ball_pos)
+                )
+                < min_progress_threshold
+            ):
                 stuck_steps += 1
             else:
                 stuck_steps = 0
@@ -931,11 +789,6 @@ try:
                 )
                 print(
                     f"    Fingers→Cube: L={np.linalg.norm(left_finger - ball_pos):.3f} R={np.linalg.norm(right_finger - ball_pos):.3f}"
-                )
-                print(f"    Gripper: {gripper_pos:.1f}/40.0 | Grasped: {bool(grasped)} | Stuck: {stuck_steps}")
-                print(
-                    f"    Breakdown: stage={breakdown['stage']:.2f} prog={breakdown['progress']:.2f} stuck={breakdown['stuck']:.2f} "
-                    f"vel={breakdown['velocity']:.2f} grip={breakdown['gripper']:.2f} raw={breakdown['total_raw']:.2f}"
                 )
 
             # Train
