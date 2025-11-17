@@ -99,6 +99,9 @@ class PolicyMLP(nn.Module):
         super().__init__()
         self.action_dim = action_dim
 
+        # state: 6 arm joints ->  6 gripper mimic joints (left finger 3 joints, right finger 3 joints) -> end effector (3) -> left finger (3) -> right finger (3) -> rasp status (1) -> ball posi (3)
+        # action state: delta x (1) -> d y (1) -> d z (1) -> gripper open close (1) = 4
+
         # linear 2 -> 3: 1x2 * 2x3 -> 1x3
         layers = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
         for _ in range(num_layers - 2):
@@ -331,6 +334,7 @@ asset_path = (
 )
 robot_prim = add_reference_to_stage(usd_path=asset_path, prim_path="/World/ur")
 
+# gripper hand
 gripper = ParallelGripper(
     end_effector_prim_path="/World/ur/ee_link/robotiq_arg2f_base_link",
     joint_prim_names=["finger_joint"],
@@ -552,22 +556,31 @@ def compute_reward_simple(
     left_finger, right_finger, ball_pos, joint_positions, prev_joints=None, ee_pos=None
 ):
     """
-    SIMPLE but DENSE reward - just 3 components
+    SIMPLE but DENSE reward - just 3 components, normalized to [0, 1]
     """
     # 1. End effector progress (always active)
     ee_dist = np.linalg.norm(ee_pos - ball_pos)
     ee_reward = (0.5 - min(ee_dist, 0.5)) * 2.0  # Linear: 1.0 at 0m, 0.0 at 0.5m
 
     # 2. Finger proximity (activates when close)
-    avg_finger_dist = (np.linalg.norm(left_finger - ball_pos) + np.linalg.norm(right_finger - ball_pos)) / 2.0
-    finger_reward = max(0.2 - avg_finger_dist, 0.0) * 5.0  # Bonus when very close
+    avg_finger_dist = (
+        np.linalg.norm(left_finger - ball_pos) + np.linalg.norm(right_finger - ball_pos)
+    ) / 2.0
+    finger_reward = (
+        max(0.2 - avg_finger_dist, 0.0) * 5.0
+    )  # Bonus when very close (max 1.0)
 
     # 3. Time penalty
     time_penalty = 0.005
 
     total_reward = ee_reward + finger_reward - time_penalty
 
-    return max(total_reward, 0.0), avg_finger_dist
+    # Normalize: range is [-0.005, 2.0] -> normalize to [0, 1]
+    # max possible: ee_reward=1.0 + finger_reward=1.0 - time_penalty=0.005 = 1.995
+    # min possible: ee_reward=0.0 + finger_reward=0.0 - time_penalty=0.005 = -0.005
+    normalized_reward = np.clip((total_reward + 0.005) / 2.0, 0.0, 1.0)
+
+    return normalized_reward, avg_finger_dist
 
 
 # === PURE RL LEARNING ===
@@ -729,7 +742,12 @@ try:
 
             # Compute reward
             reward, gripper_distance = compute_reward_simple(
-                left_finger, right_finger, ball_pos, joint_positions, prev_joints, ee_pos
+                left_finger,
+                right_finger,
+                ball_pos,
+                joint_positions,
+                prev_joints,
+                ee_pos,
             )
 
             # Track closest distance this episode
