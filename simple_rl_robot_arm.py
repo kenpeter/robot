@@ -43,8 +43,9 @@ from isaacsim.robot_motion.motion_generation import (
 
 print("=" * 60)
 print("PURE RL GRASPING - SUPER SIMPLE REWARD")
-print("Reward: exponential based on finger distance to cube")
-print("  closer = higher reward, normalized [0, 1]")
+print("Reward components:")
+print("  1. Distance: exp(-4 * avg_finger_dist) * 2")
+print("  2. Smoothness penalty: joint_movement * 0.3")
 print("=" * 60)
 
 
@@ -545,45 +546,27 @@ def reset_environment(episode_num=0):
 
 
 # === SUPER SIMPLE REWARD FUNCTION ===
-def compute_reward(
-    ee_pos,
-    ball_pos,
-    grasped,
-    gripper_pos,
-    left_finger,
-    right_finger,
-    prev_distance=None,
-    prev_ee_pos=None,
-    stuck_steps=0,
+def compute_reward_simple(
+    left_finger, right_finger, ball_pos, joint_positions, prev_joints=None
 ):
-    """Super simple: just reward fingers close to cube"""
+    """Simple reward with joint smoothness constraint"""
 
-    # finger to cube -> avg_finger_dist / max_dist -> want smaller -> 1 / np.exp -> big reward -> clip (normlized) -> return
-
-    # Calculate average finger distance to cube
+    # Main finger distance reward
     left_dist = np.linalg.norm(left_finger - ball_pos)
     right_dist = np.linalg.norm(right_finger - ball_pos)
     avg_finger_dist = (left_dist + right_dist) / 2.0
 
-    # Reward: closer = better (exponential)
-    # 1.5m away → reward ≈ 0
-    # 0.0m away → reward = 1
+    distance_reward = np.exp(-4.0 * avg_finger_dist) * 2.0
 
-    # ur10e arm 1.3m max reach
-    max_dist = 1.5
-    reward = np.exp(-3.0 * avg_finger_dist / max_dist)
+    # Simple joint smoothness penalty
+    smoothness_penalty = 0.0
+    if prev_joints is not None:
+        joint_movement = np.linalg.norm(joint_positions[:6] - prev_joints[:6])
+        smoothness_penalty = joint_movement * 0.3
 
-    # Normalized to [0, 1]
-    normalized_reward = np.clip(reward, 0.0, 1.0)
+    total_reward = distance_reward - smoothness_penalty
 
-    # Debug breakdown
-    reward_breakdown = {
-        "distance": reward,
-        "total_raw": reward,
-    }
-
-    # return normalized reward, avg finger dist, break down reward
-    return normalized_reward, avg_finger_dist, reward_breakdown
+    return total_reward, avg_finger_dist
 
 
 # === PURE RL LEARNING ===
@@ -598,11 +581,8 @@ try:
         cube_x, cube_y = reset_environment(episode)
         episode_reward = 0.0
         episode_loss = []
-        prev_finger_distance = None  # Track previous distance for penalty/reward
-        prev_ee_pos = None  # Track previous EE position for velocity reward
+        prev_joints = None  # Track previous joint positions for smoothness
         closest_dist = float("inf")  # Track closest approach
-        stuck_steps = 0  # Track stuck hovering
-        min_progress_threshold = 0.003  # Minimum distance change to not be "stuck"
         gripper_positions = []  # Track gripper activity
 
         for step in range(MAX_STEPS_PER_EPISODE):
@@ -746,30 +726,9 @@ try:
                 ]
             )
 
-            # Track stuck detection
-            if (
-                prev_finger_distance is not None
-                and abs(
-                    prev_finger_distance
-                    - np.linalg.norm((left_finger + right_finger) / 2.0 - ball_pos)
-                )
-                < min_progress_threshold
-            ):
-                stuck_steps += 1
-            else:
-                stuck_steps = 0
-
-            # Compute reward with movement penalty/bonus
-            reward, gripper_distance, breakdown = compute_reward(
-                ee_pos,
-                ball_pos,
-                grasped,
-                gripper_pos,
-                left_finger,
-                right_finger,
-                prev_finger_distance,
-                prev_ee_pos,
-                stuck_steps,
+            # Compute reward
+            reward, gripper_distance = compute_reward_simple(
+                left_finger, right_finger, ball_pos, joint_positions, prev_joints
             )
 
             # Track closest distance this episode
@@ -779,8 +738,8 @@ try:
             # Track gripper usage
             gripper_positions.append(gripper_pos)
 
-            prev_finger_distance = gripper_distance  # Update for next step
-            prev_ee_pos = ee_pos.copy()  # Update for velocity calc
+            # Update previous joints for next step
+            prev_joints = joint_positions.copy()
             episode_reward += reward
 
             # Log progress every 100 steps with breakdown
