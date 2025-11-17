@@ -558,7 +558,7 @@ def compute_reward(
 ):
     """Super simple: just reward fingers close to cube"""
 
-    # finger to cube -> 1/np.exp -> avg_finger_dist / max_dist exp index less -> bigger -> clip [0, 1] -> return
+    # finger to cube -> avg_finger_dist / max_dist -> want smaller -> 1 / np.exp -> big reward -> clip (normlized) -> return
 
     # Calculate average finger distance to cube
     left_dist = np.linalg.norm(left_finger - ball_pos)
@@ -582,6 +582,7 @@ def compute_reward(
         "total_raw": reward,
     }
 
+    # return normalized reward, avg finger dist, break down reward
     return normalized_reward, avg_finger_dist, reward_breakdown
 
 
