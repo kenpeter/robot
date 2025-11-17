@@ -559,6 +559,28 @@ def compute_reward_simple(
 
     distance_reward = np.exp(-4.0 * avg_finger_dist) * 2.0
 
+    # pan (base) -> lift -> elbow -> wrist 1 -> w2 -> w3
+    """
+    # joint_positions structure:
+        [
+            # === ARM JOINTS (6 DOF) ===
+            0.0,     # [0] shoulder_pan_joint      - Base rotation (left/right)
+            -1.57,   # [1] shoulder_lift_joint     - Shoulder up/down  
+            1.57,    # [2] elbow_joint             - Elbow bend
+            -1.57,   # [3] wrist_1_joint           - Wrist rotation
+            -1.57,   # [4] wrist_2_joint           - Wrist bend
+            0.0,     # [5] wrist_3_joint           - Wrist rotation
+            
+            # === GRIPPER MIMIC JOINTS (6 joints) ===
+            0.0,     # [6] finger_joint            - ACTUAL gripper control
+            0.0,     # [7] left_inner_knuckle_joint
+            0.0,     # [8] left_inner_finger_joint  
+            0.0,     # [9] right_inner_knuckle_joint
+            0.0,     # [10] right_inner_finger_joint
+            0.0      # [11] right_outer_knuckle_joint
+        ]
+    """
+
     # Simple joint smoothness penalty
     smoothness_penalty = 0.0
     if prev_joints is not None:
