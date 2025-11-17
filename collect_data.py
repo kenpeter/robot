@@ -11,10 +11,13 @@ Combines expert demonstrations with exploration noise for better generalization
 - Saves (state, action, reward, next_state) transitions to pickle
 """
 
+# sim app
 from isaacsim import SimulationApp
 
+# with ui
 simulation_app = SimulationApp({"headless": False})
 
+# np, pickle, sys, os
 import numpy as np
 import pickle
 import sys
@@ -24,8 +27,13 @@ import os
 ur10e_path = "/home/kenpeter/work/isaac-sim-standalone-5.1.0-linux-x86_64/standalone_examples/api/isaacsim.robot.manipulators/ur10e"
 sys.path.insert(0, ur10e_path)
 
+# pick and place controller
 from controller.pick_place import PickPlaceController
+
+# world
 from isaacsim.core.api import World
+
+# pick place
 from tasks.pick_place import PickPlace
 
 
@@ -96,7 +104,9 @@ def random_cube_position(workspace_center=np.array([0.3, 0.3, 0.3]), radius=0.2)
     return pos
 
 
-def random_target_position(workspace_center=np.array([-0.3, 0.6, 0.02575]), radius=0.15):
+def random_target_position(
+    workspace_center=np.array([-0.3, 0.6, 0.02575]), radius=0.15
+):
     """Generate random target position within workspace"""
     offset = np.random.uniform(-radius, radius, 3)
     offset[2] = 0  # Keep on table
@@ -111,20 +121,27 @@ my_world = World(stage_units_in_meters=1.0, physics_dt=1 / 200, rendering_dt=20 
 # Initial default positions
 target_position = np.array([-0.3, 0.6, 0.02575])
 
+
+# flow: reset world -> add task -> get arm -> get controller -> get cube
+
+# reset
+my_world.reset()
+
+# task: task -> no arm, no cube -> reset -> add
 my_task = PickPlace(
     name="ur10e_pick_place",
     target_position=target_position,
     cube_size=np.array([0.1, 0.0515, 0.1]),
 )
+# my world add task
 my_world.add_task(my_task)
-my_world.reset()
 
-# Get robot
+# get ur10e: get task param -> get ur10e name -> get actual ur10e
 task_params = my_world.get_task("ur10e_pick_place").get_params()
 ur10e_name = task_params["robot_name"]["value"]
 my_ur10e = my_world.scene.get_object(ur10e_name)
 
-# Initialize controller
+# pick place controller
 my_controller = PickPlaceController(
     name="controller", robot_articulation=my_ur10e, gripper=my_ur10e.gripper
 )
@@ -136,8 +153,8 @@ cube_obj = my_world.scene.get_object(cube_name)
 
 # === DATA COLLECTION PARAMETERS ===
 all_transitions = []
-num_episodes = 50  # INCREASED: More episodes for much more diversity (was 20)
-exploration_prob = 0.5  # INCREASED: 50% exploration actions for max diversity (was 0.3)
+num_episodes = 30  # Multiple episodes with varied positions for DAgger
+exploration_prob = 0.0  # PURE BEHAVIOR CLONING: Store exact expert actions only
 noise_scale = 0.15  # INCREASED: Higher noise for more exploration (was 0.1)
 
 print("=" * 60)
@@ -147,8 +164,8 @@ print(f"Exploration probability: {exploration_prob:.1%}")
 print("=" * 60)
 
 for episode in range(num_episodes):
-    # RANDOMIZE positions for each episode
-    if episode % 3 == 0:  # Every 3rd episode, use default positions
+    # VARIED positions for diverse dataset (DAgger)
+    if episode % 5 == 0:  # Every 5th episode, use default
         cube_start_pos = np.array([0.3, 0.3, 0.3])
         target_pos = np.array([-0.3, 0.6, 0.02575])
     else:
@@ -175,7 +192,9 @@ for episode in range(num_episodes):
     task_completed = False
     step_count = 0
 
-    print(f"\nEpisode {episode+1}: Cube: {cube_start_pos.round(3)} | Target: {target_pos.round(3)}")
+    print(
+        f"\nEpisode {episode+1}: Cube: {cube_start_pos.round(3)} | Target: {target_pos.round(3)}"
+    )
 
     while simulation_app.is_running():
         my_world.step(render=True)
@@ -236,7 +255,7 @@ for episode in range(num_episodes):
                 end_effector_offset=np.array([0, 0, 0.20]),
             )
 
-            # Extract expert action as DELTA (7-DOF)
+            # Extract expert action as ABSOLUTE POSITIONS (7-DOF) for exact cloning
             expert_action = np.zeros(7)
 
             if (
@@ -250,11 +269,10 @@ for episode in range(num_episodes):
                     and all(x is not None for x in target_positions_full[:6])
                 ):
                     try:
+                        # STORE ABSOLUTE TARGET POSITIONS (not deltas!)
                         target_arm = np.array(
                             target_positions_full[:6], dtype=np.float32
                         )
-                        current_arm = np.array(joint_positions[:6], dtype=np.float32)
-                        arm_delta = target_arm - current_arm
 
                         current_event = my_controller.get_current_event()
                         if current_event >= 3 and current_event < 7:
@@ -262,22 +280,12 @@ for episode in range(num_episodes):
                         else:
                             gripper_action = np.array([0.628], dtype=np.float32)
 
-                        expert_action = np.concatenate([arm_delta, gripper_action])
+                        expert_action = np.concatenate([target_arm, gripper_action])
                     except (TypeError, ValueError):
                         expert_action = np.zeros(7)
 
-            # EXPLORATION: Add noise with probability
-            if np.random.random() < exploration_prob:
-                # Add Gaussian noise to expert action
-                noise = np.random.normal(0, noise_scale, 7)
-                noise[6] = 0  # Don't add noise to gripper (keep it discrete)
-                action = expert_action + noise
-                # Clip to reasonable ranges
-                action[:6] = np.clip(action[:6], -np.pi/4, np.pi/4)  # Arm deltas
-                action[6] = np.clip(action[6], 0, 0.628)  # Gripper
-            else:
-                # Use expert action
-                action = expert_action.copy()
+            # PURE BEHAVIOR CLONING: Store exact expert action (no exploration noise)
+            action = expert_action.copy()
 
             # Store transition
             if prev_state is not None and prev_action is not None:
@@ -290,7 +298,7 @@ for episode in range(num_episodes):
             prev_dist_to_cube = new_dist_cube
             prev_dist_to_target = new_dist_target
 
-            # Apply action (use expert_actions for actual control, but store mixed action)
+            # Apply exact expert action
             articulation_controller.apply_action(expert_actions)
 
             step_count += 1
