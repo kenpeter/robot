@@ -315,7 +315,7 @@ def compute_reward(ee_pos, ball_pos, gripper_val, prev_dist):
 
 # === TRAINING LOOP ===
 MAX_EPISODES = 1000
-MAX_STEPS = 1500
+MAX_STEPS = 2000
 
 print("Starting DDPG Training...")
 
