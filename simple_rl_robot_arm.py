@@ -149,6 +149,7 @@ class DDPGAgent:
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)  # Clip gradients
         self.critic_optimizer.step()
 
         # 2. Train Actor
@@ -157,6 +158,7 @@ class DDPGAgent:
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)  # Clip gradients
         self.actor_optimizer.step()
 
         # 3. Soft Update Target Networks
@@ -294,10 +296,10 @@ def get_fingers(ee_pos, ee_rot, gripper_val):
 def compute_reward(ee_pos, ball_pos, gripper_val, prev_dist):
     dist = np.linalg.norm(ee_pos - ball_pos)
 
-    # Shaped Reward (Improvement based)
+    # Shaped Reward (Improvement based) - reduced scale for stability
     # Reward getting closer, penalize moving further
     # Positive if closer, negative if further
-    shaping = (prev_dist - dist) * 100.0
+    shaping = (prev_dist - dist) * 10.0  # Reduced from 100.0 to 10.0
 
     # Grasp Incentive
     grasp_reward = 0.0
@@ -342,7 +344,11 @@ for episode in range(MAX_EPISODES):
         my_world.step(render=False)
 
     episode_reward = 0
-    prev_dist = 10.0
+
+    # Initialize prev_dist properly to avoid huge first reward
+    ee_pos_init, _ = robot.end_effector.get_world_pose()
+    ball_pos_init, _ = ball.get_world_pose()
+    prev_dist = np.linalg.norm(ee_pos_init - ball_pos_init)
 
     for step in range(MAX_STEPS):
         # 1. Get State
