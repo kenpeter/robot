@@ -294,23 +294,21 @@ def get_fingers(ee_pos, ee_rot, gripper_val):
 def compute_reward(ee_pos, ball_pos, gripper_val, prev_dist):
     dist = np.linalg.norm(ee_pos - ball_pos)
 
-    # 1. Reaching Reward (Logarithmic - strong gradient when close)
-    # 1.0 at distance 0, approx 0.0 at distance 0.5
-    reach_reward = 1.0 - np.tanh(5.0 * dist)
+    # Shaped Reward (Improvement based)
+    # Reward getting closer, penalize moving further
+    # Positive if closer, negative if further
+    shaping = (prev_dist - dist) * 100.0
 
-    # 2. Grasp Incentive
+    # Grasp Incentive
     grasp_reward = 0.0
-    if dist < 0.08:  # Very close
-        # Encourage closing gripper
+    if dist < 0.1:  # Increased from 0.08 to 0.1 to make it easier to trigger
         if gripper_val > 20:
-            grasp_reward = 0.5
-            # Bonus if we lifted it (z height check)
+            grasp_reward = 1.0
             if ball_pos[2] > 0.05:
-                grasp_reward += 2.0
+                grasp_reward += 5.0  # Big jackpot for lifting
 
-    # 3. Action penalty (discourage jitter)
-    total = reach_reward + grasp_reward
-    return total * 0.1  # Scale down to roughly [0, 1] range per step
+    # Combine
+    return grasp_reward + shaping
 
 
 # === TRAINING LOOP ===
