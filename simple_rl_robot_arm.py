@@ -89,8 +89,8 @@ class DDPGAgent:
         self.critic_target.load_state_dict(self.critic.state_dict())
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-3)
 
-        self.buffer = deque(maxlen=50000)
-        self.batch_size = 64
+        self.buffer = deque(maxlen=100000)
+        self.batch_size = 256
         self.gamma = 0.99
         self.tau = 0.005  # Soft update rate
 
@@ -348,6 +348,7 @@ for episode in range(MAX_EPISODES):
         my_world.step(render=False)
 
     episode_reward = 0
+    prev_action = np.zeros(4)  # For action smoothing
 
     for step in range(MAX_STEPS):
         # 1. Get State
@@ -365,12 +366,13 @@ for episode in range(MAX_EPISODES):
 
         gripper_val = joint_pos[6] if len(joint_pos) > 6 else 0
 
+        # Normalize observations for stable training
         state = np.concatenate(
             [
-                joint_pos,  # 12
-                delta_pos,  # 3 (Target Vector)
-                ball_pos,  # 3
-                ee_pos,  # 3
+                joint_pos / np.pi,  # 12 - normalized to ~[-1, 1]
+                delta_pos * 2.0,  # 3 - scale relative position
+                ball_pos * 2.0,  # 3 - normalized positions
+                ee_pos * 2.0,  # 3 - normalized positions
                 [gripper_val / 40.0],  # 1 (Normalized gripper)
             ]
         )  # Total 22
@@ -380,7 +382,7 @@ for episode in range(MAX_EPISODES):
 
         # 3. Execute Action (With Clamping)
         # Action is [-1, 1]. Scale to speed.
-        pos_action = action[:3] * 0.05  # 5cm max per step
+        pos_action = action[:3] * 0.02  # 2cm max per step (smoother)
 
         target_pos = ee_pos + pos_action
 
@@ -412,12 +414,19 @@ for episode in range(MAX_EPISODES):
         next_delta = next_ball_pos - next_ee_pos
         next_grip = next_joint_pos[6] if len(next_joint_pos) > 6 else 0
 
+        # Normalize next_state the same way
         next_state = np.concatenate(
-            [next_joint_pos, next_delta, next_ball_pos, next_ee_pos, [next_grip / 40.0]]
+            [next_joint_pos / np.pi, next_delta * 2.0, next_ball_pos * 2.0, next_ee_pos * 2.0, [next_grip / 40.0]]
         )
 
         # 5. Calculate Reward
         reward = compute_reward(next_ee_pos, next_ball_pos, next_grip)
+
+        # Action smoothing penalty - penalize jerky movements
+        action_penalty = -0.5 * np.sum((action - prev_action) ** 2)
+        reward += action_penalty
+        reward = np.clip(reward, -10.0, 10.0)
+        prev_action = action.copy()
 
         # Done condition
         done = False
