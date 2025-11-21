@@ -295,25 +295,26 @@ def get_fingers(ee_pos, ee_rot, gripper_val):
     return ee_pos  # Just return EE center for simple tracking in this snippet
 
 
-def compute_reward(ee_pos, ball_pos, gripper_val, prev_dist):
+def compute_reward(ee_pos, ball_pos, gripper_val):
     dist = np.linalg.norm(ee_pos - ball_pos)
 
-    # Shaped Reward (Improvement based) - reduced scale for stability
-    # Reward getting closer, penalize moving further
-    # Positive if closer, negative if further
-    shaping = (prev_dist - dist) * 10.0  # Reduced from 100.0 to 10.0
+    # Distance-based reward: closer = higher reward (stable, no velocity dependence)
+    # Map distance [0, 1] to reward [10, -10] roughly
+    # At dist=0: reward=10, at dist=0.5: reward=0, at dist>=1: reward=-10
+    dist_reward = 10.0 - 20.0 * min(dist, 1.0)
 
-    # Grasp Incentive
-    grasp_reward = 0.0
-    if dist < 0.1:  # Increased from 0.08 to 0.1 to make it easier to trigger
-        if gripper_val > 20:
-            grasp_reward = 1.0
-            if ball_pos[2] > 0.05:
-                grasp_reward += 5.0  # Big jackpot for lifting
+    # Small bonus for being very close
+    if dist < 0.1:
+        dist_reward += 2.0
 
-    # Combine and clip to [-10, 10]
-    reward = grasp_reward + shaping
-    return np.clip(reward, -10.0, 10.0)
+    # Grasp bonus
+    if dist < 0.1 and gripper_val > 20:
+        dist_reward += 3.0
+        if ball_pos[2] > 0.05:  # Lifted
+            dist_reward += 5.0
+
+    # Clip to [-10, 10]
+    return np.clip(dist_reward, -10.0, 10.0)
 
 
 # === TRAINING LOOP ===
@@ -347,11 +348,6 @@ for episode in range(MAX_EPISODES):
         my_world.step(render=False)
 
     episode_reward = 0
-
-    # Initialize prev_dist properly to avoid huge first reward
-    ee_pos_init, _ = robot.end_effector.get_world_pose()
-    ball_pos_init, _ = ball.get_world_pose()
-    prev_dist = np.linalg.norm(ee_pos_init - ball_pos_init)
 
     for step in range(MAX_STEPS):
         # 1. Get State
@@ -421,8 +417,7 @@ for episode in range(MAX_EPISODES):
         )
 
         # 5. Calculate Reward
-        reward = compute_reward(next_ee_pos, next_ball_pos, next_grip, prev_dist)
-        prev_dist = np.linalg.norm(next_delta)
+        reward = compute_reward(next_ee_pos, next_ball_pos, next_grip)
 
         # Done condition
         done = False
