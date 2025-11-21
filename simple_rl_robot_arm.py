@@ -69,8 +69,10 @@ class Critic(nn.Module):
         return self.l3(x)
 
 
+# deep determine policy agent
 class DDPGAgent:
     def __init__(self, state_dim, action_dim, device="cuda"):
+        # device, state dim, action dim
         self.device = device
         self.state_dim = state_dim
         self.action_dim = action_dim
@@ -309,8 +311,9 @@ def compute_reward(ee_pos, ball_pos, gripper_val, prev_dist):
             if ball_pos[2] > 0.05:
                 grasp_reward += 5.0  # Big jackpot for lifting
 
-    # Combine
-    return grasp_reward + shaping
+    # Combine and clip to [-10, 10]
+    reward = grasp_reward + shaping
+    return np.clip(reward, -10.0, 10.0)
 
 
 # === TRAINING LOOP ===
